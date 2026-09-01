@@ -1,0 +1,31 @@
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+backend/.pytest_cache/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/tests/__pycache__/
+.venv/
+.env
+
+# Local system and editor/tool state
+.DS_Store
+.impeccable/
+
+# Python tooling and coverage
+.pytest_cache/
+backend/.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime data
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+
+# Python bytecode (all packages and scripts)
+__pycache__/
+*.py[cod]

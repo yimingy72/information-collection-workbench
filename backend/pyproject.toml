@@ -1,0 +1,32 @@
+[project]
+name = "asset-workbench"
+version = "0.1.0"
+description = "Persistent enterprise asset collection workbench"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi==0.115.6",
+  "uvicorn[standard]==0.34.0",
+  "asyncpg==0.30.0",
+  "httpx==0.28.1",
+  "pydantic-settings==2.7.1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest==8.3.4",
+  "pytest-asyncio==0.25.2",
+  "respx==0.22.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+
+docs = """
+Install: pip install -e '.[test]'
+Run API: uvicorn app.main:app --reload
+Run worker: python -m app.worker
+"""

@@ -1,0 +1,16 @@
+---
+description: Frontend must use Ant Design 6 components
+globs: frontend/**/*.{tsx,ts,css}
+alwaysApply: true
+---
+
+# Ant Design 前端约束
+
+工作台前端必须使用 Ant Design 6（`antd` + `@ant-design/icons`）。对照 https://ant.design/components/overview-cn 选用组件。
+
+- 布局用 `Layout` / `Flex` / `Space` / `Grid`，导航用 `Menu` / `Breadcrumb`。
+- 表单用 `Form`、`Input`、`InputNumber`、`Select`、`Checkbox`、`Segmented`、`Button`。
+- 列表与结果用 `Table`、`Tag`、`Badge`、`Progress`、`Empty`、`Descriptions`、`Alert`。
+- 反馈用 `App`（message/notification）、`Result`、`Skeleton`、`Spin`。主题用 `ConfigProvider` token，不要手写一套皮肤。
+- 禁止自绘可交互控件替代上述组件。禁止 Ant Design Pro / Pro Components。禁止再引入其它 UI 库。
+- `styles.css` 只做页面级间距，不做 Hero、渐变、自定义侧栏。

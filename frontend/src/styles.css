@@ -1,0 +1,683 @@
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+.app-shell.ant-layout {
+  position: fixed !important;
+  inset: 0;
+  display: flex;
+  width: 100%;
+  height: 100% !important;
+  max-height: 100% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+
+.app-shell > .ant-layout-sider {
+  height: 100%;
+  overflow: auto;
+}
+
+.app-body.ant-layout {
+  flex: 1 1 0% !important;
+  min-width: 0;
+  min-height: 0 !important;
+  height: 100% !important;
+  max-height: 100% !important;
+  overflow: hidden !important;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header.ant-layout-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-inline: 16px;
+}
+
+.brand {
+  height: 56px;
+  padding: 0 16px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  border-radius: 6px;
+  background: #0f766e;
+  color: #fff;
+  font-size: 13px;
+}
+
+.app-main.ant-layout-content {
+  flex: 1 1 0% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+  display: flex;
+  flex-direction: column;
+  padding: 16px 20px;
+  margin: 0 !important;
+}
+
+.app-main.ant-layout-content > .page {
+  flex: 1 1 0%;
+  min-height: 0;
+  min-width: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.page {
+  min-height: 0;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.page.page-split {
+  display: grid !important;
+  grid-template-rows: max-content minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
+  gap: 16px;
+  height: 100%;
+  min-height: 0;
+}
+
+.page-head {
+  min-height: 0;
+  grid-row: 1;
+}
+
+.fill-card.ant-card,
+.fill-card {
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.page.page-split > .fill-card {
+  grid-row: 2;
+  min-height: 0 !important;
+  overflow: hidden;
+}
+
+.fill-card > .ant-card-head {
+  flex: none;
+}
+
+.fill-card > .ant-card-body {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.fill-body {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.table-frame {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.table-host {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: auto;
+}
+
+.table-pager {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  min-height: 44px;
+  padding-top: 12px;
+  background: var(--ant-color-bg-container, #fff);
+}
+
+/* Keep result pagers inside the available card height instead of below the clipped viewport. */
+.query-results-panel {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.query-results-panel > .ant-segmented {
+  flex: none;
+}
+
+.history-query-detail.ant-card {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-query-detail > .ant-card-head {
+  flex: none;
+}
+
+.history-query-detail > .ant-card-body {
+  flex: 1 1 0%;
+  min-height: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.history-query-detail > .ant-card-body > .ant-alert {
+  flex: none;
+}
+
+.history-query-loading {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+}
+
+.task-toolbar,
+.fill-body > .ant-segmented,
+.fill-card > .ant-card-body > .ant-alert {
+  flex: none;
+}
+
+.table-fill .ant-table-thead > tr > th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.icp-update-value {
+  white-space: nowrap;
+}
+
+.query-fields {
+  min-width: 0;
+}
+
+.query-company-field {
+  width: 252px;
+  min-width: 0;
+}
+
+.query-form .ant-form-item {
+  margin-inline-end: 0;
+  margin-bottom: 0;
+}
+
+.query-form .ant-form-item-explain,
+.page .ant-form-item-explain {
+  display: none;
+}
+
+.query-form .ant-form-item-has-error .ant-input,
+.query-form .ant-form-item-has-error .ant-input-affix-wrapper,
+.page .ant-form-item-has-error .ant-input {
+  border-color: var(--ant-color-error);
+}
+
+.query-providers {
+  min-width: 360px;
+}
+
+.query-providers .ant-select-selection-overflow {
+  flex-wrap: nowrap;
+}
+
+.query-recents-wrap {
+  position: relative;
+  width: 100%;
+  height: 22px;
+  min-width: 0;
+}
+
+.query-recents {
+  display: flex;
+  width: 100%;
+  height: 22px;
+  min-width: 0;
+  overflow: hidden;
+  gap: 8px;
+}
+
+.query-recents-measure {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+  overflow: visible;
+}
+
+.query-recent-tag {
+  flex: 0 0 auto;
+  margin-inline-end: 0;
+  max-width: 160px;
+}
+
+.query-recent-tag .ant-typography {
+  display: inline-block;
+  max-width: 112px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+@media (max-width: 1100px) {
+  .query-fields {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 768px) {
+  .app-main.ant-layout-content {
+    padding: 12px;
+  }
+}
+
+
+.settings-sessions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.session-item {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+@media (max-width: 1200px) {
+  .settings-sessions {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+
+
+.task-toolbar {
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.task-toolbar .ant-typography {
+  white-space: nowrap;
+}
+
+.qr-image {
+  width: 168px;
+  height: 168px;
+  object-fit: contain;
+  border: 1px solid rgba(5, 5, 5, 0.1);
+  border-radius: 8px;
+  background: #fff;
+}
+
+
+.source-tags {
+  flex-wrap: nowrap;
+  white-space: nowrap;
+}
+
+.source-tags .ant-tag {
+  margin-inline-end: 0;
+}
+
+
+
+
+
+
+
+
+.settings-section-switch {
+  flex: 0 0 auto;
+  margin-bottom: 12px;
+}
+
+.settings-section-switch .ant-segmented {
+  padding: 2px;
+  background: rgba(127, 127, 127, 0.08);
+}
+
+.settings-section-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+.settings-source-table {
+  margin-top: 0;
+}
+
+.serverless-proxy-form {
+  margin-top: 4px;
+}
+
+.serverless-section-card {
+  margin-top: 14px;
+}
+
+.serverless-proxy-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 18px;
+}
+
+.serverless-span-full {
+  grid-column: 1 / -1;
+}
+
+.serverless-managed-note {
+  margin-bottom: 14px !important;
+}
+
+.serverless-enable-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 6px 0 2px;
+}
+
+.serverless-enable-row .ant-typography {
+  margin-bottom: 0;
+}
+
+.proxy-error {
+  margin-bottom: 16px;
+}
+
+@media (max-width: 760px) {
+  .serverless-proxy-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .serverless-span-full {
+    grid-column: auto;
+  }
+
+  .serverless-enable-row {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 10px;
+  }
+}
+
+/* Cloud-function settings stay dense while keeping the primary actions visible. */
+.serverless-shell > .ant-card-head {
+  min-height: 40px;
+  padding-inline: 12px;
+}
+
+.serverless-shell > .ant-card-body {
+  padding: 8px 10px 10px;
+}
+
+.serverless-compact-form {
+  margin-top: 0;
+}
+
+.serverless-compact-form .ant-form-item {
+  margin-bottom: 6px;
+}
+
+.serverless-compact-form .ant-form-item-label {
+  padding: 0 0 2px;
+}
+
+.serverless-compact-form .ant-form-item-label > label {
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.serverless-compact-form .ant-form-item-extra,
+.serverless-compact-form .ant-form-item-explain {
+  min-height: 0;
+  margin-top: 1px;
+  font-size: 11px;
+  line-height: 1.3;
+}
+
+.serverless-compact-form .ant-input,
+.serverless-compact-form .ant-input-affix-wrapper,
+.serverless-compact-form .ant-select-single:not(.ant-select-customize-input) .ant-select-selector,
+.serverless-compact-form .ant-segmented {
+  min-height: 28px;
+}
+
+.serverless-compact-form .ant-input,
+.serverless-compact-form .ant-input-affix-wrapper {
+  padding-block: 2px;
+}
+
+.serverless-compact-form .ant-select-single .ant-select-selector {
+  height: 28px;
+}
+
+.serverless-compact-form .ant-select-single .ant-select-selection-item,
+.serverless-compact-form .ant-select-single .ant-select-selection-placeholder {
+  line-height: 26px;
+}
+
+.serverless-compact-form .ant-segmented-item-label {
+  min-height: 24px;
+  padding-inline: 8px;
+  line-height: 24px;
+}
+
+.serverless-section-card {
+  margin-top: 8px;
+}
+
+.serverless-section-card > .ant-card-head {
+  min-height: 32px;
+  padding-inline: 10px;
+}
+
+.serverless-section-card > .ant-card-head .ant-card-head-title {
+  font-size: 12px;
+  line-height: 30px;
+}
+
+.serverless-section-card > .ant-card-body {
+  padding: 8px 10px 6px;
+}
+
+.serverless-managed-note {
+  display: block;
+  margin-bottom: 6px !important;
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.serverless-proxy-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  column-gap: 12px;
+}
+
+.serverless-span-full {
+  grid-column: 1 / -1;
+}
+
+.serverless-route-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 26px;
+  font-size: 11px;
+}
+
+.serverless-route-summary > .ant-typography {
+  min-width: 0;
+}
+
+.serverless-tls-item.ant-form-item {
+  flex: none;
+  margin: 0;
+  white-space: nowrap;
+}
+
+.serverless-tls-item .ant-form-item-label {
+  display: inline-flex;
+  margin-inline-end: 6px;
+  padding: 0;
+  vertical-align: middle;
+}
+
+.serverless-tls-item .ant-form-item-control {
+  display: inline-flex;
+  width: auto;
+  vertical-align: middle;
+}
+
+.proxy-error {
+  margin-top: 6px;
+  margin-bottom: 0;
+  font-size: 12px;
+}
+
+.serverless-action-bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: -8px -10px 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--aw-border, #dce4e3);
+  background: var(--aw-surface, #fff);
+  box-shadow: 0 3px 10px rgba(22, 32, 32, 0.06);
+}
+
+.serverless-action-meta {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.serverless-action-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.serverless-action-buttons {
+  flex: 0 0 auto;
+  justify-content: flex-end;
+}
+
+.serverless-action-bar .ant-btn {
+  height: 28px;
+  padding-inline: 8px;
+  font-size: 12px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .serverless-action-bar {
+    background: #171c1c;
+    border-bottom-color: #2a3635;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
+  }
+}
+
+@media (max-width: 760px) {
+  .serverless-action-bar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .serverless-action-meta {
+    width: 100%;
+  }
+
+  .serverless-action-buttons {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .serverless-action-buttons .ant-space-item,
+  .serverless-action-buttons .ant-space-item > .ant-popover-open,
+  .serverless-action-buttons .ant-space-item > .ant-btn {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .serverless-action-buttons .ant-btn {
+    width: 100%;
+    padding-inline: 4px;
+  }
+
+  .serverless-proxy-grid {
+    column-gap: 10px;
+  }
+
+  .serverless-route-summary {
+    align-items: flex-start;
+    gap: 6px;
+  }
+}
+
+@media (max-width: 520px) {
+  .serverless-proxy-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .serverless-setup-card .serverless-proxy-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .serverless-setup-card .serverless-proxy-grid {
+    column-gap: 8px;
+  }
+
+  .serverless-route-summary {
+    flex-direction: column;
+  }
+
+  .serverless-tls-item.ant-form-item {
+    align-self: flex-start;
+  }
+}

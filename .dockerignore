@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.env
+frontend/node_modules
+frontend/dist
+.git
+.cursor
+.impeccable
+.DS_Store
+backend/.ruff_cache

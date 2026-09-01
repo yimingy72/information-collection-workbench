@@ -1,0 +1,72 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: workbench
+      POSTGRES_USER: workbench
+      POSTGRES_PASSWORD: workbench
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U workbench -d workbench"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    image: asset-workbench-api:latest
+    build: .
+    environment:
+      DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
+      TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
+      MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
+      SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
+      SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
+      SERVERLESS_PROXY_MIIT_URL: http://seamoon-gateway:19080
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seamoon-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: asset-workbench-api:latest
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
+      TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
+      MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
+      SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
+      SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
+      SERVERLESS_PROXY_MIIT_URL: http://seamoon-gateway:19080
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-120}
+      WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-1}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seamoon-gateway:
+        condition: service_healthy
+
+  seamoon-gateway:
+    image: asset-workbench-api:latest
+    command: ["seamoon-core", "gateway", "-proxy", "0.0.0.0:19080", "-admin", "0.0.0.0:19081"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:19081/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
