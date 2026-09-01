@@ -8,6 +8,7 @@ from app.providers.names import normalize_providers, provider_label
 from app.providers.riskbird import AnonymousRiskbird
 from app.providers.tianyancha import AnonymousTianyancha
 from app.runtime import SESSION_PROVIDERS, session_cookie, session_login_gaps
+from app.serverless_proxy import active_proxy_url
 from app.settings import settings
 
 
@@ -36,7 +37,7 @@ def build_providers(
             continue
         cookie = session_cookie(runtime, provider_id)
         if provider_id == "aiqicha":
-            providers.append(AnonymousAiqicha(cookie=cookie))
+            providers.append(AnonymousAiqicha(cookie=cookie, proxy=active_proxy_url(runtime)))
         elif provider_id == "kuaicha":
             providers.append(AnonymousKuaicha(cookie=cookie))
         elif provider_id == "riskbird":

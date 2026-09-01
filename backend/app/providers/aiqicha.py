@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import httpx
+
 from app.providers.tianyancha import (
     Company,
     Investment,
@@ -18,6 +20,11 @@ PID_MAPS = {
     1: str.maketrans("0123456789", "0123547698"),
     2: str.maketrans("0123456789", "0123689457"),
 }
+
+# One proxied AsyncClient keeps one CONNECT tunnel to aiqicha.baidu.com. Closing
+# it after 15 outbound requests makes the next request open a new SeaMoon
+# WebSocket invocation instead of continuing to reuse the current cloud route.
+AIQICHA_PROXY_REQUEST_LIMIT = 15
 
 
 def _decode_pid(value: str, ddw: Any) -> str:
@@ -41,6 +48,7 @@ class AnonymousAiqicha:
         self._timeout = timeout
         self._cookie = cookie
         self._proxy = proxy
+        self._proxy_request_count = 0
         self.client = self._make_client()
 
     def _make_client(self):
@@ -62,6 +70,25 @@ class AnonymousAiqicha:
     async def close(self) -> None:
         await self.client.aclose()
 
+    async def _rotate_proxy_client(self) -> None:
+        if not self._proxy:
+            return
+        previous = self.client
+        self.client = self._make_client()
+        self._proxy_request_count = 0
+        await previous.aclose()
+
+    async def _proxy_get(
+        self,
+        url: str,
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        if self._proxy and self._proxy_request_count >= AIQICHA_PROXY_REQUEST_LIMIT:
+            await self._rotate_proxy_client()
+        if self._proxy:
+            self._proxy_request_count += 1
+        return await self.client.get(url, params=params)
+
     def _raise_for_challenge(self, response) -> None:
         location = response.headers.get("location", "")
         text_head = response.text[:200]
@@ -71,15 +98,19 @@ class AnonymousAiqicha:
             or "tuxing" in location
             or "百度安全验证" in text_head
         ):
+            if self._proxy:
+                self._proxy_request_count = AIQICHA_PROXY_REQUEST_LIMIT
             raise ProviderError("爱企查需要安全验证，无法查询")
         if response.status_code in {401, 403, 429}:
+            if self._proxy:
+                self._proxy_request_count = AIQICHA_PROXY_REQUEST_LIMIT
             raise ProviderError(f"爱企查拒绝访问 (HTTP {response.status_code})")
 
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(2):
             try:
-                response = await self.client.get(url, params=params)
+                response = await self._proxy_get(url, params=params)
                 self.client.cookies.clear()
                 self._raise_for_challenge(response)
                 response.raise_for_status()
@@ -87,6 +118,8 @@ class AnonymousAiqicha:
             except Exception as exc:
                 last_error = exc if isinstance(exc, ProviderError) else ProviderError(str(exc))
                 if is_retryable_network_error(exc) and attempt == 0:
+                    if self._proxy:
+                        await self._rotate_proxy_client()
                     await asyncio.sleep(0.15)
                     continue
                 break

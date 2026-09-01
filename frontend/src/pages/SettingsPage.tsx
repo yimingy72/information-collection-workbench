@@ -392,7 +392,7 @@ export function SettingsPage() {
       title={(
         <Space>
           <CloudServerOutlined />
-          <span>SeaMoon 云函数代理（仅 ICP 备案）</span>
+          <span>SeaMoon 云函数代理（ICP / 爱企查）</span>
           {proxyTag(proxy?.status, proxy?.enabled)}
         </Space>
       )}
@@ -415,12 +415,12 @@ export function SettingsPage() {
         <div className="serverless-action-bar serverless-action-bar-top" role="toolbar" aria-label="云函数操作">
           <div className="serverless-action-meta">
             <Space size={6} wrap>
-              <Typography.Text type="secondary">ICP 查询路由</Typography.Text>
+              <Typography.Text type="secondary">ICP / 爱企查查询路由</Typography.Text>
               <Tag color={proxy?.enabled ? 'success' : 'default'}>
                 {proxy?.enabled ? '云函数代理' : '直连'}
               </Tag>
               <Typography.Text type="secondary" className="serverless-action-hint">
-                数据源请求保持直连，云函数只用于备案查询
+                爱企查每15次请求轮换隧道；其他企业数据源保持直连
               </Typography.Text>
             </Space>
           </div>

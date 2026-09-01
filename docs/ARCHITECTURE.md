@@ -20,7 +20,7 @@
 ## 查询时序
 
 1. API 刷新数据源登录状态并配置本地 SeaMoon 网关。
-2. 所选 provider 并行启动；单个 provider 内按企业队列执行投资穿透。
+2. 所选 provider 并行启动；云函数启用时爱企查通过 `seamoon-gateway` 请求，其他 provider 直连；单个 provider 内按企业队列执行投资穿透。
 3. 企业实体与投资关系保存到 PostgreSQL。
 4. `entity_names_for_run()` 汇总根企业、投资父企业、投资子企业和结果实体名称。
 5. 调度器把用户输入的根企业移动到第一位。
@@ -29,6 +29,14 @@
    - 未启用：YMICP 直连工信部。
 7. 每个企业执行分页查询、完整性检查和结果保存。
 8. 任一阶段存在错误但已有结果时，任务状态为 `partial`；无错误时为 `succeeded`。
+
+## 爱企查代理轮换
+
+- `build_providers()` 仅向爱企查注入当前启用的 `SERVERLESS_PROXY_URL`。
+- 一个爱企查 `httpx.AsyncClient` 复用一条目标为 `aiqicha.baidu.com` 的 CONNECT / WebSocket 隧道。
+- 每累计15次实际 HTTP 请求关闭客户端；第16次请求创建新客户端和新云函数隧道。
+- 网络重试立即重建隧道；安全验证以及 HTTP 401、403、429 会把当前隧道标记为下一请求前轮换。
+- 隧道轮换不等价于固定出口IP轮换，实际出口仍由云平台实例和网络调度决定。
 
 ## ICP 分页算法
 
@@ -96,6 +104,6 @@ ICP_COMPANY_TIMEOUT_SECONDS     = 30
 
 - API 不接收来自前端的任意代理 URL。
 - YMICP 仅允许配置的内部 SeaMoon 代理地址。
-- 数据源请求不经过 SeaMoon。
+- 只有 ICP 和爱企查业务查询经过 SeaMoon；其他数据源和登录链路不经过 SeaMoon。
 - 云平台 Secret 不回传前端。
 - API 当前没有登录和租户隔离，只应运行在本机或受控私网。

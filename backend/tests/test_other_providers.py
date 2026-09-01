@@ -232,3 +232,61 @@ def test_unauthenticated_session_providers_are_skipped():
         assert isinstance(providers[0], AnonymousTianyancha)
     finally:
         asyncio.run(providers[0].close())
+
+
+@pytest.mark.asyncio
+async def test_aiqicha_proxy_rotates_tunnel_after_fifteen_requests(monkeypatch):
+    from app.providers.aiqicha import AIQICHA_PROXY_REQUEST_LIMIT
+
+    provider = AnonymousAiqicha(proxy="http://proxy.test:19080")
+    await provider.client.aclose()
+
+    clients: list[httpx.AsyncClient] = []
+    generations: list[int] = []
+
+    def make_client() -> httpx.AsyncClient:
+        generation = len(clients) + 1
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            generations.append(generation)
+            return httpx.Response(200, json={"status": 0, "data": {"list": [{"id": "ok"}]}})
+
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=False,
+        )
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(provider, "_make_client", make_client)
+    provider.client = make_client()
+
+    for _ in range(AIQICHA_PROXY_REQUEST_LIMIT + 1):
+        await provider._get("https://aiqicha.baidu.com/test")
+
+    assert generations == [1] * AIQICHA_PROXY_REQUEST_LIMIT + [2]
+    assert clients[0].is_closed is True
+    assert clients[1].is_closed is False
+    await provider.close()
+
+
+def test_build_providers_routes_aiqicha_through_active_seamoon():
+    from app.providers.registry import build_providers
+    from app.settings import settings
+
+    providers = build_providers(
+        ["aiqicha"],
+        {
+            "sessions": {"aiqicha": {"cookie": "aqc=1", "expires_at": None}},
+            "serverless_proxy": {
+                "enabled": True,
+                "endpoint": "https://example.test",
+            },
+        },
+    )
+    try:
+        assert len(providers) == 1
+        assert providers[0]._proxy == settings.serverless_proxy_url
+        assert providers[0].client.headers.get("cookie") == "aqc=1"
+    finally:
+        asyncio.run(providers[0].close())
