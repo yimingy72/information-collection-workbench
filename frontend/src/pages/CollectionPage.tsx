@@ -20,8 +20,28 @@ import { exportQuery } from '../export'
 import { StatusTag } from '../components/StatusTag'
 import { formatDuration } from '../formatters'
 import { QueryResultsPanel } from '../components/QueryResultsPanel'
-import type { CollectionValues, ProviderId, QueryView, Run } from '../types'
+import type { CollectionValues, ProviderId, QueryView, Run, SettingsView } from '../types'
 import { PROVIDER_OPTIONS } from '../types'
+
+function QueryRouteStatus({ settings }: { settings: SettingsView | null }) {
+  const manualCount = settings?.manual_proxies.filter(
+    (item) => item.enabled && item.status === 'ready',
+  ).length ?? 0
+  const cloud = settings?.serverless_proxy
+  const cloudCount = cloud?.nodes.filter((item) => item.enabled && item.status !== 'error').length ?? 0
+  const usingManual = manualCount > 0
+  const usingCloud = !usingManual && Boolean(cloud?.enabled)
+  const label = usingManual ? `手动 HTTP 代理（${manualCount} 个）` : usingCloud ? `云函数代理（${cloudCount || 1} 个节点）` : '未启用代理（直连）'
+  const color = usingManual ? 'processing' : usingCloud ? 'success' : 'default'
+
+  return (
+    <div className="query-route-status">
+      <Typography.Text type="secondary">查询代理</Typography.Text>
+      <Tag color={color}>{label}</Tag>
+      <Typography.Text type="secondary">代理统一在“基础配置”中管理，查询页面不单独选择代理。</Typography.Text>
+    </div>
+  )
+}
 
 
 function RecentTag({
@@ -115,6 +135,7 @@ export function CollectionPage({
   onFinish,
   onPick,
   onForget,
+  settings,
 }: {
   form: FormInstance<CollectionValues>
   loading: boolean
@@ -124,6 +145,7 @@ export function CollectionPage({
   onFinish: (values: CollectionValues) => void
   onPick: (run: Run) => void
   onForget: (run: Run) => void
+  settings: SettingsView | null
 }) {
   const { message } = App.useApp()
 
@@ -198,6 +220,7 @@ export function CollectionPage({
             </Form.Item>
           </Flex>
         </Form>
+        <QueryRouteStatus settings={settings} />
       </Card>
 
       <Card

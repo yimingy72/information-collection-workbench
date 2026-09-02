@@ -7,7 +7,7 @@ import pytest
 
 from app.collector import RunSpec, _prioritize_root_name, collect_run
 from app.models import CollectionRequest
-from app.providers.tianyancha import AnonymousTianyancha, Company, Investment, Shareholder
+from app.providers.tianyancha import AnonymousTianyancha, Company, Investment, ProviderError, Shareholder
 
 
 async def _no_icp(*_args, **_kwargs):
@@ -128,6 +128,162 @@ def test_holding_filter_and_depth_with_fake_provider(monkeypatch):
     assert "filtered" not in names
     assert "unknown" not in names
     assert "kept" in names
+
+
+
+def test_failed_child_company_is_retried_without_requerying_parent(monkeypatch):
+    import app.collector as collector
+
+    monkeypatch.setattr(collector, "collect_icp", _no_icp)
+
+    class FakeProvider:
+        id = "tianyancha"
+        label = "天眼查"
+        failed_company_retries = 1
+
+        def __init__(self):
+            self.calls = []
+            self.resets = 0
+            self.client = type("Client", (), {"base_url": "https://example.test"})()
+
+        async def search(self, keyword):
+            root = Company("1", keyword, {"id": "1", "name": keyword})
+            return root, [root]
+
+        async def all_pages(self, fetch):
+            rows, _ = await fetch(1)
+            return rows
+
+        async def investments(self, external_id, page=1):
+            self.calls.append(external_id)
+            if external_id == "1":
+                return [
+                    Investment("一级企业A", "2", 100, {"id": "2", "name": "一级企业A", "percent": 100}),
+                    Investment("一级企业B", "3", 100, {"id": "3", "name": "一级企业B", "percent": 100}),
+                ], 2
+            if external_id == "2" and self.calls.count("2") == 1:
+                raise ProviderError("请登录以使用完整功能")
+            if external_id == "2":
+                return [
+                    Investment("二级企业A", "4", 100, {"id": "4", "name": "二级企业A", "percent": 100}),
+                ], 1
+            return [], 0
+
+        async def reset_after_failure(self):
+            self.resets += 1
+
+    class FakeRepo:
+        def __init__(self):
+            self.entities = {}
+            self.relationships = []
+            self.results = []
+
+        async def upsert_entity(self, provider, external_id, name, payload):
+            self.entities.setdefault(external_id, uuid4())
+            return self.entities[external_id]
+
+        async def add_result(self, *args):
+            self.results.append(args)
+
+        async def add_relationship(self, *args):
+            self.relationships.append(args)
+
+        async def heartbeat(self, *args, **kwargs):
+            pass
+
+        async def has_results(self, run_id):
+            return bool(self.results or self.relationships)
+
+        async def entity_names_for_run(self, run_id):
+            return ["根企业", "一级企业A", "一级企业B", "二级企业A"]
+
+    provider = FakeProvider()
+    repo = FakeRepo()
+    errors = asyncio.run(
+        collect_run(repo, [provider], RunSpec(uuid4(), "根企业", 2, 100, ["invest"]))
+    )
+
+    assert errors == []
+    assert provider.calls == ["1", "2", "3", "2"]
+    assert provider.resets == 1
+    assert len(repo.relationships) == 3
+    assert {item[2] for item in repo.relationships} == {
+        repo.entities["2"], repo.entities["3"], repo.entities["4"]
+    }
+
+@pytest.mark.asyncio
+async def test_icp_starts_while_investment_traversal_is_running(monkeypatch):
+    import app.collector as collector
+
+    investment_started = asyncio.Event()
+    icp_started = asyncio.Event()
+    observed_overlap = False
+    icp_names = []
+
+    async def fake_icp(_repo, _run_id, names):
+        icp_names.extend(names)
+        icp_started.set()
+        return []
+
+    monkeypatch.setattr(collector, "collect_icp", fake_icp)
+
+    class FakeProvider:
+        id = "tianyancha"
+        label = "天眼查"
+
+        async def search(self, keyword):
+            root = Company("root", keyword, {"id": "root", "name": keyword})
+            return root, [root]
+
+        async def all_pages(self, fetch):
+            rows, _ = await fetch(1)
+            return rows
+
+        async def investments(self, external_id, page=1):
+            nonlocal observed_overlap
+            investment_started.set()
+            await asyncio.wait_for(icp_started.wait(), timeout=1)
+            observed_overlap = True
+            return [], 0
+
+        @property
+        def client(self):
+            return httpx.AsyncClient(base_url="https://example.test")
+
+    class FakeRepo:
+        def __init__(self):
+            self.results = []
+
+        async def upsert_entity(self, provider, external_id, name, payload):
+            return uuid4()
+
+        async def add_result(self, *args):
+            self.results.append(args)
+
+        async def add_relationship(self, *args):
+            pass
+
+        async def heartbeat(self, *args, **kwargs):
+            pass
+
+        async def has_results(self, run_id):
+            return bool(self.results)
+
+        async def entity_names_for_run(self, run_id):
+            return ["根企业"] if self.results else []
+
+    errors = await asyncio.wait_for(
+        collector.collect_run(
+            FakeRepo(),
+            [FakeProvider()],
+            RunSpec(uuid4(), "根企业", 1, 51, ["invest"]),
+        ),
+        timeout=2,
+    )
+
+    assert errors == []
+    assert observed_overlap is True
+    assert icp_names == ["根企业"]
 
 
 def test_collect_run_queries_providers_in_parallel(monkeypatch):
@@ -489,7 +645,7 @@ async def test_icp_serverless_proxy_is_forwarded_to_local_icp_service(monkeypatc
     assert calls[0][3]
 
 
-def test_cloud_proxy_is_used_only_by_icp_not_data_sources():
+def test_cloud_proxy_is_used_by_tianyancha_when_configured():
     import app.providers.registry as registry
 
     config = {
@@ -502,13 +658,49 @@ def test_cloud_proxy_is_used_only_by_icp_not_data_sources():
     providers = registry.build_providers(["tianyancha"], config)
     try:
         assert len(providers) == 1
-        assert providers[0].client._mounts == {} or all(
-            getattr(transport, "_proxy", None) is None
-            for transport in providers[0].client._mounts.values()
-        )
-        assert providers[0].client._transport._pool._proxy is None
+        assert providers[0].client._mounts
     finally:
         asyncio.run(providers[0].close())
+
+
+@pytest.mark.asyncio
+async def test_icp_single_manual_proxy_keeps_one_pagination_session(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+    manual = "http://user:pass@manual.example:8080"
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {
+                "serverless_proxy": {
+                    "enabled": True,
+                    "endpoint": "https://cloud.example",
+                },
+                "manual_proxies": [{
+                    "scheme": "http",
+                    "host": "manual.example",
+                    "port": 8080,
+                    "username": "user",
+                    "password": "pass",
+                    "enabled": True,
+                    "status": "ready",
+                }],
+            }
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((page, timeout_seconds, route_proxy, session_key))
+        return {"rows": [], "pages": 2}
+
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert len(calls) == 2
+    assert all(call[2] == manual for call in calls)
+    assert calls[0][3] == calls[1][3]
+    assert not calls[0][3].endswith("_0")
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,9 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
+from urllib.parse import unquote, urlsplit
+
+import httpx
 
 import asyncpg
 from fastapi import FastAPI, HTTPException, Query
@@ -18,6 +21,9 @@ from app.collector import RunSpec, collect_run
 from app.models import (
     CollectionRequest,
     IcpRow,
+    ManualProxyRequest,
+    ManualProxyTestResponse,
+    ManualProxyView,
     InvestmentRow,
     ProviderSessionRequest,
     ProviderSessionView,
@@ -44,8 +50,13 @@ from app.session_refresh import refresh_provider_sessions
 from app.serverless_proxy import (
     ServerlessProxyError,
     configure_gateway,
+    configure_gateway_for_active_route,
+    manual_proxy_url,
+    pool_nodes,
+    remove_pool_node,
     run_cloud_operation,
     serverless_proxy_view,
+    upsert_pool_node,
     test_serverless_proxy,
     validate_saved_config,
 )
@@ -65,6 +76,52 @@ def session_status(row: dict) -> str:
     return "logged_in" if cookie_active(row) else "expired"
 
 
+def _manual_proxy_view(row: dict) -> ManualProxyView:
+    return ManualProxyView(
+        id=row["id"],
+        scheme=str(row.get("scheme") or "http"),
+        host=str(row.get("host") or ""),
+        port=int(row.get("port") or 0),
+        username=str(row.get("username") or ""),
+        has_password=bool(str(row.get("password") or "")),
+        enabled=bool(row.get("enabled")),
+        status=str(row.get("status") or "configured"),
+        latency_ms=int(row["latency_ms"]) if row.get("latency_ms") is not None else None,
+        failure_count=int(row.get("failure_count") or 0),
+        last_error=str(row.get("last_error") or ""),
+        last_tested_at=row.get("last_tested_at"),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _parse_manual_proxy(value: str) -> dict[str, object]:
+    raw = str(value or "").strip()
+    parsed = urlsplit(raw if "://" in raw else f"http://{raw}")
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.hostname:
+        raise HTTPException(400, "代理地址必须是 HTTP(S)://[用户名:密码@]主机:端口")
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise HTTPException(400, "代理地址不能包含路径、查询参数或片段")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise HTTPException(400, "代理端口无效") from exc
+    if not port:
+        raise HTTPException(400, "代理地址必须包含端口")
+    return {
+        "scheme": parsed.scheme.lower(),
+        "host": parsed.hostname,
+        "port": port,
+        "username": unquote(parsed.username or ""),
+        "password": unquote(parsed.password or ""),
+    }
+
+
+def _manual_proxy_error(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    return text[:500] or type(exc).__name__
+
+
 def settings_view(config: dict) -> SettingsResponse:
     raw = config.get("sessions") or {}
     sessions = []
@@ -82,6 +139,7 @@ def settings_view(config: dict) -> SettingsResponse:
     return SettingsResponse(
         sessions=sessions,
         serverless_proxy=serverless_proxy_view(config),
+        manual_proxies=[_manual_proxy_view(row) for row in config.get("manual_proxies") or []],
     )
 
 
@@ -183,7 +241,7 @@ async def lifespan(_: FastAPI):
     repo = Repository(pool, Path(__file__).parent.parent / "migrations")
     await repo.migrate()
     try:
-        await configure_gateway(await repo.get_runtime_config())
+        await configure_gateway_for_active_route(await repo.get_runtime_config())
     except ServerlessProxyError:
         logger.exception("SeaMoon 网关启动同步失败，将在查询时重试")
     refresh_task = asyncio.create_task(_session_refresh_loop())
@@ -237,7 +295,7 @@ async def run_query(request: CollectionRequest) -> QueryResponse:
     store = current_repo()
     config = await refresh_provider_sessions(store)
     try:
-        await configure_gateway(config)
+        await configure_gateway_for_active_route(config)
     except ServerlessProxyError as exc:
         raise HTTPException(502, str(exc)) from exc
     login_errors = login_required_errors(request.providers, config)
@@ -276,7 +334,10 @@ async def query_view(run_id: UUID, extra_errors: list[str] | None = None) -> Que
     row = await current_repo().get_run(run_id)
     if row is None:
         raise HTTPException(404, "run not found")
-    _, rels, _, _ = await current_repo().results(run_id, None, 1000, 0, 1000, 0)
+    # Historical/query detail pages must not silently truncate investments at
+    # 1000 rows. The results endpoint remains paginated, while this view is the
+    # complete payload used by the detail screen and export action.
+    _, rels, _, _ = await current_repo().results(run_id, None, 0, 0, None, 0)
     icp_rows, _, _, _ = await current_repo().results(run_id, "icp", 10000, 0, 0, 0)
     investments = _merge_investments([
         InvestmentRow(
@@ -385,6 +446,97 @@ async def get_settings() -> SettingsResponse:
     return settings_view(await current_repo().get_runtime_config())
 
 
+@app.post("/api/v1/settings/manual-proxies", response_model=ManualProxyView)
+async def create_manual_proxy(request: ManualProxyRequest) -> ManualProxyView:
+    values = _parse_manual_proxy(request.proxy_url)
+    try:
+        row = await current_repo().create_manual_proxy(**values, enabled=request.enabled)
+    except asyncpg.UniqueViolationError as exc:
+        raise HTTPException(409, "相同代理已经存在") from exc
+    return _manual_proxy_view(dict(row))
+
+
+@app.put("/api/v1/settings/manual-proxies/{proxy_id}", response_model=ManualProxyView)
+async def update_manual_proxy(proxy_id: UUID, request: ManualProxyRequest) -> ManualProxyView:
+    values = _parse_manual_proxy(request.proxy_url)
+    row = await current_repo().get_manual_proxy(proxy_id)
+    if row is None:
+        raise HTTPException(404, "代理不存在")
+    password = str(values["password"])
+    try:
+        updated = await current_repo().update_manual_proxy(
+            proxy_id,
+            scheme=str(values["scheme"]),
+            host=str(values["host"]),
+            port=int(values["port"]),
+            username=str(values["username"]),
+            password=password,
+            enabled=request.enabled,
+        )
+    except asyncpg.UniqueViolationError as exc:
+        raise HTTPException(409, "相同代理已经存在") from exc
+    if updated is None:
+        raise HTTPException(404, "代理不存在")
+    await configure_gateway_for_active_route(await current_repo().get_runtime_config())
+    return _manual_proxy_view(dict(updated))
+
+
+@app.post("/api/v1/settings/manual-proxies/{proxy_id}/toggle", response_model=ManualProxyView)
+async def toggle_manual_proxy(proxy_id: UUID) -> ManualProxyView:
+    store = current_repo()
+    row = await store.get_manual_proxy(proxy_id)
+    if row is None:
+        raise HTTPException(404, "代理不存在")
+    updated = await store.update_manual_proxy(
+        proxy_id,
+        scheme=str(row["scheme"]),
+        host=str(row["host"]),
+        port=int(row["port"]),
+        username=str(row["username"] or ""),
+        password=str(row["password"] or ""),
+        enabled=not bool(row["enabled"]),
+    )
+    if updated is None:
+        raise HTTPException(404, "代理不存在")
+    await configure_gateway_for_active_route(await store.get_runtime_config())
+    return _manual_proxy_view(dict(updated))
+
+
+@app.delete("/api/v1/settings/manual-proxies/{proxy_id}")
+async def delete_manual_proxy(proxy_id: UUID) -> dict[str, int]:
+    deleted = await current_repo().delete_manual_proxy(proxy_id)
+    if not deleted:
+        raise HTTPException(404, "代理不存在")
+    return {"deleted": deleted}
+
+
+@app.post("/api/v1/settings/manual-proxies/{proxy_id}/test", response_model=ManualProxyTestResponse)
+async def test_manual_proxy(proxy_id: UUID) -> ManualProxyTestResponse:
+    store = current_repo()
+    row = await store.get_manual_proxy(proxy_id)
+    if row is None:
+        raise HTTPException(404, "代理不存在")
+    values = dict(row)
+    proxy = manual_proxy_url(values)
+    if not proxy:
+        raise HTTPException(400, "代理配置不完整")
+    await store.set_manual_proxy_result(proxy_id, status="testing", latency_ms=None, error="")
+    started = asyncio.get_running_loop().time()
+    try:
+        timeout = httpx.Timeout(10.0, connect=5.0, read=10.0, write=10.0, pool=5.0)
+        async with asyncio.timeout(10):
+            async with httpx.AsyncClient(proxy=proxy, timeout=timeout, trust_env=False, follow_redirects=True) as client:
+                response = await client.get("https://www.baidu.com/robots.txt")
+                response.raise_for_status()
+        elapsed = max(0, round((asyncio.get_running_loop().time() - started) * 1000))
+        await store.set_manual_proxy_result(proxy_id, status="ready", latency_ms=elapsed, error="", enabled=True)
+        return ManualProxyTestResponse(proxy_id=proxy_id, latency_ms=elapsed, target="https://www.baidu.com/robots.txt")
+    except Exception as exc:
+        detail = _manual_proxy_error(exc)
+        await store.set_manual_proxy_result(proxy_id, status="error", latency_ms=None, error=detail, enabled=False)
+        raise HTTPException(502, f"代理测试失败：{detail}") from exc
+
+
 async def _serverless_proxy_payload(
     store: Repository,
     request: ServerlessProxyRequest,
@@ -418,7 +570,7 @@ async def save_serverless_proxy(request: ServerlessProxyRequest) -> SettingsResp
     await store.update_serverless_proxy(payload)
     config = await store.get_runtime_config()
     try:
-        await configure_gateway(config)
+        await configure_gateway_for_active_route(config)
     except ServerlessProxyError as exc:
         await store.set_serverless_proxy_status("error", str(exc))
         raise HTTPException(502, str(exc)) from exc
@@ -431,30 +583,61 @@ async def deploy_serverless_proxy(request: ServerlessProxyRequest) -> Serverless
     await store.update_serverless_proxy(await _serverless_proxy_payload(store, request))
     config = await store.get_runtime_config()
     row = config["serverless_proxy"]
+    previous_enabled = bool(row.get("enabled"))
+    node_id = str(request.node_id or f"{request.provider}:{request.region}:{request.function_name}")
     await store.set_serverless_proxy_status("deploying", enabled=False)
     try:
         result = await run_cloud_operation("deploy", row)
         endpoint = str(result.get("endpoint") or "").strip()
         if not endpoint:
             raise ServerlessProxyError("云平台未返回函数地址")
-        await store.set_serverless_proxy_status(
-            "deployed",
-            endpoint=endpoint,
-            deployment_id=str(result.get("deployment_id") or ""),
-            enabled=False,
-        )
+        node = {
+            "id": node_id,
+            "enabled": True,
+            "provider": row["provider"],
+            "endpoint": endpoint,
+            "region": row["region"],
+            "function_name": row["function_name"],
+            "image_uri": row.get("image_uri") or "",
+            "access_key_id": row.get("access_key_id") or "",
+            "access_key_secret": row.get("access_key_secret") or "",
+            "insecure_skip_verify": bool(row.get("insecure_skip_verify")),
+            "deployment_id": str(result.get("deployment_id") or ""),
+            "status": "deployed",
+            "last_error": "",
+            "latency_ms": None,
+            "failure_count": 0,
+        }
+        nodes = upsert_pool_node(row, node)
+        deployment_payload = {
+            **row,
+            **node,
+            "enabled": True,
+            "endpoint": endpoint,
+            "deployment_id": node["deployment_id"],
+            "status": "deployed",
+            "nodes": nodes,
+        }
+        await store.update_serverless_proxy(deployment_payload)
         config = await store.get_runtime_config()
         await configure_gateway(config, force_enabled=False)
 
-        # Deployment is not considered complete until the newly returned route
-        # has passed the same real proxy check used by the manual Test action.
-        test_result = await test_serverless_proxy(config)
+        # Verify the newly deployed node in isolation, then put the complete
+        # pool back into the gateway. This prevents a broken old node from
+        # masking a healthy newly deployed node during deployment verification.
+        test_result = await test_serverless_proxy({**deployment_payload, "nodes": [node], "enabled": True})
+        ready_nodes = [
+            {**item, "status": "ready", "enabled": True, "last_error": "", "failure_count": 0}
+            if item.get("id") == node_id else item
+            for item in nodes
+        ]
+        await store.update_serverless_proxy({**deployment_payload, "status": "ready", "nodes": ready_nodes})
         await store.set_serverless_proxy_status("ready", enabled=True)
         config = await store.get_runtime_config()
         await configure_gateway(config, force_enabled=True)
     except ServerlessProxyError as exc:
-        await store.set_serverless_proxy_status("error", str(exc), enabled=False)
-        await configure_gateway(await store.get_runtime_config(), force_enabled=False)
+        await store.set_serverless_proxy_status("error", str(exc), enabled=previous_enabled)
+        await configure_gateway(await store.get_runtime_config(), force_enabled=previous_enabled)
         raise HTTPException(502, f"云函数部署或验证失败：{exc}") from exc
 
     return ServerlessProxyDeployResponse(
@@ -471,7 +654,7 @@ async def enable_serverless_proxy() -> ServerlessProxyEnableResponse:
     store = current_repo()
     config = await store.get_runtime_config()
     row = config["serverless_proxy"]
-    if not str(row.get("endpoint") or "").strip():
+    if not str(row.get("endpoint") or "").strip() and not any(node.get("endpoint") for node in pool_nodes(row)):
         raise HTTPException(400, "请先一键部署云函数")
     await store.set_serverless_proxy_status("testing", enabled=False)
     try:
@@ -519,22 +702,48 @@ async def test_serverless_proxy_route() -> ServerlessProxyTestResponse:
         raise HTTPException(502, str(exc)) from exc
 
 
-@app.delete("/api/v1/settings/serverless-proxy/deployment", response_model=SettingsResponse)
-async def delete_serverless_proxy_deployment() -> SettingsResponse:
-    store = current_repo()
+async def _delete_serverless_node(store: Repository, node_id: str) -> SettingsResponse:
     config = await store.get_runtime_config()
     row = config["serverless_proxy"]
-    if row.get("provider") == "custom" or not row.get("deployment_id"):
-        raise HTTPException(400, "当前配置不是由平台部署的云函数")
+    target = next((item for item in pool_nodes(row) if item.get("id") == node_id), None)
+    if target is None:
+        raise HTTPException(404, "云函数节点不存在")
+    if target.get("provider") == "custom" or not target.get("deployment_id"):
+        raise HTTPException(400, "当前节点不是由平台部署的云函数")
     try:
-        await run_cloud_operation("destroy", row)
+        await run_cloud_operation("destroy", target)
     except ServerlessProxyError as exc:
         await store.set_serverless_proxy_status("error", str(exc))
         raise HTTPException(502, str(exc)) from exc
-    await store.clear_serverless_proxy_deployment()
+    _, remaining = remove_pool_node(row, node_id)
+    primary = next((item for item in remaining if item.get("endpoint")), None)
+    payload = {**row, "nodes": remaining}
+    if primary:
+        payload.update(primary)
+        payload["enabled"] = bool(row.get("enabled"))
+        payload["status"] = "ready" if primary.get("status") == "ready" else "configured"
+    else:
+        payload.update({"enabled": False, "endpoint": "", "deployment_id": "", "status": "not_configured", "last_error": ""})
+    await store.update_serverless_proxy(payload)
     config = await store.get_runtime_config()
     await configure_gateway(config)
     return settings_view(config)
+
+
+@app.delete("/api/v1/settings/serverless-proxy/nodes/{node_id}", response_model=SettingsResponse)
+async def delete_serverless_proxy_node(node_id: str) -> SettingsResponse:
+    return await _delete_serverless_node(current_repo(), node_id)
+
+
+@app.delete("/api/v1/settings/serverless-proxy/deployment", response_model=SettingsResponse)
+async def delete_serverless_proxy_deployment() -> SettingsResponse:
+    store = current_repo()
+    row = (await store.get_runtime_config())["serverless_proxy"]
+    target = next((item for item in pool_nodes(row) if item.get("id") == f"{row.get('provider')}:{row.get('region')}:{row.get('function_name')}"), None)
+    target = target or next((item for item in pool_nodes(row) if item.get("deployment_id")), None)
+    if target is None:
+        raise HTTPException(400, "当前配置不是由平台部署的云函数")
+    return await _delete_serverless_node(store, str(target["id"]))
 
 
 @app.put("/api/v1/settings/sessions/{provider}", response_model=SettingsResponse)

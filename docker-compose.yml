@@ -21,6 +21,7 @@ services:
       DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
       MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
+      ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
       SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
       SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
       SERVERLESS_PROXY_MIIT_URL: http://seamoon-gateway:19080
@@ -45,6 +46,7 @@ services:
       DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
       MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
+      ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
       SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
       SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
       SERVERLESS_PROXY_MIIT_URL: http://seamoon-gateway:19080

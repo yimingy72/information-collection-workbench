@@ -165,6 +165,25 @@ class ProviderSessionView(BaseModel):
 CloudProvider = Literal["aliyun", "tencent", "custom"]
 
 
+class ServerlessProxyNodeView(BaseModel):
+    id: str
+    enabled: bool
+    provider: CloudProvider
+    endpoint: str
+    region: str
+    function_name: str
+    image_uri: str
+    access_key_id: str
+    has_access_key_secret: bool
+    insecure_skip_verify: bool
+    deployment_id: str
+    status: str
+    last_error: str
+    latency_ms: int | None = None
+    failure_count: int = 0
+    updated_at: datetime | None = None
+
+
 class ServerlessProxyView(BaseModel):
     enabled: bool
     provider: CloudProvider
@@ -180,11 +199,49 @@ class ServerlessProxyView(BaseModel):
     last_error: str
     local_proxy_url: str
     updated_at: datetime | None = None
+    nodes: list[ServerlessProxyNodeView] = Field(default_factory=list)
+
+
+class ManualProxyView(BaseModel):
+    id: UUID
+    scheme: Literal["http", "https"]
+    host: str
+    port: int
+    username: str
+    has_password: bool
+    enabled: bool
+    status: str
+    latency_ms: int | None = None
+    failure_count: int = 0
+    last_error: str
+    last_tested_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class SettingsResponse(BaseModel):
     sessions: list[ProviderSessionView]
     serverless_proxy: ServerlessProxyView
+    manual_proxies: list[ManualProxyView] = Field(default_factory=list)
+
+
+class ManualProxyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proxy_url: str = Field(min_length=1, max_length=2000)
+    enabled: bool = True
+
+    @field_validator("proxy_url")
+    @classmethod
+    def strip_proxy_url(cls, value: str) -> str:
+        return str(value or "").strip()
+
+
+class ManualProxyTestResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    proxy_id: UUID
+    latency_ms: int
+    target: str
 
 
 class ServerlessProxyRequest(BaseModel):
@@ -199,6 +256,7 @@ class ServerlessProxyRequest(BaseModel):
     access_key_id: str = Field(default="", max_length=512)
     access_key_secret: str | None = Field(default=None, max_length=2000)
     insecure_skip_verify: bool = False
+    node_id: str | None = Field(default=None, max_length=300)
 
     @field_validator("endpoint", "region", "function_name", "image_uri", "access_key_id")
     @classmethod
@@ -218,6 +276,8 @@ class ServerlessProxyTestResponse(BaseModel):
     latency_ms: int
     endpoint: str
     target: str
+    tested_nodes: int = 1
+    successful_nodes: int = 1
 
 
 class ServerlessProxyEnableResponse(BaseModel):

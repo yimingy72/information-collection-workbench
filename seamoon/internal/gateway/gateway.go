@@ -21,13 +21,15 @@ import (
 )
 
 type Config struct {
-	Enabled            bool   `json:"enabled"`
-	Endpoint           string `json:"endpoint"`
-	InsecureSkipVerify bool   `json:"insecure_skip_verify"`
+	Enabled            bool     `json:"enabled"`
+	Endpoint           string   `json:"endpoint"` // legacy first endpoint
+	Endpoints          []string `json:"endpoints,omitempty"`
+	InsecureSkipVerify bool     `json:"insecure_skip_verify"`
 }
 
 type Gateway struct {
 	config atomic.Value
+	cursor atomic.Uint64
 }
 
 func New() *Gateway {
@@ -41,12 +43,33 @@ func (g *Gateway) Current() Config {
 }
 
 func (g *Gateway) Update(next Config) error {
-	if next.Enabled {
-		endpoint, err := normalizeEndpoint(next.Endpoint)
+	rawEndpoints := append([]string(nil), next.Endpoints...)
+	if len(rawEndpoints) == 0 && strings.TrimSpace(next.Endpoint) != "" {
+		rawEndpoints = []string{next.Endpoint}
+	}
+	normalized := make([]string, 0, len(rawEndpoints))
+	seen := make(map[string]struct{}, len(rawEndpoints))
+	for _, raw := range rawEndpoints {
+		value := strings.TrimSpace(raw)
+		if value == "" {
+			continue
+		}
+		endpoint, err := normalizeEndpoint(value)
 		if err != nil {
 			return err
 		}
-		next.Endpoint = endpoint
+		if _, ok := seen[endpoint]; ok {
+			continue
+		}
+		seen[endpoint] = struct{}{}
+		normalized = append(normalized, endpoint)
+	}
+	if next.Enabled && len(normalized) == 0 {
+		return errors.New("at least one cloud function endpoint is required")
+	}
+	next.Endpoints = normalized
+	if len(normalized) > 0 {
+		next.Endpoint = normalized[0]
 	} else {
 		next.Endpoint = strings.TrimSpace(next.Endpoint)
 	}
@@ -111,7 +134,7 @@ func (g *Gateway) ServeProxy(ctx context.Context, address string) error {
 func (g *Gateway) handle(client net.Conn) {
 	defer client.Close()
 	config := g.Current()
-	if !config.Enabled || config.Endpoint == "" {
+	if !config.Enabled || len(config.Endpoints) == 0 {
 		_, _ = io.WriteString(client, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 37\r\n\r\nSeaMoon cloud function is not enabled")
 		return
 	}
@@ -124,19 +147,23 @@ func (g *Gateway) handle(client net.Conn) {
 			InsecureSkipVerify: config.InsecureSkipVerify,
 		},
 	}
-	ws, response, err := dialer.Dial(config.Endpoint, nil)
-	if err != nil {
+	start := int(g.cursor.Add(1)-1) % len(config.Endpoints)
+	for attempt := range config.Endpoints {
+		endpoint := config.Endpoints[(start+attempt)%len(config.Endpoints)]
+		ws, response, err := dialer.Dial(endpoint, nil)
+		if err == nil {
+			remote := tunnel.Wrap(ws)
+			defer remote.Close()
+			relay(client, remote)
+			return
+		}
 		status := ""
 		if response != nil {
 			status = response.Status
 		}
-		log.Printf("SeaMoon gateway dial failed endpoint=%s status=%s err=%v", config.Endpoint, status, err)
-		_, _ = io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 34\r\n\r\nSeaMoon cloud function unavailable")
-		return
+		log.Printf("SeaMoon gateway dial failed endpoint=%s status=%s err=%v", endpoint, status, err)
 	}
-	remote := tunnel.Wrap(ws)
-	defer remote.Close()
-	relay(client, remote)
+	_, _ = io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 34\r\n\r\nSeaMoon cloud function unavailable")
 }
 
 func relay(left, right net.Conn) {

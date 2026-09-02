@@ -143,6 +143,7 @@ class beian:
         self.sign = "eyJ0eXBlIjozLCJleHREYXRhIjp7InZhZnljb2RlX2ltYWdlX2tleSI6IjUyZWI1ZTcyODViNzRmNWJhM2YwYzBkNTg0YTg3NmVmIn0sImUiOjE3NTY5NzAyNDg4MjN9.Ngpkwn4T7sQoQF9pCk_sQQpH61wQUEKnK2sQ8hDIq-Q"
         self.token = ""
         self.token_expire = 0
+        self._token_cache = {}
         self.check_img_cache = {}
         self.check_img_lock = asyncio.Lock()
         self.timeout = aiohttp.ClientTimeout(total=getattr(getattr(config, 'system', object()), 'http_client_timeout', 30))
@@ -358,16 +359,27 @@ class beian:
         if state is not None:
             await self._close_page_session_state(state)
 
-    async def get_token(self, proxy=""):
+    async def get_token(self, proxy="", session_key="", session=None):
+        # Keep clearance and token state scoped to the same YMICP page session.
+        # The proxy URL itself is a shared logical address and does not identify
+        # the actual cloud-function egress IP.
+        cache_key = session_key or proxy or "direct"
         base_header = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.41 Safari/537.36 Edg/101.0.1210.32",
             "Origin": "https://beian.miit.gov.cn",
             "Referer": "https://beian.miit.gov.cn/",
-            "Cookie": await ymicp_jsl.solve_clearance(proxy),
+            "Cookie": await ymicp_jsl.solve_clearance(
+                proxy,
+                cache_key=cache_key,
+                session=session,
+            ),
             "Accept": "application/json, text/plain, */*",
         }
 
-        if self.token_expire > int(time.time() * 1000):
+        cached = self._token_cache.get(cache_key)
+        if cached and cached[1] > int(time.time() * 1000):
+            return True, cached[0], base_header
+        if not session_key and self.token_expire > int(time.time() * 1000):
             return True, self.token, base_header
 
         timeStamp = round(time.time() * 1000)
@@ -375,32 +387,36 @@ class beian:
         authKey = hashlib.md5(authSecret.encode(encoding="UTF-8")).hexdigest()
         auth_data = {"authKey": authKey, "timeStamp": timeStamp}
 
-        try:
-            async with self.get_session(proxy) as session:
-                current_ip = None
-                if hasattr(session, '_connector') and hasattr(session._connector, '_local_addr'):
-                    current_ip = session._connector._local_addr[0] if session._connector._local_addr else None
-                async with session.post(self.url, data=auth_data, headers=base_header, proxy=proxy if proxy else None) as req:
-                    req_text = await req.text()
+        async def request_token(active_session):
+            current_ip = None
+            if hasattr(active_session, '_connector') and hasattr(active_session._connector, '_local_addr'):
+                current_ip = active_session._connector._local_addr[0] if active_session._connector._local_addr else None
+            async with active_session.post(self.url, data=auth_data, headers=base_header, proxy=proxy if proxy else None) as req:
+                req_text = await req.text()
 
-                    if "当前访问疑似黑客攻击" in req_text:
-                        if current_ip:
-                            await self._add_blocked_ip(current_ip)
-                        elif not proxy and self.local_ipv6_addresses:
-                            # Bug 9 修复：使用异步方式获取被拦截的 IPv6 索引
-                            if self._last_used_ipv6_index >= 0:
-                                blocked_ip = self.local_ipv6_addresses[self._last_used_ipv6_index]
-                                await self._add_blocked_ip(blocked_ip)
-                        return False, "当前访问已被创宇盾拦截", ""
+                if "当前访问疑似黑客攻击" in req_text:
+                    if current_ip:
+                        await self._add_blocked_ip(current_ip)
+                    elif not proxy and self.local_ipv6_addresses:
+                        if self._last_used_ipv6_index >= 0:
+                            blocked_ip = self.local_ipv6_addresses[self._last_used_ipv6_index]
+                            await self._add_blocked_ip(blocked_ip)
+                    return False, "当前访问已被创宇盾拦截", ""
 
-                    t = ujson.loads(req_text)
-                    token = t["params"]["bussiness"]
-                    expire = int(time.time() * 1000) + t["params"]["expire"]
-
+                t = ujson.loads(req_text)
+                token = t["params"]["bussiness"]
+                expire = int(time.time() * 1000) + t["params"]["expire"]
+                self._token_cache[cache_key] = (token, expire)
+                if not session_key:
                     self.token = token
                     self.token_expire = expire
+                return True, token, base_header
 
-                    return True, token, base_header
+        try:
+            if session is not None:
+                return await request_token(session)
+            async with self.get_session(proxy) as owned_session:
+                return await request_token(owned_session)
         except Exception as e:
             logger.warning(f"get_token Faile : {e}")
             return False, str(e), ""
@@ -492,21 +508,23 @@ class beian:
         logger.info(f"缺口定位：x={offset_x}, 滑块={sw}x{sh}")
         return True, offset_x
 
-    async def check_img(self, proxy=""):
+    async def check_img(self, proxy="", session_key="", session=None):
         now = time.time()
-        cached = self.check_img_cache.get("data")
-        if cached and now - cached["time"] < 20 and cached.get("proxy") == proxy:
+        cache_key = session_key or proxy or "direct"
+        cached = self.check_img_cache.get(cache_key)
+        if cached and now - cached["time"] < 20:
             return True, cached["uuid"], cached["token"], cached["sign"], cached["base_header"]
 
         async with self.check_img_lock:
             now = time.time()
-            cached = self.check_img_cache.get("data")
-            if cached and now - cached["time"] < 20 and cached.get("proxy") == proxy:
+            cached = self.check_img_cache.get(cache_key)
+            if cached and now - cached["time"] < 20:
                 return True, cached["uuid"], cached["token"], cached["sign"], cached["base_header"]
-            return await self._check_img_solve(proxy)
+            return await self._check_img_solve(proxy, session_key, session)
 
-    async def _check_img_solve(self, proxy=""):
-        success, token, base_header = await self.get_token(proxy)
+    async def _check_img_solve(self, proxy="", session_key="", session=None):
+        cache_key = session_key or proxy or "direct"
+        success, token, base_header = await self.get_token(proxy, session_key, session)
         if not success:
             logger.info(f"获取 token 失败：{token}")
             return False, token, '', '', ''
@@ -515,10 +533,17 @@ class beian:
             length = str(len(str(data).encode("utf-8")))
             base_header.update({"Content-Length": length, "token": token})
             base_header["Content-Type"] = "application/json"
+
+            async def request_check_image(active_session):
+                async with active_session.post(self.getCheckImage, data=data, headers=base_header, proxy=proxy if proxy else None) as req:
+                    return await req.json()
+
             try:
-                async with self.get_session(proxy) as session:
-                    async with session.post(self.getCheckImage, data=data, headers=base_header, proxy=proxy if proxy else None) as req:
-                        res = await req.json()
+                if session is not None:
+                    res = await request_check_image(session)
+                else:
+                    async with self.get_session(proxy) as owned_session:
+                        res = await request_check_image(owned_session)
             except Exception as e:
                 logger.info(f"请求验证码时失败：{e}")
                 return False, f"请求验证码时失败：{e}", '', '', ''
@@ -538,9 +563,16 @@ class beian:
             logger.info(f"checkImage 请求体：{check_data}")
             length = str(len(check_data.encode("utf-8")))
             base_header.update({"Content-Length": length})
-            async with self.get_session(proxy) as session:
-                async with session.post(self.checkImage, data=check_data, headers=base_header, proxy=proxy if proxy else None) as req:
-                    res = await req.text()
+
+            async def request_check(active_session):
+                async with active_session.post(self.checkImage, data=check_data, headers=base_header, proxy=proxy if proxy else None) as req:
+                    return await req.text()
+
+            if session is not None:
+                res = await request_check(session)
+            else:
+                async with self.get_session(proxy) as owned_session:
+                    res = await request_check(owned_session)
 
             data = ujson.loads(res)
             logger.info(f"checkImage 响应：code={data.get('code')}, msg={data.get('msg')}, success={data.get('success')}")
@@ -557,20 +589,18 @@ class beian:
                         f.write(base64.b64decode(big_image))
                     logger.info(f"失败验证码已保存：{filename}")
                 return False, "验证码识别失败", '', '', ''
-            else:
-                sign = data["params"]
-                self.check_img_cache["data"] = {
-                    "time": time.time(),
-                    "proxy": proxy,
-                    "uuid": p_uuid,
-                    "token": token,
-                    "sign": sign,
-                    "base_header": base_header,
-                }
-                return True, p_uuid, token, sign, base_header
-
+            sign = data["params"]
+            self.check_img_cache[cache_key] = {
+                "time": time.time(),
+                "proxy": proxy,
+                "uuid": p_uuid,
+                "token": token,
+                "sign": sign,
+                "base_header": base_header,
+            }
+            return True, p_uuid, token, sign, base_header
         except Exception as e:
-            logger.warning(f"check_image Faile : {e}")
+            logger.info(f"验证码处理失败：{e}")
             return False, str(e), '', '', ''
 
     async def getAppAndMiniDetail(self, dataId, serviceType, p_uuid, token, sign, base_header, proxy=""):
@@ -614,7 +644,7 @@ class beian:
             if use_captcha:
                 auth = cached_auth if cached_auth and cached_auth.get("mode") == "captcha" else None
                 if auth is None:
-                    success, p_uuid, token, sign, auth_header = await self.check_img(proxy)
+                    success, p_uuid, token, sign, auth_header = await self.check_img(proxy, session_key, session)
                     if not success:
                         logger.info(f"打码失败：{p_uuid}")
                         return False, p_uuid, None
@@ -646,7 +676,7 @@ class beian:
 
             auth = cached_auth if cached_auth and cached_auth.get("mode") == "token" else None
             if auth is None:
-                success, token, auth_header = await self.get_token(proxy)
+                success, token, auth_header = await self.get_token(proxy, session_key, session)
                 if not success:
                     logger.info("获取 token 失败")
                     return False, token, None

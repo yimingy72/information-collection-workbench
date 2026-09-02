@@ -7,6 +7,8 @@ import type {
   RunList,
   ServerlessProxyDeployResult,
   ServerlessProxyEnableResult,
+  ManualProxy,
+  ManualProxyTest,
   ServerlessProxyTest,
   ServerlessProxyValues,
   SessionProviderId,
@@ -102,6 +104,30 @@ export const disableServerlessProxy = () =>
 
 export const deleteServerlessProxyDeployment = () =>
   api<SettingsView>('/api/v1/settings/serverless-proxy/deployment', { method: 'DELETE' })
+
+export const deleteServerlessProxyNode = (nodeId: string) =>
+  api<SettingsView>(`/api/v1/settings/serverless-proxy/nodes/${encodeURIComponent(nodeId)}`, { method: 'DELETE' })
+
+export const createManualProxy = (proxyUrl: string, enabled = true) =>
+  api<ManualProxy>('/api/v1/settings/manual-proxies', {
+    method: 'POST',
+    body: JSON.stringify({ proxy_url: proxyUrl, enabled }),
+  })
+
+export const updateManualProxy = (proxyId: string, proxyUrl: string, enabled = true) =>
+  api<ManualProxy>(`/api/v1/settings/manual-proxies/${proxyId}`, {
+    method: 'PUT',
+    body: JSON.stringify({ proxy_url: proxyUrl, enabled }),
+  })
+
+export const deleteManualProxy = (proxyId: string) =>
+  api<{ deleted: number }>(`/api/v1/settings/manual-proxies/${proxyId}`, { method: 'DELETE' })
+
+export const toggleManualProxy = (proxyId: string) =>
+  api<ManualProxy>(`/api/v1/settings/manual-proxies/${proxyId}/toggle`, { method: 'POST' })
+
+export const testManualProxy = (proxyId: string) =>
+  api<ManualProxyTest>(`/api/v1/settings/manual-proxies/${proxyId}/test`, { method: 'POST' })
 
 export const clearSession = (provider: SessionProviderId) =>
   api<SettingsView>(`/api/v1/settings/sessions/${provider}`, { method: 'DELETE' })

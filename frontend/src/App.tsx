@@ -15,6 +15,7 @@ import './styles.css'
 const parseHash = () => {
   const raw = location.hash.replace(/^#/, '') || 'collection'
   if (raw === 'dashboard' || raw === 'history') return 'tasks'
+  if (raw === 'proxy-settings') return 'settings'
   if (raw.startsWith('results/')) return `collection/${raw.slice('results/'.length)}`
   return raw
 }
@@ -173,9 +174,11 @@ function Workbench({
     }
   }
 
-  const title = page === 'settings' ? '基础配置' : page === 'tasks' ? '历史查询' : 'ICP备案查询'
+  const title = page === 'settings' ? '基础配置' : page === 'proxy-settings' ? '基础配置' : page === 'tasks' ? '历史查询' : 'ICP备案查询'
 
   const content = page === 'settings' ? (
+    <SettingsPage />
+  ) : page === 'proxy-settings' ? (
     <SettingsPage />
   ) : page === 'tasks' ? (
     <TasksPage
@@ -228,6 +231,7 @@ function Workbench({
           message.error(error instanceof Error ? error.message : '删除失败')
         }
       }}
+      settings={settings}
     />
   )
 

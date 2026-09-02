@@ -233,7 +233,7 @@ class Repository:
 
     async def results(
         self, run_id: UUID, category: str | None, limit: int, offset: int,
-        relationship_limit: int = 200, relationship_offset: int = 0,
+        relationship_limit: int | None = 200, relationship_offset: int = 0,
     ) -> tuple[list, list, int, int]:
         if category:
             rows = await self.pool.fetch(
@@ -259,8 +259,7 @@ class Repository:
                 run_id, limit, offset,
             )
             count_result = await self.pool.fetchval("SELECT count(*) FROM results WHERE run_id=$1", run_id)
-        rels = await self.pool.fetch(
-            """
+        relationship_query = """
             SELECT rel.id,rel.parent_entity_id,p.name parent_name,rel.child_entity_id,c.name child_name,
                    rel.relation_type,rel.holding_percent,rel.depth,rel.reference,rel.source_url,rel.captured_at,
                    rel.raw_payload
@@ -269,10 +268,17 @@ class Repository:
               JOIN entities c ON c.id=rel.child_entity_id
              WHERE rel.run_id=$1
              ORDER BY rel.depth,rel.id
-             LIMIT $2 OFFSET $3
-            """,
-            run_id, relationship_limit, relationship_offset,
-        )
+        """
+        if relationship_limit is None:
+            # The query view needs the complete relationship set. A fixed 1000-row
+            # limit here made historical records appear truncated even though the
+            # remaining relationships were already persisted in PostgreSQL.
+            rels = await self.pool.fetch(relationship_query, run_id)
+        else:
+            rels = await self.pool.fetch(
+                relationship_query + " LIMIT $2 OFFSET $3",
+                run_id, relationship_limit, relationship_offset,
+            )
         count_rel = await self.pool.fetchval("SELECT count(*) FROM relationships WHERE run_id=$1", run_id)
         return rows, rels, int(count_result or 0), int(count_rel or 0)
 
@@ -291,6 +297,7 @@ class Repository:
                 SELECT e.name FROM results r
                   JOIN entities e ON e.id = r.entity_id
                  WHERE r.run_id = $1
+                   AND r.category IN ('company_selection', 'invest', 'partner')
             ) names
             ORDER BY name
             """,
@@ -312,9 +319,11 @@ class Repository:
         serverless_proxy = await self.pool.fetchrow(
             "SELECT * FROM serverless_proxy_settings WHERE id=1"
         )
+        manual_proxies = await self.pool.fetch("SELECT * FROM manual_proxy_nodes ORDER BY created_at, id")
         return {
             "sessions": {row["provider"]: dict(row) for row in sessions},
             "serverless_proxy": dict(serverless_proxy) if serverless_proxy else {},
+            "manual_proxies": [dict(row) for row in manual_proxies],
         }
 
     async def update_serverless_proxy(self, config: dict[str, Any]) -> asyncpg.Record:
@@ -330,6 +339,7 @@ class Repository:
                    access_key_id=$7,
                    access_key_secret=COALESCE($8, access_key_secret),
                    insecure_skip_verify=$9,
+                   nodes=COALESCE($10::jsonb, nodes),
                    deployment_id=CASE
                      WHEN provider <> $2 OR region <> $4 OR function_name <> $5 THEN ''
                      ELSE deployment_id
@@ -347,6 +357,7 @@ class Repository:
             config["enabled"], config["provider"], config["endpoint"], config["region"],
             config["function_name"], config["image_uri"], config["access_key_id"],
             config.get("access_key_secret"), config["insecure_skip_verify"],
+            json.dumps(config["nodes"]) if "nodes" in config else None,
         )
 
     async def set_serverless_proxy_status(
@@ -386,6 +397,95 @@ class Repository:
              WHERE id=1
             RETURNING *
             """
+        )
+
+    async def list_manual_proxies(self) -> list[asyncpg.Record]:
+        return await self.pool.fetch(
+            "SELECT * FROM manual_proxy_nodes ORDER BY created_at, id"
+        )
+
+    async def get_manual_proxy(self, proxy_id: UUID) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            "SELECT * FROM manual_proxy_nodes WHERE id=$1",
+            proxy_id,
+        )
+
+    async def create_manual_proxy(
+        self,
+        *,
+        scheme: str,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        enabled: bool,
+    ) -> asyncpg.Record:
+        return await self.pool.fetchrow(
+            """
+            INSERT INTO manual_proxy_nodes
+              (scheme, host, port, username, password, enabled, status, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $6 THEN 'configured' ELSE 'disabled' END, now())
+            RETURNING *
+            """,
+            scheme, host, port, username, password, enabled,
+        )
+
+    async def update_manual_proxy(
+        self,
+        proxy_id: UUID,
+        *,
+        scheme: str,
+        host: str,
+        port: int,
+        username: str,
+        password: str | None,
+        enabled: bool,
+    ) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            """
+            UPDATE manual_proxy_nodes
+               SET scheme=$2,
+                   host=$3,
+                   port=$4,
+                   username=$5,
+                   password=COALESCE($6, password),
+                   enabled=$7,
+                   status=CASE WHEN $7 THEN CASE WHEN status='ready' THEN status ELSE 'configured' END ELSE 'disabled' END,
+                   last_error=CASE WHEN $7 THEN '' ELSE last_error END,
+                   updated_at=now()
+             WHERE id=$1
+            RETURNING *
+            """,
+            proxy_id, scheme, host, port, username, password, enabled,
+        )
+
+    async def delete_manual_proxy(self, proxy_id: UUID) -> int:
+        result = await self.pool.execute("DELETE FROM manual_proxy_nodes WHERE id=$1", proxy_id)
+        return int(str(result).split()[-1])
+
+    async def set_manual_proxy_result(
+        self,
+        proxy_id: UUID,
+        *,
+        status: str,
+        latency_ms: int | None = None,
+        error: str = "",
+        enabled: bool | None = None,
+    ) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            """
+            UPDATE manual_proxy_nodes
+               SET status=$2,
+                   latency_ms=$3,
+                   last_error=$4,
+                   enabled=COALESCE($5, enabled),
+                   failure_count=CASE WHEN $2='ready' THEN 0 ELSE failure_count + 1 END,
+                   last_tested_at=now(),
+                   updated_at=now()
+             WHERE id=$1
+            RETURNING *
+            """,
+            proxy_id, status, latency_ms, error, enabled,
         )
 
     async def list_provider_sessions(self) -> list[asyncpg.Record]:

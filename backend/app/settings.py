@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql://workbench:workbench@localhost:5432/workbench"
     tianyancha_base_url: str = "https://capi.tianyancha.com"
     miit_api_url: str = "http://127.0.0.1:16181"
+    icp_proxy_control_token: str = "asset-workbench-local"
     worker_poll_seconds: float = 1.0
     worker_lease_seconds: int = 120
     worker_concurrency: int = 2

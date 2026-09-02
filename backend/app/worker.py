@@ -10,7 +10,7 @@ from app.collector import RunSpec, collect_run
 from app.providers.names import normalize_providers
 from app.providers.registry import build_providers, login_required_errors
 from app.repository import LeaseLost, Repository, create_pool
-from app.serverless_proxy import configure_gateway
+from app.serverless_proxy import configure_gateway_for_active_route
 from app.settings import settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -44,7 +44,7 @@ async def worker_loop(repo: Repository, provider_lock: asyncio.Lock) -> None:
             providers=provider_ids, lease_id=run["lease_id"],
         )
         try:
-            await configure_gateway(config)
+            await configure_gateway_for_active_route(config)
             providers = build_providers(provider_ids, config)
             if not providers:
                 await repo.finish(spec.id, "failed", "；".join(login_errors) or "请先登录对应数据源", lease_id=spec.lease_id)

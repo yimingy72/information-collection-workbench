@@ -51,40 +51,57 @@ var window=globalThis;
     return context.eval("document.cookie")
 
 
-async def solve_clearance(proxy: str = "") -> str:
-    now = time.time()
-    cached = _cache.get("clearance")
-    if cached and now - cached[0] < CACHE_TTL_SECONDS:
-        return cached[1]
-
+async def _solve_clearance(session: aiohttp.ClientSession, proxy: str = "") -> str:
     cookies: dict[str, str] = {}
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
     }
-    async with aiohttp.ClientSession() as session:
-        for _ in range(5):
-            if cookies:
-                headers["Cookie"] = _join_cookies(cookies)
-            async with session.get(HOME_URL, headers=headers, proxy=proxy or None, timeout=15) as response:
-                text = await response.text()
-                set_cookie = response.headers.get("set-cookie")
-                if set_cookie:
-                    cookies.update(_cookie_dict(set_cookie))
-                if response.status == 200:
-                    result = _join_cookies(cookies)
-                    _cache["clearance"] = (now, result)
-                    return result
-                scripts = _script_re.findall(text)
-                if not scripts:
-                    break
-                try:
-                    doc_cookie = _eval_script(scripts[0], _join_cookies(cookies))
-                    cookies.update(_cookie_dict(doc_cookie))
-                except Exception:
-                    break
+    for _ in range(5):
+        if cookies:
+            headers["Cookie"] = _join_cookies(cookies)
+        async with session.get(HOME_URL, headers=headers, proxy=proxy or None, timeout=15) as response:
+            text = await response.text()
+            set_cookie = response.headers.get("set-cookie")
+            if set_cookie:
+                cookies.update(_cookie_dict(set_cookie))
+            if response.status == 200:
+                return _join_cookies(cookies)
+            scripts = _script_re.findall(text)
+            if not scripts:
+                break
+            try:
+                doc_cookie = _eval_script(scripts[0], _join_cookies(cookies))
+                cookies.update(_cookie_dict(doc_cookie))
+            except Exception:
+                break
+    return _join_cookies(cookies)
 
-    result = _join_cookies(cookies)
-    if result:
-        _cache["clearance"] = (now, result)
-    return result
+
+async def solve_clearance(
+    proxy: str = "",
+    *,
+    cache_key: str = "",
+    session: aiohttp.ClientSession | None = None,
+) -> str:
+    """Get the MIIT clearance cookie without mixing proxy sessions.
+
+    A cached clearance cookie is only safe for the same proxy route. Page
+    sessions now pass a unique cache key and their existing aiohttp session, so
+    a cookie obtained through one SeaMoon tunnel is not reused by another.
+    """
+    now = time.time()
+    key = cache_key or proxy or "direct"
+    if session is None:
+        cached = _cache.get(key)
+        if cached and now - cached[0] < CACHE_TTL_SECONDS:
+            return cached[1]
+        async with aiohttp.ClientSession() as owned_session:
+            result = await _solve_clearance(owned_session, proxy)
+        if result:
+            _cache[key] = (now, result)
+        return result
+
+    # Do not use the process-wide cache when an active page session is
+    # provided: the session's proxy connection is the route affinity boundary.
+    return await _solve_clearance(session, proxy)

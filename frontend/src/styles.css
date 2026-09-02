@@ -681,3 +681,52 @@ body,
     align-self: flex-start;
   }
 }
+
+.proxy-settings-note {
+  margin-bottom: 10px;
+}
+
+.manual-proxy-form {
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.manual-proxy-input {
+  flex: 1 1 520px;
+  min-width: 260px;
+  margin-bottom: 0;
+}
+
+.manual-proxy-table .ant-typography {
+  max-width: 100%;
+}
+
+.proxy-settings-error {
+  margin-bottom: 10px;
+}
+
+.serverless-node-table .ant-table-cell {
+  white-space: nowrap;
+}
+
+
+.query-route-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.query-route-status .ant-tag {
+  margin-inline-end: 0;
+}
+
+@media (max-width: 760px) {
+  .query-route-status {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+}

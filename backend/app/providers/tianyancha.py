@@ -70,52 +70,97 @@ class AnonymousTianyancha:
         self,
         base_url: str,
         timeout: float = 20.0,
-        retries: int = 2,
-        proxy: str = "",
+        retries: int = 4,
+        proxy: str | list[str] = "",
     ) -> None:
-        self.client = httpx.AsyncClient(
-            base_url=base_url.rstrip("/"),
-            timeout=timeout,
-            trust_env=False,
-            proxy=proxy or None,
-            headers={
-                "User-Agent": (
+        if isinstance(proxy, str):
+            self._proxy_routes = [proxy] if proxy else []
+        else:
+            self._proxy_routes = list(dict.fromkeys(route for route in proxy if route))
+        self._proxy_index = 0
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self._headers = {
+            "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.60 Safari/537.36"
-                ),
-                "Accept": "text/html,application/json,application/xhtml+xml, image/jxr, */*",
-                "Version": "TYC-Web",
-                "Content-Type": "application/json",
-                "Origin": "https://www.tianyancha.com",
-                "Referer": "https://www.tianyancha.com/",
-            },
+            ),
+            "Accept": "text/html,application/json,application/xhtml+xml, image/jxr, */*",
+            "Version": "TYC-Web",
+            "Content-Type": "application/json",
+            "Origin": "https://www.tianyancha.com",
+            "Referer": "https://www.tianyancha.com/",
+        }
+        self.client = self._make_client()
+        self.retries = max(0, retries)
+        # After one query has exhausted its immediate attempts, the collector
+        # retries only that failed company once at the end of the queue.
+        self.failed_company_retries = 1
+
+    @property
+    def current_proxy(self) -> str:
+        return self._proxy_routes[self._proxy_index % len(self._proxy_routes)] if self._proxy_routes else ""
+
+    def _make_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
+            base_url=self._base_url,
+            timeout=self._timeout,
+            trust_env=False,
+            proxy=self.current_proxy or None,
+            headers=self._headers,
         )
-        self.retries = retries
+
+    async def _rotate_proxy(self) -> None:
+        if not self._proxy_routes:
+            return
+        # A new client also resets a stale keep-alive connection. With several
+        # routes, advance to the next exit; with one route, simply recreate the
+        # connection without pretending the public IP changed.
+        previous = self.client
+        if len(self._proxy_routes) > 1:
+            self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
+        self.client = self._make_client()
+        await previous.aclose()
 
     async def close(self) -> None:
         await self.client.aclose()
 
+    async def reset_after_failure(self) -> None:
+        """Open a fresh proxy tunnel before retrying only the failed company."""
+        await self._rotate_proxy()
+
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
-        for attempt in range(self.retries + 1):
+        attempts = max(1, self.retries + 1)
+        last_error: Exception | None = None
+        for attempt in range(attempts):
             try:
                 response = await self.client.request(method, path, **kwargs)
-                if response.status_code in {429, 433}:
-                    raise ProviderError(f"Tianyancha rate limited the request (HTTP {response.status_code})")
+                if response.status_code in {403, 429, 433, 500, 501, 502, 503, 504, 521}:
+                    raise ProviderError(f"Tianyancha request rejected (HTTP {response.status_code})")
                 response.raise_for_status()
-                data = response.json()
+                try:
+                    data = response.json()
+                except ValueError as exc:
+                    raise ProviderError("Tianyancha returned an invalid JSON response") from exc
                 if not isinstance(data, dict):
                     raise ProviderError("Tianyancha returned an invalid response")
                 if data.get("state") not in (None, "ok"):
-                    message = _provider_message(data)
-                    raise ProviderError(message)
+                    raise ProviderError(_provider_message(data))
                 return data
             except (httpx.HTTPError, ValueError, ProviderError) as exc:
-                if isinstance(exc, ProviderError) and ("rate limited" in str(exc) or _is_login_required(str(exc))):
-                    raise
-                if attempt >= self.retries:
-                    raise ProviderError(f"Tianyancha request failed: {exc}") from exc
-                await asyncio.sleep(0.25 * (2**attempt))
-        raise AssertionError("unreachable")
+                last_error = exc if isinstance(exc, ProviderError) else ProviderError(str(exc))
+                if attempt >= attempts - 1:
+                    break
+                # A business-level login wall can be intermittent and can be
+                # scoped to the current proxy tunnel. Rebuild the tunnel and
+                # immediately retry the exact same query. The configured proxy
+                # address may stay the same while its upstream exit changes.
+                login_wall = _is_login_required(str(exc))
+                await self._rotate_proxy()
+                if not login_wall:
+                    await asyncio.sleep(min(3.0, 0.25 * (2 ** min(attempt, 3))))
+        detail = str(last_error or "unknown error")
+        raise ProviderError(f"Tianyancha request failed after {attempts} attempts: {detail}") from last_error
 
     async def search(self, keyword: str) -> tuple[Company, list[Company]]:
         data = await self._request(
@@ -208,6 +253,9 @@ class AnonymousTianyancha:
         rows: list[Any] = []
         total = 0
         for page in range(1, max_pages + 1):
+            # _request retries this exact query/page and rebuilds the proxy
+            # tunnel on a login-wall response. Successfully completed earlier
+            # pages remain in ``rows`` and are not requested again.
             chunk, reported_total = await fetch(page)
             rows.extend(chunk)
             total = max(total, int(reported_total or 0))
@@ -221,6 +269,7 @@ class AnonymousTianyancha:
             if len(chunk) < page_size and not total:
                 return rows
         raise ProviderError(f"Tianyancha pagination exceeded {max_pages} pages")
+
 
 
 def _first_int(value: Any, *keys: str) -> int:

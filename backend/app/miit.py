@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from app.repository import Repository
-from app.serverless_proxy import miit_proxy_url
+from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls
 from app.settings import settings
 
 MAX_PAGES = 50
@@ -104,6 +104,58 @@ class _IcpCloudRotationScheduler:
             return self.generation
 
 
+class _IcpProxyPoolScheduler:
+    """Round-robin HTTP proxy pool with an independent five-request budget per node."""
+
+    def __init__(self, routes: list[str], request_limit: int) -> None:
+        self.routes = list(dict.fromkeys(route for route in routes if route))
+        self.request_limit = max(1, request_limit)
+        self.used = [0 for _ in self.routes]
+        self.generations = [0 for _ in self.routes]
+        self.cursor = 0
+        self.active = 0
+        self.condition = asyncio.Condition()
+
+    async def acquire(self, preferred_index: int | None = None) -> tuple[str, int, int]:
+        if not self.routes:
+            raise IcpPageError("暂无可用 HTTP 代理")
+        async with self.condition:
+            while True:
+                if not all(used >= self.request_limit for used in self.used):
+                    break
+                if self.active == 0:
+                    self.used = [0 for _ in self.routes]
+                    break
+                await self.condition.wait()
+            candidates: list[int] = []
+            if preferred_index is not None and 0 <= preferred_index < len(self.routes):
+                candidates.append(preferred_index)
+            candidates.extend(
+                (self.cursor + offset) % len(self.routes)
+                for offset in range(len(self.routes))
+                if (self.cursor + offset) % len(self.routes) not in candidates
+            )
+            for index in candidates:
+                if self.used[index] < self.request_limit:
+                    self.cursor = (index + 1) % len(self.routes)
+                    self.used[index] += 1
+                    self.active += 1
+                    return self.routes[index], index, self.generations[index]
+            raise IcpPageError("暂无可用 HTTP 代理")
+
+    async def release(self) -> None:
+        async with self.condition:
+            self.active = max(0, self.active - 1)
+            self.condition.notify_all()
+
+    async def rotate(self, index: int, generation: int) -> None:
+        async with self.condition:
+            if 0 <= index < len(self.routes) and self.generations[index] == generation:
+                self.used[index] = self.request_limit
+                self.generations[index] += 1
+            self.condition.notify_all()
+
+
 class _IcpRequestScheduler:
     """Throttle only direct requests that share one fixed local exit IP."""
 
@@ -179,7 +231,14 @@ async def _fetch_page(
 
     try:
         async with asyncio.timeout(timeout_seconds):
-            response = await client.get("/query/web", params=params, timeout=timeout)
+            headers = (
+                {"X-Workbench-Proxy-Token": settings.icp_proxy_control_token}
+                if route_proxy
+                else None
+            )
+            response = await client.get(
+                "/query/web", params=params, timeout=timeout, headers=headers
+            )
             if response.status_code >= 400:
                 raise _http_error(response)
             text = response.text.strip()
@@ -275,11 +334,31 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
         return []
     get_runtime_config = getattr(repo, "get_runtime_config", None)
     runtime_config = await get_runtime_config() if get_runtime_config else {}
-    route_proxy = miit_proxy_url(runtime_config)
-    route_label = "云函数代理" if route_proxy else "直连"
+    manual_routes = manual_proxy_urls(runtime_config)
+    route_proxies = miit_proxy_urls(runtime_config)
+    using_manual_proxy = bool(manual_routes)
+    using_cloud_proxy = not using_manual_proxy and bool(
+        runtime_config.get("serverless_proxy", {}).get("enabled")
+    ) and bool(route_proxies)
+    route_proxy = route_proxies[0] if len(route_proxies) == 1 else ""
+    route_label = (
+        "手动 HTTP 代理"
+        if using_manual_proxy
+        else "云函数代理"
+        if using_cloud_proxy
+        else "直连"
+    )
     batch_size = max(1, min(ICP_BATCH_SIZE, ICP_CONCURRENCY))
-    request_scheduler = _IcpRequestScheduler(batch_size, direct=True)
-    cloud_scheduler = _IcpCloudRotationScheduler(ICP_PROXY_REQUEST_LIMIT) if route_proxy else None
+    # A single manual proxy is a fixed route: do not apply the cloud tunnel
+    # generation counter to it. Otherwise its pagination session would be
+    # replaced every five pages even though no new exit IP can be created.
+    cloud_scheduler = (
+        _IcpCloudRotationScheduler(ICP_PROXY_REQUEST_LIMIT)
+        if using_cloud_proxy and route_proxy
+        else None
+    )
+    proxy_pool_scheduler = _IcpProxyPoolScheduler(route_proxies, ICP_PROXY_REQUEST_LIMIT) if len(route_proxies) > 1 else None
+    request_scheduler = _IcpRequestScheduler(batch_size, direct=not route_proxies)
 
     async def collect_company(name: str, client: httpx.AsyncClient) -> CompanyFailure | None:
         started = asyncio.get_running_loop().time()
@@ -309,7 +388,8 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                     pass_total: int | None = None
                     inconsistent = False
 
-                    page_waf_retries = 0
+                    page_proxy_retries = 0
+                    company_route_index: int | None = None
                     while page <= min(total_pages, MAX_PAGES):
                         elapsed = asyncio.get_running_loop().time() - started
                         remaining = ICP_COMPANY_TIMEOUT_SECONDS - elapsed
@@ -327,44 +407,70 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                                 "session_key": session_key,
                             }
                             request_generation: int | None = None
-                            cloud_request_claimed = False
+                            request_route_proxy = route_proxy
+                            request_route_index: int | None = None
+                            proxy_request_claimed = False
                             try:
-                                if route_proxy and cloud_scheduler is not None:
+                                if cloud_scheduler is not None:
                                     request_generation = await cloud_scheduler.acquire()
-                                    cloud_request_claimed = True
-                                    fetch_options["route_proxy"] = route_proxy
-                                    # A changed session key makes YMICP discard
-                                    # the prior aiohttp page session and open a
-                                    # new SeaMoon HTTP-proxy tunnel for this
-                                    # request.
-                                    fetch_options["session_key"] = f"{session_key}_{request_generation}"
+                                    proxy_request_claimed = True
+                                    request_route_proxy = route_proxy
+                                elif proxy_pool_scheduler is not None:
+                                    request_route_proxy, request_route_index, request_generation = await proxy_pool_scheduler.acquire(company_route_index)
+                                    company_route_index = request_route_index
+                                    proxy_request_claimed = True
                                 else:
                                     await request_scheduler.before_request()
+                                if request_route_proxy:
+                                    fetch_options["route_proxy"] = request_route_proxy
+                                    if request_generation is not None:
+                                        # A changed session key makes YMICP
+                                        # discard the prior aiohttp page
+                                        # session and open a new HTTP-proxy
+                                        # tunnel for this request. A single
+                                        # manual route has no generation and
+                                        # must keep the original page session.
+                                        suffix = (
+                                            request_generation
+                                            if request_route_index is None
+                                            else f"{request_route_index}_{request_generation}"
+                                        )
+                                        fetch_options["session_key"] = f"{session_key}_{suffix}"
                                 attempted_pages += 1
                                 chunk = await _fetch_page(client, name, page, **fetch_options)
                             finally:
-                                if cloud_request_claimed and cloud_scheduler is not None:
-                                    await cloud_scheduler.release()
+                                if proxy_request_claimed:
+                                    if cloud_scheduler is not None:
+                                        await cloud_scheduler.release()
+                                    elif proxy_pool_scheduler is not None:
+                                        await proxy_pool_scheduler.release()
                         except IcpPageError as exc:
                             if (
-                                route_proxy
-                                and cloud_scheduler is not None
-                                and "创宇盾" in str(exc)
-                                and page_waf_retries < ICP_PROXY_WAF_RETRIES
+                                (cloud_scheduler is not None or proxy_pool_scheduler is not None)
                                 and request_generation is not None
+                                and page_proxy_retries < (
+                                    ICP_PROXY_WAF_RETRIES
+                                    if "创宇盾" in str(exc)
+                                    else max(0, len(route_proxies) - 1)
+                                )
                             ):
-                                page_waf_retries += 1
-                                await cloud_scheduler.rotate(request_generation)
+                                page_proxy_retries += 1
+                                if cloud_scheduler is not None:
+                                    await cloud_scheduler.rotate(request_generation)
+                                elif proxy_pool_scheduler is not None and request_route_index is not None:
+                                    await proxy_pool_scheduler.rotate(request_route_index, request_generation)
+                                    company_route_index = None
                                 continue
                             if expected_total is not None and len(aggregate_rows) == expected_total:
                                 await save_complete_result()
                                 return None
                             detail = str(exc) or "ICP 页面请求失败"
-                            if "创宇盾" in detail and page_waf_retries:
-                                detail = f"{detail}（已重建隧道 {page_waf_retries} 次）"
+                            if page_proxy_retries:
+                                action = "已重建隧道" if "创宇盾" in detail else "已切换代理"
+                                detail = f"{detail}（{action} {page_proxy_retries} 次）"
                             return _failure(name, started, attempted_pages, detail)
 
-                        page_waf_retries = 0
+                        page_proxy_retries = 0
                         reported_pages = max(1, int(chunk["pages"] or 1))
                         reported_total = chunk.get("total")
                         if reported_total is not None:
@@ -474,11 +580,10 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             outcomes: list[CompanyFailure | None] = []
             for batch_start in range(0, len(names), batch_size):
                 batch = names[batch_start:batch_start + batch_size]
-                if route_proxy:
-                    # Cloud mode intentionally allows five logical company
-                    # lookups at once. All requests use the same configured
-                    # SeaMoon gateway URL. Cloud batches do not use the
-                    # direct-IP cooldown; the next batch starts after gather.
+                if route_proxy or proxy_pool_scheduler is not None:
+                    # Proxy-backed mode intentionally allows five logical
+                    # company lookups at once. Each route has its own request
+                    # budget; the next batch starts after gather.
                     batch_outcomes = await asyncio.gather(
                         *(collect_company(name, client) for name in batch)
                     )

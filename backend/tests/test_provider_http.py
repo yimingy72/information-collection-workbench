@@ -3,6 +3,7 @@ import json
 import httpx
 import pytest
 
+import app.providers.tianyancha as tianyancha
 from app.providers.tianyancha import AnonymousTianyancha
 
 
@@ -66,20 +67,64 @@ async def test_all_pages_stops_on_short_page_without_total():
 
 
 @pytest.mark.asyncio
-async def test_login_wall_is_not_retried():
+async def test_login_wall_rebuilds_proxy_and_retries_same_query_immediately(monkeypatch):
     seen = []
+    rotations = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if len(seen) == 1:
+            return httpx.Response(200, json={"state": "warn", "message": "请登录以使用完整功能"})
+        return httpx.Response(200, json={
+            "state": "ok",
+            "data": {"companyList": [{"id": "1", "name": "目标公司"}]},
+        })
+
+    async def rotate_proxy():
+        rotations.append(True)
+
+    async def unexpected_sleep(_seconds):
+        raise AssertionError("登录墙重试不应等待")
+
+    provider = AnonymousTianyancha("https://example.test", proxy="http://proxy.test:8080")
+    await provider.client.aclose()
+    provider.client = httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(provider, "_rotate_proxy", rotate_proxy)
+    monkeypatch.setattr(tianyancha.asyncio, "sleep", unexpected_sleep)
+
+    selected, _ = await provider.search("目标公司")
+
+    assert selected.external_id == "1"
+    assert len(seen) == 2
+    assert len(rotations) == 1
+    assert seen[0].content == seen[1].content
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_login_wall_exhausts_five_attempts_on_same_query(monkeypatch):
+    seen = []
+    rotations = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
         return httpx.Response(200, json={"state": "warn", "message": "请登录以使用完整功能"})
 
-    provider = AnonymousTianyancha("https://example.test")
+    async def rotate_proxy():
+        rotations.append(True)
+
+    provider = AnonymousTianyancha("https://example.test", proxy="http://proxy.test:8080")
     await provider.client.aclose()
     provider.client = httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(provider, "_rotate_proxy", rotate_proxy)
+
     with pytest.raises(Exception) as error:
         await provider.search("目标公司")
+
+    assert "failed after 5 attempts" in str(error.value)
     assert "请登录以使用完整功能" in str(error.value)
-    assert len(seen) == 1
+    assert len(seen) == 5
+    assert len(rotations) == 4
     await provider.close()
 
 

@@ -44,12 +44,19 @@ class AnonymousAiqicha:
     label = "爱企查"
     page_size = 10
 
-    def __init__(self, timeout: float = 20.0, cookie: str = "", proxy: str = "") -> None:
+    def __init__(self, timeout: float = 20.0, cookie: str = "", proxy: str | list[str] = "") -> None:
         self._timeout = timeout
         self._cookie = cookie
-        self._proxy = proxy
+        self._proxy_routes = [proxy] if isinstance(proxy, str) and proxy else list(proxy or [])
+        self._proxy_index = 0
         self._proxy_request_count = 0
         self.client = self._make_client()
+
+    @property
+    def _proxy(self) -> str:
+        if not self._proxy_routes:
+            return ""
+        return self._proxy_routes[self._proxy_index % len(self._proxy_routes)]
 
     def _make_client(self):
         return make_client(
@@ -71,9 +78,10 @@ class AnonymousAiqicha:
         await self.client.aclose()
 
     async def _rotate_proxy_client(self) -> None:
-        if not self._proxy:
+        if not self._proxy_routes:
             return
         previous = self.client
+        self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
         self.client = self._make_client()
         self._proxy_request_count = 0
         await previous.aclose()

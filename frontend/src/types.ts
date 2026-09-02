@@ -93,6 +93,25 @@ export type ProviderSession = {
 
 export type CloudProvider = 'aliyun' | 'tencent' | 'custom'
 
+export type ServerlessProxyNode = {
+  id: string
+  enabled: boolean
+  provider: CloudProvider
+  endpoint: string
+  region: string
+  function_name: string
+  image_uri: string
+  access_key_id: string
+  has_access_key_secret: boolean
+  insecure_skip_verify: boolean
+  deployment_id: string
+  status: string
+  last_error: string
+  latency_ms?: number | null
+  failure_count: number
+  updated_at?: string | null
+}
+
 export type ServerlessProxySettings = {
   enabled: boolean
   provider: CloudProvider
@@ -108,6 +127,7 @@ export type ServerlessProxySettings = {
   last_error: string
   local_proxy_url: string
   updated_at?: string | null
+  nodes: ServerlessProxyNode[]
 }
 
 export type ServerlessProxyValues = {
@@ -127,6 +147,8 @@ export type ServerlessProxyTest = {
   latency_ms: number
   endpoint: string
   target: string
+  tested_nodes?: number
+  successful_nodes?: number
 }
 
 export type ServerlessProxyEnableResult = {
@@ -139,9 +161,34 @@ export type ServerlessProxyDeployResult = {
   test: ServerlessProxyTest
 }
 
+export type ManualProxy = {
+  id: string
+  scheme: 'http' | 'https'
+  host: string
+  port: number
+  username: string
+  has_password: boolean
+  enabled: boolean
+  status: string
+  latency_ms?: number | null
+  failure_count: number
+  last_error: string
+  last_tested_at?: string | null
+  created_at: string
+  updated_at: string
+}
+
+export type ManualProxyTest = {
+  status: 'ok'
+  proxy_id: string
+  latency_ms: number
+  target: string
+}
+
 export type SettingsView = {
   sessions: ProviderSession[]
   serverless_proxy: ServerlessProxySettings
+  manual_proxies: ManualProxy[]
 }
 
 export type LoginValues = {

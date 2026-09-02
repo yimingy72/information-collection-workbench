@@ -32,6 +32,7 @@ import {
   cancelQrLogin,
   clearSession,
   deleteServerlessProxyDeployment,
+  deleteServerlessProxyNode,
   deployServerlessProxy,
   disableServerlessProxy,
   getSettings,
@@ -42,8 +43,9 @@ import {
 } from '../api'
 import { formatDate } from '../formatters'
 import type { CloudProvider, ServerlessProxyValues, SessionProviderId, SettingsView } from '../types'
+import { ProxySettingsPage } from './ProxySettingsPage'
 
-type SettingsSection = 'sources' | 'cloud'
+type SettingsSection = 'sources' | 'cloud' | 'manual'
 
 const ALIYUN_REGIONS = [
   { value: 'cn-hangzhou', label: '华东 1（杭州）' },
@@ -319,6 +321,18 @@ export function SettingsPage() {
     }
   }
 
+  const onDeleteProxyNode = async (nodeId: string) => {
+    setDeletingProxy(true)
+    try {
+      applySettings(await deleteServerlessProxyNode(nodeId))
+      message.success('云函数节点已删除')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '删除云函数节点失败')
+    } finally {
+      setDeletingProxy(false)
+    }
+  }
+
   const onLogout = async (sessionProvider: SessionProviderId) => {
     setLoggingOut(sessionProvider)
     try {
@@ -371,7 +385,47 @@ export function SettingsPage() {
   ]
 
   const proxy = settings?.serverless_proxy
+  const hasReadyManualProxy = Boolean(
+    settings?.manual_proxies.some((item) => item.enabled && item.status === 'ready'),
+  )
+  const routeLabel = hasReadyManualProxy ? 'HTTP代理' : proxy?.enabled ? '云函数代理' : '直连'
+  const routeColor = hasReadyManualProxy ? 'processing' : proxy?.enabled ? 'success' : 'default'
   const managed = managedFields(provider)
+
+  const cloudNodeColumns: TableProps<NonNullable<SettingsView['serverless_proxy']['nodes']>[number]>['columns'] = [
+    { title: '地域', dataIndex: 'region', width: 150 },
+    { title: '函数', dataIndex: 'function_name', ellipsis: true },
+    {
+      title: '状态',
+      key: 'status',
+      width: 90,
+      render: (_: unknown, row) => proxyTag(row.status, row.enabled),
+    },
+    {
+      title: '延迟',
+      dataIndex: 'latency_ms',
+      width: 90,
+      render: (value: number | null | undefined) => value == null ? '-' : `${value} ms`,
+    },
+    {
+      title: '操作',
+      key: 'actions',
+      width: 76,
+      render: (_: unknown, row) => (
+        row.deployment_id ? (
+          <Popconfirm
+            title="删除这个云函数节点？"
+            description="只删除当前节点，其他区域节点继续工作。"
+            okText="删除"
+            cancelText="取消"
+            onConfirm={() => void onDeleteProxyNode(row.id)}
+          >
+            <Button type="link" danger size="small" icon={<DeleteOutlined />} loading={deletingProxy} />
+          </Popconfirm>
+        ) : null
+      ),
+    },
+  ]
 
   const dataSourceTab = (
     <Card title="数据源登录" size="small" loading={loading}>
@@ -416,11 +470,9 @@ export function SettingsPage() {
           <div className="serverless-action-meta">
             <Space size={6} wrap>
               <Typography.Text type="secondary">ICP / 爱企查查询路由</Typography.Text>
-              <Tag color={proxy?.enabled ? 'success' : 'default'}>
-                {proxy?.enabled ? '云函数代理' : '直连'}
-              </Tag>
+              <Tag color={routeColor}>{routeLabel}</Tag>
               <Typography.Text type="secondary" className="serverless-action-hint">
-                ICP每5次请求重建隧道；爱企查每15次请求轮换；其他数据源直连
+                手动代理优先；无可用手动代理时才使用云函数
               </Typography.Text>
             </Space>
           </div>
@@ -430,7 +482,7 @@ export function SettingsPage() {
             </Button>
             <Button
               size="small"
-              type={proxy?.endpoint ? 'default' : 'primary'}
+              type='primary'
               icon={<RocketOutlined />}
               loading={deployingProxy}
               onClick={() => void onDeployProxy()}
@@ -440,7 +492,7 @@ export function SettingsPage() {
             <Button
               size="small"
               icon={<ApiOutlined />}
-              disabled={!proxy?.endpoint}
+              disabled={!proxy?.nodes?.length}
               loading={testingProxy}
               onClick={() => void onTestProxy()}
             >
@@ -509,7 +561,19 @@ export function SettingsPage() {
           </div>
         </Card>
 
-        <Card type="inner" size="small" title="3. 验证状态" className="serverless-section-card">
+        <Card type="inner" size="small" title={`3. 节点池（${proxy?.nodes?.length ?? 0}）`} className="serverless-section-card">
+          <Table
+            className="serverless-node-table"
+            rowKey="id"
+            size="small"
+            pagination={false}
+            dataSource={proxy?.nodes ?? []}
+            columns={cloudNodeColumns}
+            locale={{ emptyText: '尚未部署云函数节点' }}
+          />
+        </Card>
+
+        <Card type="inner" size="small" title="4. 验证状态" className="serverless-section-card">
           <div className="serverless-route-summary">
             <Typography.Text type="secondary">部署会自动验证并启用代理；测试只检查链路，不切换当前路由。</Typography.Text>
             <Form.Item name="insecure_skip_verify" label="TLS 证书校验" valuePropName="checked" className="serverless-tls-item">
@@ -522,6 +586,8 @@ export function SettingsPage() {
     </Card>
   )
 
+  const manualProxyTab = <ProxySettingsPage embedded />
+
   return (
     <div className="page settings-page">
       <div className="settings-section-switch">
@@ -531,12 +597,13 @@ export function SettingsPage() {
           options={[
             { value: 'sources', label: '数据源配置', icon: <DatabaseOutlined /> },
             { value: 'cloud', label: '云函数配置', icon: <CloudServerOutlined /> },
+            { value: 'manual', label: '代理设置', icon: <ApiOutlined /> },
           ]}
           onChange={(value) => setSettingsSection(value as SettingsSection)}
         />
       </div>
       <div className="settings-section-content">
-        {settingsSection === 'sources' ? dataSourceTab : cloudProxyTab}
+        {settingsSection === 'sources' ? dataSourceTab : settingsSection === 'cloud' ? cloudProxyTab : manualProxyTab}
       </div>
     </div>
   )

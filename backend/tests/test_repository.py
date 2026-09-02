@@ -83,3 +83,14 @@ async def test_touch_run_refreshes_lease_without_changing_progress():
     assert "progress" not in query
     assert "lease_id=$2" in query
     assert args[1] == lease_id
+
+
+@pytest.mark.asyncio
+async def test_results_can_load_all_relationships_without_a_fixed_limit():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.results(uuid4(), None, 0, 0, relationship_limit=None)
+
+    relationship_query = pool.queries[-2][0]
+    assert "FROM relationships rel" in relationship_query
+    assert "LIMIT $2" not in relationship_query

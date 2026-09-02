@@ -3,6 +3,7 @@ import pytest
 from app.serverless_proxy import (
     ServerlessProxyError,
     active_proxy_url,
+    configure_gateway_for_active_route,
     miit_proxy_url,
     serverless_proxy_view,
     validate_deploy_config,
@@ -44,6 +45,70 @@ def test_active_proxy_requires_enabled_endpoint():
     assert active_proxy_url(active) == settings.serverless_proxy_url
     assert miit_proxy_url(active) == settings.serverless_proxy_miit_url
 
+
+def test_manual_routes_take_priority_over_cloud_route():
+    manual = "http://user:pass@manual.example:8080"
+    active = config(
+        enabled=True,
+        endpoint="https://example.test",
+        manual_proxies=[{
+            "scheme": "http",
+            "host": "manual.example",
+            "port": 8080,
+            "username": "user",
+            "password": "pass",
+            "enabled": True,
+            "status": "ready",
+        }],
+    )
+    assert active_proxy_url(active) == manual
+    assert miit_proxy_url(active) == manual
+
+
+
+@pytest.mark.asyncio
+async def test_active_route_does_not_require_seamoon_when_manual_proxy_is_ready(monkeypatch):
+    import app.serverless_proxy as proxy
+
+    calls = []
+
+    async def fake_configure(config, **kwargs):
+        calls.append((config, kwargs))
+
+    monkeypatch.setattr(proxy, "configure_gateway", fake_configure)
+    runtime = {
+        "serverless_proxy": config(enabled=True, endpoint="https://example.test")["serverless_proxy"],
+        "manual_proxies": [{
+            "scheme": "http",
+            "host": "manual.example",
+            "port": 8080,
+            "username": "user",
+            "password": "pass",
+            "enabled": True,
+            "status": "ready",
+        }],
+    }
+
+    await configure_gateway_for_active_route(runtime)
+    assert calls == []
+
+
+def test_runtime_config_keeps_manual_routes_when_serverless_row_is_present():
+    manual = "http://user:pass@manual.example:8080"
+    runtime = {
+        "serverless_proxy": config(enabled=True, endpoint="https://example.test")["serverless_proxy"],
+        "manual_proxies": [{
+            "scheme": "http",
+            "host": "manual.example",
+            "port": 8080,
+            "username": "user",
+            "password": "pass",
+            "enabled": True,
+            "status": "ready",
+        }],
+    }
+    assert active_proxy_url(runtime) == manual
+    assert miit_proxy_url(runtime) == manual
 
 def test_enabled_config_requires_endpoint():
     with pytest.raises(ServerlessProxyError, match="函数地址"):
