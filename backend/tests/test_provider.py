@@ -581,3 +581,103 @@ async def test_icp_direct_queries_keep_five_request_burst_and_gap(monkeypatch):
 
     assert await miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(12)]) == []
     assert started == [f"企业{i}" for i in range(12)]
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_rotation_scheduler_changes_generation_after_five_requests():
+    import app.miit as miit
+
+    scheduler = miit._IcpCloudRotationScheduler(5)
+    generations = []
+    for _ in range(6):
+        generation = await scheduler.acquire()
+        generations.append(generation)
+        await scheduler.release()
+
+    assert generations == [0, 0, 0, 0, 0, 1]
+    assert scheduler.used == 1
+    assert scheduler.active == 0
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_uses_new_session_key_after_five_actual_requests(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fake_fetch(
+        _client, keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((keyword, page, route_proxy, session_key))
+        return {"rows": [], "pages": 1}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(6)]) == []
+    assert len(calls) == 6
+    assert [item[3].rsplit("_", 1)[-1] for item in calls] == ["0", "0", "0", "0", "0", "1"]
+    assert calls[5][3] != calls[0][3]
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_waf_retries_current_page_after_rotating_session(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((page, route_proxy, session_key))
+        if len(calls) == 1:
+            raise miit.IcpPageError("当前访问已被创宇盾拦截")
+        return {"rows": [], "pages": 1}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert len(calls) == 2
+    assert calls[0][0] == calls[1][0] == 1
+    assert calls[0][1] == calls[1][1] == miit.settings.serverless_proxy_miit_url
+    assert calls[0][2] != calls[1][2]
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fake_fetch(
+        _client, keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((keyword, session_key))
+        if session_key.endswith("_0"):
+            raise miit.IcpPageError("当前访问已被创宇盾拦截")
+        return {"rows": [], "pages": 1}
+
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    errors = await asyncio.wait_for(
+        miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(5)]),
+        timeout=2,
+    )
+
+    assert errors == []
+    assert len(calls) == 6
+    assert calls[0][1].endswith("_0")
+    assert all(item[1].endswith("_1") for item in calls[1:])

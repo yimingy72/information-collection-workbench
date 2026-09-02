@@ -420,7 +420,7 @@ export function SettingsPage() {
                 {proxy?.enabled ? '云函数代理' : '直连'}
               </Tag>
               <Typography.Text type="secondary" className="serverless-action-hint">
-                爱企查每15次请求轮换隧道；其他企业数据源保持直连
+                ICP每5次请求重建隧道；爱企查每15次请求轮换；其他数据源直连
               </Typography.Text>
             </Space>
           </div>

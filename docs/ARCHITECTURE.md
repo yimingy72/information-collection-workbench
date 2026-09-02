@@ -46,6 +46,8 @@
 PAGE_SIZE                       = 26
 ICP_PAGINATION_RECOVERY_PASSES = 2
 ICP_BATCH_SIZE                  = 5
+ICP_PROXY_REQUEST_LIMIT         = 5
+ICP_PROXY_WAF_RETRIES           = 2
 ICP_PAGE_TIMEOUT_SECONDS        = 10
 ICP_COMPANY_TIMEOUT_SECONDS     = 30
 ```
@@ -67,10 +69,13 @@ ICP_COMPANY_TIMEOUT_SECONDS     = 30
 ### 云函数路由
 
 - 每批最多5家企业并发。
-- 每家企业拥有独立分页会话和 SeaMoon 代理连接。
+- `ICP_PROXY_REQUEST_LIMIT=5` 按实际 ICP 页面请求计数，不按企业数计数。
+- 达到5次后，下一次请求使用新的路由代次和新的 YMICP 分页会话，迫使 YMICP 建立新的 HTTP 代理 TCP 连接/SeaMoon WebSocket 隧道。
+- 创宇盾拦截时对当前页最多重建2次隧道并重试，不从第一页重新查询。
+- 每家企业拥有独立分页会话；路由代次变化时会为当前页切换到新的会话键。
 - 云函数批次不使用直连出口的12秒全局冷却。
 - 云函数单实例并发6，保留1个槽位。
-- 一个代理 TCP 连接对应一个 WebSocket 隧道；不同连接可能获得不同云出口IP。
+- 一个代理 TCP 连接对应一个 WebSocket 隧道；单个 FC 函数地址仍不保证获得不同的公网出口IP。
 
 ### 直连路由
 

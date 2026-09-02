@@ -28,6 +28,13 @@ ICP_DIRECT_REQUEST_GAP_SECONDS = 0.4
 ICP_BATCH_PAUSE_SECONDS = 12.0
 ICP_PAGE_TIMEOUT_SECONDS = 10
 ICP_COMPANY_TIMEOUT_SECONDS = 30
+# In cloud mode this counts actual ICP page requests, not companies. Reaching
+# the limit starts a new YMICP page session, which makes YMICP open a fresh
+# HTTP-proxy TCP connection and therefore a fresh SeaMoon WebSocket tunnel.
+ICP_PROXY_REQUEST_LIMIT = 5
+# A WAF response should not discard the current page immediately. Retry it a
+# bounded number of times after the route generation has been rotated.
+ICP_PROXY_WAF_RETRIES = 2
 
 # Multiple API requests and queue workers share the same direct/cloud route.
 # Serialize complete ICP collections per event loop so separate runs cannot
@@ -46,6 +53,55 @@ def _collection_lock() -> asyncio.Lock:
 
 class IcpPageError(RuntimeError):
     """An ICP page request failed."""
+
+
+class _IcpCloudRotationScheduler:
+    """Count cloud page requests and gate the next logical tunnel generation.
+
+    The backend can force YMICP to create a new HTTP-proxy connection by
+    changing the page-session key. This is a real tunnel/session rotation, but
+    a single cloud-function endpoint still cannot guarantee a different public
+    egress IP because the provider may reuse the same warm instance or NAT.
+    """
+
+    def __init__(self, request_limit: int) -> None:
+        self.request_limit = max(1, request_limit)
+        self.used = 0
+        self.active = 0
+        self.generation = 0
+        self.rotation_pending = False
+        self.condition = asyncio.Condition()
+
+    async def acquire(self) -> int:
+        async with self.condition:
+            while self.rotation_pending or (self.used >= self.request_limit and self.active):
+                await self.condition.wait()
+            if self.used >= self.request_limit:
+                self.used = 0
+                self.generation += 1
+            generation = self.generation
+            self.used += 1
+            self.active += 1
+            return generation
+
+    async def release(self) -> None:
+        async with self.condition:
+            self.active = max(0, self.active - 1)
+            self.condition.notify_all()
+
+    async def rotate(self, observed_generation: int) -> int:
+        async with self.condition:
+            if self.generation != observed_generation:
+                return self.generation
+            self.rotation_pending = True
+            while self.active:
+                await self.condition.wait()
+            if self.generation == observed_generation:
+                self.used = 0
+                self.generation += 1
+            self.rotation_pending = False
+            self.condition.notify_all()
+            return self.generation
 
 
 class _IcpRequestScheduler:
@@ -222,7 +278,8 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
     route_proxy = miit_proxy_url(runtime_config)
     route_label = "云函数代理" if route_proxy else "直连"
     batch_size = max(1, min(ICP_BATCH_SIZE, ICP_CONCURRENCY))
-    request_scheduler = _IcpRequestScheduler(batch_size, direct=not bool(route_proxy))
+    request_scheduler = _IcpRequestScheduler(batch_size, direct=True)
+    cloud_scheduler = _IcpCloudRotationScheduler(ICP_PROXY_REQUEST_LIMIT) if route_proxy else None
 
     async def collect_company(name: str, client: httpx.AsyncClient) -> CompanyFailure | None:
         started = asyncio.get_running_loop().time()
@@ -252,6 +309,7 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                     pass_total: int | None = None
                     inconsistent = False
 
+                    page_waf_retries = 0
                     while page <= min(total_pages, MAX_PAGES):
                         elapsed = asyncio.get_running_loop().time() - started
                         remaining = ICP_COMPANY_TIMEOUT_SECONDS - elapsed
@@ -268,22 +326,45 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                                 "timeout_seconds": min(ICP_PAGE_TIMEOUT_SECONDS, remaining),
                                 "session_key": session_key,
                             }
-                            if route_proxy:
-                                fetch_options["route_proxy"] = route_proxy
-                            await request_scheduler.before_request()
-                            attempted_pages += 1
-                            chunk = await _fetch_page(client, name, page, **fetch_options)
+                            request_generation: int | None = None
+                            cloud_request_claimed = False
+                            try:
+                                if route_proxy and cloud_scheduler is not None:
+                                    request_generation = await cloud_scheduler.acquire()
+                                    cloud_request_claimed = True
+                                    fetch_options["route_proxy"] = route_proxy
+                                    # A changed session key makes YMICP discard
+                                    # the prior aiohttp page session and open a
+                                    # new SeaMoon HTTP-proxy tunnel for this
+                                    # request.
+                                    fetch_options["session_key"] = f"{session_key}_{request_generation}"
+                                else:
+                                    await request_scheduler.before_request()
+                                attempted_pages += 1
+                                chunk = await _fetch_page(client, name, page, **fetch_options)
+                            finally:
+                                if cloud_request_claimed and cloud_scheduler is not None:
+                                    await cloud_scheduler.release()
                         except IcpPageError as exc:
+                            if (
+                                route_proxy
+                                and cloud_scheduler is not None
+                                and "创宇盾" in str(exc)
+                                and page_waf_retries < ICP_PROXY_WAF_RETRIES
+                                and request_generation is not None
+                            ):
+                                page_waf_retries += 1
+                                await cloud_scheduler.rotate(request_generation)
+                                continue
                             if expected_total is not None and len(aggregate_rows) == expected_total:
                                 await save_complete_result()
                                 return None
-                            return _failure(
-                                name,
-                                started,
-                                attempted_pages,
-                                str(exc) or "ICP 页面请求失败",
-                            )
+                            detail = str(exc) or "ICP 页面请求失败"
+                            if "创宇盾" in detail and page_waf_retries:
+                                detail = f"{detail}（已重建隧道 {page_waf_retries} 次）"
+                            return _failure(name, started, attempted_pages, detail)
 
+                        page_waf_retries = 0
                         reported_pages = max(1, int(chunk["pages"] or 1))
                         reported_total = chunk.get("total")
                         if reported_total is not None:
