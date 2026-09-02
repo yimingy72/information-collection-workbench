@@ -133,6 +133,14 @@ docker compose -p asset-workbench exec -T postgres \
 2. 查看 API 的 `last_error` 和云平台请求 ID。
 3. 检查函数地域和函数名是否与平台配置一致。
 
+### `Either Code or CustomContainerConfig must be set`
+
+阿里云 FC 的 `CreateFunction` 请求必须在 `code` 和
+`customContainerConfig` 中二选一。SeaMoon 使用自定义容器镜像，部署请求应携带
+`customContainerConfig.image`、监听端口 `9000` 以及 `server -p 9000 -t websocket`
+启动参数。更新同名函数时也要同步提交相同的自定义容器配置，否则首次创建失败后的
+重试或旧函数更新仍可能失败。
+
 ## 测试
 
 ```bash
