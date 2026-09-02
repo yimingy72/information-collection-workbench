@@ -1,6 +1,7 @@
 package cloud
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -70,6 +71,10 @@ func TestAliyunTriggerEndpointNormalizesHostOnlyURL(t *testing.T) {
 
 func TestManagedFunctionSizing(t *testing.T) {
 	aliyun := aliyunCreateFunctionInput(Config{FunctionName: "test"}, "image")
+	if aliyun.CustomContainerConfig == nil || aliyun.CustomContainerConfig.Image == nil ||
+		*aliyun.CustomContainerConfig.Image != "image" {
+		t.Fatalf("expected Alibaba custom container image in create request: %#v", aliyun.CustomContainerConfig)
+	}
 	if aliyun.Cpu == nil || *aliyun.Cpu != seaMoonCPU {
 		t.Fatalf("unexpected Alibaba CPU: %v", aliyun.Cpu)
 	}
@@ -82,8 +87,28 @@ func TestManagedFunctionSizing(t *testing.T) {
 	if aliyun.InstanceConcurrency == nil || *aliyun.InstanceConcurrency != seaMoonInstanceConcurrency {
 		t.Fatalf("unexpected Alibaba concurrency: %v", aliyun.InstanceConcurrency)
 	}
+	encoded, err := json.Marshal(aliyun)
+	if err != nil {
+		t.Fatalf("marshal Alibaba create request: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"customContainerConfig"`) {
+		t.Fatalf("Alibaba create request omitted customContainerConfig: %s", encoded)
+	}
+	t.Logf("Alibaba CreateFunction body: %s", encoded)
 
-	updated := aliyunUpdateFunctionInput()
+	updated := aliyunUpdateFunctionInput("image")
+	if updated.CustomContainerConfig == nil || updated.CustomContainerConfig.Image == nil ||
+		*updated.CustomContainerConfig.Image != "image" {
+		t.Fatalf("expected Alibaba custom container image in update request: %#v", updated.CustomContainerConfig)
+	}
+	encoded, err = json.Marshal(updated)
+	if err != nil {
+		t.Fatalf("marshal Alibaba update request: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"customContainerConfig"`) {
+		t.Fatalf("Alibaba update request omitted customContainerConfig: %s", encoded)
+	}
+	t.Logf("Alibaba UpdateFunction body: %s", encoded)
 	if updated.Cpu == nil || *updated.Cpu != seaMoonCPU ||
 		updated.MemorySize == nil || *updated.MemorySize != seaMoonMemoryMB ||
 		updated.DiskSize == nil || *updated.DiskSize != seaMoonDiskMB ||

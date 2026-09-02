@@ -51,26 +51,28 @@ func aliyunContainerConfig(image string) *fc.CustomContainerConfig {
 
 func aliyunCreateFunctionInput(config Config, image string) *fc.CreateFunctionInput {
 	return &fc.CreateFunctionInput{
-		FunctionName:        tea.String(config.FunctionName),
-		Description:         tea.String("asset-workbench-seamoon-websocket"),
-		Runtime:             tea.String("custom-container"),
-		Handler:             tea.String("main"),
-		Timeout:             tea.Int32(300),
-		DiskSize:            tea.Int32(seaMoonDiskMB),
-		Cpu:                 tea.Float32(seaMoonCPU),
-		MemorySize:          tea.Int32(seaMoonMemoryMB),
-		InstanceConcurrency: tea.Int32(seaMoonInstanceConcurrency),
+		FunctionName:          tea.String(config.FunctionName),
+		Description:           tea.String("asset-workbench-seamoon-websocket"),
+		Runtime:               tea.String("custom-container"),
+		Handler:               tea.String("main"),
+		CustomContainerConfig: aliyunContainerConfig(image),
+		Timeout:               tea.Int32(300),
+		DiskSize:              tea.Int32(seaMoonDiskMB),
+		Cpu:                   tea.Float32(seaMoonCPU),
+		MemorySize:            tea.Int32(seaMoonMemoryMB),
+		InstanceConcurrency:   tea.Int32(seaMoonInstanceConcurrency),
 	}
 }
 
-func aliyunUpdateFunctionInput() *fc.UpdateFunctionInput {
+func aliyunUpdateFunctionInput(image string) *fc.UpdateFunctionInput {
 	return &fc.UpdateFunctionInput{
-		Description:         tea.String("asset-workbench-seamoon-websocket"),
-		Timeout:             tea.Int32(300),
-		DiskSize:            tea.Int32(seaMoonDiskMB),
-		Cpu:                 tea.Float32(seaMoonCPU),
-		MemorySize:          tea.Int32(seaMoonMemoryMB),
-		InstanceConcurrency: tea.Int32(seaMoonInstanceConcurrency),
+		Description:           tea.String("asset-workbench-seamoon-websocket"),
+		CustomContainerConfig: aliyunContainerConfig(image),
+		Timeout:               tea.Int32(300),
+		DiskSize:              tea.Int32(seaMoonDiskMB),
+		Cpu:                   tea.Float32(seaMoonCPU),
+		MemorySize:            tea.Int32(seaMoonMemoryMB),
+		InstanceConcurrency:   tea.Int32(seaMoonInstanceConcurrency),
 	}
 }
 
@@ -156,7 +158,7 @@ func deployAliyun(config Config) (Result, error) {
 			deploymentID = dara.StringValue(existing.Body.FunctionId)
 		}
 		if _, updateErr := client.UpdateFunction(tea.String(config.FunctionName), &fc.UpdateFunctionRequest{
-			Body: aliyunUpdateFunctionInput(),
+			Body: aliyunUpdateFunctionInput(image),
 		}); updateErr != nil {
 			return Result{}, fmt.Errorf("update existing Alibaba Cloud function resources: %w", updateErr)
 		}
