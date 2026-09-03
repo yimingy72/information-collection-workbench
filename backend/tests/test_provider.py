@@ -841,8 +841,6 @@ async def test_icp_single_manual_proxy_keeps_one_pagination_session(monkeypatch)
 
 
 @pytest.mark.asyncio
-<<<<<<< HEAD
-=======
 async def test_icp_single_manual_proxy_runs_one_company_at_a_time(monkeypatch):
     import app.miit as miit
 
@@ -933,7 +931,6 @@ async def test_icp_manual_proxy_pool_parallelism_matches_ready_nodes(monkeypatch
 
 
 @pytest.mark.asyncio
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 async def test_icp_cloud_scheduler_does_not_apply_direct_ip_cooldown(monkeypatch):
     import app.miit as miit
 
@@ -1006,8 +1003,6 @@ async def test_icp_direct_queries_keep_five_request_burst_and_gap(monkeypatch):
 
 
 @pytest.mark.asyncio
-<<<<<<< HEAD
-=======
 async def test_icp_direct_queries_pipeline_independent_companies(monkeypatch):
     import app.miit as miit
 
@@ -1039,7 +1034,6 @@ async def test_icp_direct_queries_pipeline_independent_companies(monkeypatch):
 
 
 @pytest.mark.asyncio
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 async def test_icp_cloud_rotation_scheduler_changes_generation_after_five_requests():
     import app.miit as miit
 
@@ -1109,8 +1103,6 @@ async def test_icp_cloud_waf_retries_current_page_after_rotating_session(monkeyp
 
 
 @pytest.mark.asyncio
-<<<<<<< HEAD
-=======
 async def test_icp_cloud_waf_exhaustion_enters_company_retry(monkeypatch):
     import app.miit as miit
 
@@ -1146,7 +1138,6 @@ async def test_icp_cloud_waf_exhaustion_enters_company_retry(monkeypatch):
 
 
 @pytest.mark.asyncio
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
     import app.miit as miit
 

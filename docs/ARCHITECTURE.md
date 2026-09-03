@@ -22,11 +22,7 @@
 1. API 刷新数据源登录状态，并根据路由优先级决定是否配置本地 SeaMoon 网关。
 2. 所选 provider 并行启动；根企业搜索结果写入 PostgreSQL 后立即触发该企业的 ICP 查询。
 3. provider 遍历投资关系时，每个符合持股比例的新企业写入后立即进入 ICP 队列，不必等待全部层级遍历完成。
-<<<<<<< HEAD
-4. ICP 消费者按当前代理模式分批运行：代理模式最多5家企业并发，直连模式串行节流。ICP备案结果不会再次作为待查询企业，避免队列自反馈。
-=======
 4. ICP 消费者按当前代理模式分批运行：云函数模式按就绪节点数扩展（每节点5个逻辑槽位，最多40个），手动代理按节点数并发，直连模式串行节流。ICP备案结果不会再次作为待查询企业，避免队列自反馈。
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 5. 每个企业执行分页查询、完整性检查、跨页去重和结果保存；ICP 阶段持续刷新任务心跳。
 6. 任一阶段存在错误但已有结果时，任务状态为 `partial`；无错误时为 `succeeded`。
 
@@ -47,15 +43,10 @@ PAGE_SIZE                       = 26
 ICP_PAGINATION_RECOVERY_PASSES = 2
 ICP_EMPTY_RESULT_RECOVERY_PASSES = 1
 ICP_BATCH_SIZE                  = 5
-<<<<<<< HEAD
-ICP_PROXY_REQUEST_LIMIT         = 5
-ICP_PROXY_WAF_RETRIES           = 2
-=======
 ICP_CONCURRENCY                 = 40
 ICP_PROXY_REQUEST_LIMIT         = 5
 ICP_PROXY_WAF_RETRIES           = 2
 ICP_PROXY_ERROR_RETRIES         = 1
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 ICP_PAGE_TIMEOUT_SECONDS        = 10
 ICP_COMPANY_TIMEOUT_SECONDS     = 30
 ICP_COMPANY_MAX_ATTEMPTS        = 3
@@ -80,17 +71,6 @@ ICP_COMPANY_RETRY_BACKOFF_SECONDS = 2
 
 ### 云函数路由
 
-<<<<<<< HEAD
-- 每批最多5家企业并发。
-- `ICP_PROXY_REQUEST_LIMIT=5` 按实际 ICP 页面请求计数，不按企业数计数。
-- `ICP_BATCH_SIZE=5` 控制代理模式下的企业并发；投资关系遍历与 ICP 消费者并行执行。
-- 达到5次后，下一次请求使用新的路由代次和新的 YMICP 分页会话，迫使 YMICP 建立新的 HTTP 代理 TCP 连接/SeaMoon WebSocket 隧道。
-- 创宇盾拦截时对当前页最多重建2次隧道并重试，不从第一页重新查询。
-- 每家企业拥有独立分页会话；云函数路由代次变化时会为当前页切换到新的会话键。单个手动代理保持同一分页会话，不套用云函数代次轮换。
-- 云函数批次不使用直连出口的12秒全局冷却。
-- 云函数单实例并发6，保留1个槽位。
-- 一个代理 TCP 连接对应一个 WebSocket 隧道；单个 FC 函数地址仍不保证获得不同的公网出口IP。
-=======
 - 按就绪云节点数扩展，每节点5个逻辑槽位，最多40个逻辑并发；7个就绪节点时目标为35个槽位。
 - `ICP_PROXY_REQUEST_LIMIT=5` 按实际 ICP 页面请求计数，不按企业数计数。
 - `ICP_BATCH_SIZE=5` 是单节点基准槽位，不是整个云池的固定并发；投资关系遍历与 ICP 消费者并行执行。
@@ -106,7 +86,6 @@ ICP_COMPANY_RETRY_BACKOFF_SECONDS = 2
 - 并发数等于已启用且检测成功的手动代理节点数，最多5家企业并发。
 - 每个手动代理同一时间只处理1家企业，避免多个验证码流程在同一固定出口上互相阻塞并触发9秒页面超时。
 - 不同手动代理节点拥有独立分页会话和验证码流程，可以并行查询。
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 ### 直连路由
 

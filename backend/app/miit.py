@@ -9,11 +9,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from app.repository import Repository
-<<<<<<< HEAD
-from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls
-=======
 from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls, pool_nodes
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 from app.settings import settings
 
 MAX_PAGES = 50
@@ -37,11 +33,8 @@ ICP_DIRECT_REQUEST_GAP_SECONDS = 0.4
 ICP_BATCH_PAUSE_SECONDS = 12.0
 ICP_PAGE_TIMEOUT_SECONDS = 10
 ICP_COMPANY_TIMEOUT_SECONDS = 30
-<<<<<<< HEAD
-=======
 ICP_COMPANY_MAX_ATTEMPTS = max(1, settings.icp_company_max_attempts)
 ICP_COMPANY_RETRY_BACKOFF_SECONDS = max(0.0, settings.icp_company_retry_backoff_seconds)
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 # In cloud mode this counts actual ICP page requests, not companies. Reaching
 # the limit starts a new YMICP page session, which makes YMICP open a fresh
 # HTTP-proxy TCP connection and therefore a fresh SeaMoon WebSocket tunnel.
@@ -49,8 +42,6 @@ ICP_PROXY_REQUEST_LIMIT = 5
 # A WAF response should not discard the current page immediately. Retry it a
 # bounded number of times after the route generation has been rotated.
 ICP_PROXY_WAF_RETRIES = 2
-<<<<<<< HEAD
-=======
 # A single local gateway URL can front several cloud nodes. Rotate the tunnel
 # for non-WAF transport errors too; the gateway may have just selected a bad
 # endpoint and returning straight to the company retry wastes the page context.
@@ -60,7 +51,6 @@ ICP_PROXY_WAF_RETRIES = 2
 # requests before the final failure was reported.
 ICP_PROXY_ERROR_RETRIES = 1
 ICP_MAX_CLOUD_BATCH_SIZE = 40
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 # Multiple API requests and queue workers share the same direct/cloud route.
 # Serialize complete ICP collections per event loop so separate runs cannot
@@ -398,8 +388,6 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
         else "直连"
     )
     batch_size = max(1, min(ICP_BATCH_SIZE, ICP_CONCURRENCY))
-<<<<<<< HEAD
-=======
     ready_cloud_nodes = [
         item for item in pool_nodes(runtime_config.get("serverless_proxy") or {})
         if item.get("enabled") and item.get("status") in {"ready", "deployed"}
@@ -421,18 +409,13 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
         # company per ready node; sending five companies through one node only
         # makes their captcha/auth work contend and hit the page hard timeout.
         batch_size = min(batch_size, len(manual_routes))
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     # A single manual proxy is a fixed route: do not apply the cloud tunnel
     # generation counter to it. Otherwise its pagination session would be
     # replaced every five pages even though no new exit IP can be created.
     cloud_scheduler = (
-<<<<<<< HEAD
-        _IcpCloudRotationScheduler(ICP_PROXY_REQUEST_LIMIT)
-=======
         _IcpCloudRotationScheduler(
             max(ICP_PROXY_REQUEST_LIMIT, batch_size)
         )
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
         if using_cloud_proxy and route_proxy
         else None
     )
@@ -530,11 +513,7 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                                 and page_proxy_retries < (
                                     ICP_PROXY_WAF_RETRIES
                                     if "创宇盾" in str(exc)
-<<<<<<< HEAD
-                                    else max(0, len(route_proxies) - 1)
-=======
                                     else ICP_PROXY_ERROR_RETRIES
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
                                 )
                             ):
                                 page_proxy_retries += 1
@@ -665,27 +644,6 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             # Cloud mode limits active companies to five. Each company's page
             # pass has its own SeaMoon tunnel and session affinity; direct-mode
             # WAF pacing is handled by the scheduler above.
-<<<<<<< HEAD
-            outcomes: list[CompanyFailure | None] = []
-            for batch_start in range(0, len(names), batch_size):
-                batch = names[batch_start:batch_start + batch_size]
-                if route_proxy or proxy_pool_scheduler is not None:
-                    # Proxy-backed mode intentionally allows five logical
-                    # company lookups at once. Each route has its own request
-                    # budget; the next batch starts after gather.
-                    batch_outcomes = await asyncio.gather(
-                        *(collect_company(name, client) for name in batch)
-                    )
-                else:
-                    # Direct mode follows the reference strategy: do not fire
-                    # five requests at exactly the same instant. The scheduler
-                    # inserts the 0.4s gap and the cooldown between request
-                    # rounds, keeping the burst predictable.
-                    batch_outcomes = []
-                    for name in batch:
-                        batch_outcomes.append(await collect_company(name, client))
-                outcomes.extend(batch_outcomes)
-=======
             # Retry in rounds so successful companies leave the queue while
             # failed companies get a fresh session after a short cooldown.
             pending = list(names)
@@ -693,7 +651,6 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             attempt_counts: dict[str, int] = {name: 0 for name in names}
             attempted_pages: dict[str, int] = {name: 0 for name in names}
             elapsed_seconds: dict[str, float] = {name: 0.0 for name in names}
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
             for attempt_index in range(ICP_COMPANY_MAX_ATTEMPTS):
                 round_outcomes: list[tuple[str, CompanyFailure | None]] = []

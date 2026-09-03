@@ -66,8 +66,6 @@ def test_manual_routes_take_priority_over_cloud_route():
     assert miit_proxy_url(active) == manual
 
 
-<<<<<<< HEAD
-=======
 def test_gateway_endpoint_pool_excludes_disabled_or_failed_nodes():
     runtime = config(
         enabled=True,
@@ -135,7 +133,6 @@ async def test_configure_gateway_keeps_failed_nodes_out_when_enabled(monkeypatch
     assert calls[0]["endpoints"] == ["https://healthy.example"]
 
 
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 @pytest.mark.asyncio
 async def test_active_route_does_not_require_seamoon_when_manual_proxy_is_ready(monkeypatch):

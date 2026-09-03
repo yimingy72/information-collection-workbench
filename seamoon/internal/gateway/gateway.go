@@ -26,13 +26,6 @@ type Config struct {
 	Endpoint           string   `json:"endpoint"` // legacy first endpoint
 	Endpoints          []string `json:"endpoints,omitempty"`
 	InsecureSkipVerify bool     `json:"insecure_skip_verify"`
-<<<<<<< HEAD
-}
-
-type Gateway struct {
-	config atomic.Value
-	cursor atomic.Uint64
-=======
 }
 
 const endpointFailureCooldown = 30 * time.Second
@@ -47,7 +40,6 @@ type Gateway struct {
 	cursor   atomic.Uint64
 	healthMu sync.Mutex
 	health   map[string]endpointHealth
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 }
 
 func New() *Gateway {
@@ -208,26 +200,16 @@ func (g *Gateway) handle(client net.Conn) {
 		},
 	}
 	start := int(g.cursor.Add(1)-1) % len(config.Endpoints)
-<<<<<<< HEAD
-	for attempt := range config.Endpoints {
-		endpoint := config.Endpoints[(start+attempt)%len(config.Endpoints)]
-		ws, response, err := dialer.Dial(endpoint, nil)
-		if err == nil {
-=======
 	for _, endpoint := range g.availableEndpoints(config.Endpoints, start, time.Now()) {
 		ws, response, err := dialer.Dial(endpoint, nil)
 		if err == nil {
 			g.markEndpointSuccess(endpoint)
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 			remote := tunnel.Wrap(ws)
 			defer remote.Close()
 			relay(client, remote)
 			return
 		}
-<<<<<<< HEAD
-=======
 		g.markEndpointFailure(endpoint, time.Now())
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 		status := ""
 		if response != nil {
 			status = response.Status

@@ -240,15 +240,11 @@ def validate_deploy_config(config: dict[str, Any]) -> None:
 async def configure_gateway(config: dict[str, Any], *, force_enabled: bool | None = None) -> None:
     row = _row(config)
     enabled = bool(row.get("enabled")) if force_enabled is None else force_enabled
-<<<<<<< HEAD
-    endpoints = _gateway_endpoints(row, force_enabled=enabled)
-=======
     # ``force_enabled`` controls whether the gateway itself is enabled. It
     # must not implicitly admit disabled/error pool nodes. Only an explicit
     # ``True`` (used by the single-node warm-up probe) may bypass node health
     # filtering.
     endpoints = _gateway_endpoints(row, force_enabled=force_enabled is True)
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     payload = {
         "enabled": enabled and bool(endpoints),
         "endpoint": endpoints[0] if endpoints else str(row.get("endpoint") or "").strip(),
@@ -276,13 +272,9 @@ async def configure_gateway_for_active_route(config: dict[str, Any]) -> None:
     await configure_gateway(config)
 
 
-<<<<<<< HEAD
-async def test_serverless_proxy(config: dict[str, Any]) -> ServerlessProxyTestResponse:
-=======
 async def test_serverless_proxy(
     config: dict[str, Any], *, restore_gateway: bool = True
 ) -> ServerlessProxyTestResponse:
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     row = _row(config)
     validate_saved_config({**row, "enabled": True})
     nodes = pool_nodes(row)
@@ -303,13 +295,9 @@ async def test_serverless_proxy(
                 force_enabled=True,
             )
             last_error: Exception | None = None
-<<<<<<< HEAD
-            for attempt in range(3):
-=======
             # Newly created FC triggers can return 412 while propagating or
             # warming. Use a bounded warm-up window before marking a node bad.
             for attempt in range(5):
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
                 started = time.monotonic()
                 timeout = httpx.Timeout(20.0, connect=15.0, read=20.0, write=20.0, pool=5.0)
                 try:
@@ -327,13 +315,8 @@ async def test_serverless_proxy(
                     break
                 except Exception as exc:  # noqa: BLE001 - cold starts can fail transiently
                     last_error = exc
-<<<<<<< HEAD
-                    if attempt < 2:
-                        await asyncio.sleep(attempt + 1)
-=======
                     if attempt < 4:
                         await asyncio.sleep(min(8, 2 * (attempt + 1)))
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
             if last_error is not None:
                 failures.append(f"{node['region']}：{last_error}")
 
@@ -352,14 +335,10 @@ async def test_serverless_proxy(
     except Exception as exc:
         raise ServerlessProxyError(f"云函数代理测试失败：{exc}") from exc
     finally:
-<<<<<<< HEAD
-        await configure_gateway(row, force_enabled=bool(row.get("enabled")))
-=======
         if restore_gateway:
             # Restore the saved active pool, not the probe bypass mode. A
             # normal health test must never re-admit disabled/error nodes.
             await configure_gateway(row)
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 
 async def run_cloud_operation(action: str, config: dict[str, Any]) -> dict[str, str]:

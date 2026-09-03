@@ -22,8 +22,6 @@ services:
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
       MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
       ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
-<<<<<<< HEAD
-=======
       ICP_COMPANY_MAX_ATTEMPTS: ${ICP_COMPANY_MAX_ATTEMPTS:-3}
       ICP_COMPANY_RETRY_BACKOFF_SECONDS: ${ICP_COMPANY_RETRY_BACKOFF_SECONDS:-2}
       ICP_TARGET_SECONDS: ${ICP_TARGET_SECONDS:-300}
@@ -31,7 +29,6 @@ services:
       ICP_AUTO_SCALE_COMPANIES_PER_NODE: ${ICP_AUTO_SCALE_COMPANIES_PER_NODE:-160}
       ICP_AUTO_SCALE_REGIONS: ${ICP_AUTO_SCALE_REGIONS:-cn-hangzhou,cn-shanghai,cn-beijing,cn-shenzhen,cn-qingdao,cn-zhangjiakou,cn-huhehaote}
       ICP_AUTO_SCALE_EXCLUDED_REGIONS: ${ICP_AUTO_SCALE_EXCLUDED_REGIONS:-cn-chengdu}
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
       SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
       SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
       SERVERLESS_PROXY_MIIT_URL: http://seamoon-gateway:19080
@@ -57,8 +54,6 @@ services:
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
       MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
       ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
-<<<<<<< HEAD
-=======
       ICP_COMPANY_MAX_ATTEMPTS: ${ICP_COMPANY_MAX_ATTEMPTS:-3}
       ICP_COMPANY_RETRY_BACKOFF_SECONDS: ${ICP_COMPANY_RETRY_BACKOFF_SECONDS:-2}
       ICP_TARGET_SECONDS: ${ICP_TARGET_SECONDS:-300}
@@ -66,7 +61,6 @@ services:
       ICP_AUTO_SCALE_COMPANIES_PER_NODE: ${ICP_AUTO_SCALE_COMPANIES_PER_NODE:-160}
       ICP_AUTO_SCALE_REGIONS: ${ICP_AUTO_SCALE_REGIONS:-cn-hangzhou,cn-shanghai,cn-beijing,cn-shenzhen,cn-qingdao,cn-zhangjiakou,cn-huhehaote}
       ICP_AUTO_SCALE_EXCLUDED_REGIONS: ${ICP_AUTO_SCALE_EXCLUDED_REGIONS:-cn-chengdu}
->>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
       SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
       SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
       SERVERLESS_PROXY_MIIT_URL: http://seamoon-gateway:19080
