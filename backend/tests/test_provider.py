@@ -437,6 +437,7 @@ async def test_icp_direct_company_total_timeout_has_details(monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(miit, "ICP_COMPANY_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 1)
     monkeypatch.setattr(miit, "_fetch_page", hangs)
 
     errors = await miit.collect_icp(Repo(), uuid4(), ["测试企业"])
@@ -486,7 +487,7 @@ async def test_icp_direct_multi_page_saves_each_page_without_proxy_lookup(monkey
 
 
 @pytest.mark.asyncio
-async def test_icp_direct_failure_does_not_retry_or_touch_proxy_pool(monkeypatch):
+async def test_icp_direct_failure_retries_company_until_exhausted(monkeypatch):
     import app.miit as miit
 
     calls = []
@@ -505,14 +506,85 @@ async def test_icp_direct_failure_does_not_retry_or_touch_proxy_pool(monkeypatch
         raise miit.IcpPageError("HTTP 521：上游 Web 服务不可用")
 
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(miit, "ICP_COMPANY_RETRY_BACKOFF_SECONDS", 0)
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
 
     errors = await miit.collect_icp(Repo(), uuid4(), ["测试企业"])
     assert len(errors) == 1
     assert "HTTP 521" in errors[0]
-    assert len(calls) == 1
-    assert calls[0][0:2] == (1, 10)
-    assert calls[0][2]
+    assert "企业尝试 3 次" in errors[0]
+    assert "请求页面 3 次" in errors[0]
+    assert "企业级自动重试 2 次后仍失败" in errors[0]
+    assert len(calls) == 3
+    assert all(call[0:2] == (1, 10) for call in calls)
+    assert len({call[2] for call in calls}) == 3
+
+
+@pytest.mark.asyncio
+async def test_icp_direct_failure_recovers_on_later_company_attempt(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        pass
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, session_key=""
+    ):
+        calls.append((page, timeout_seconds, session_key))
+        if len(calls) < 3:
+            raise miit.IcpPageError("HTTP 521：上游 Web 服务不可用")
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(miit, "ICP_COMPANY_RETRY_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert len(calls) == 3
+    assert len({call[2] for call in calls}) == 3
+
+
+@pytest.mark.asyncio
+async def test_icp_company_retry_only_requeues_failed_names(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+    counts = {"失败企业": 0, "成功企业": 0}
+
+    class Repo:
+        pass
+
+    async def fake_fetch(
+        _client, keyword, page, timeout_seconds=10, session_key=""
+    ):
+        calls.append((keyword, page, session_key))
+        counts[keyword] += 1
+        if keyword == "失败企业" and counts[keyword] == 1:
+            raise miit.IcpPageError("HTTP 521：上游 Web 服务不可用")
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 2)
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_DIRECT_REQUEST_GAP_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(miit, "ICP_COMPANY_RETRY_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(
+        Repo(), uuid4(), ["失败企业", "成功企业"]
+    ) == []
+    assert counts == {"失败企业": 2, "成功企业": 1}
+    failed_sessions = {
+        session for keyword, _page, session in calls if keyword == "失败企业"
+    }
+    assert len(failed_sessions) == 2
+
 
 @pytest.mark.asyncio
 async def test_icp_retries_an_incomplete_pagination_with_a_new_affinity_session(monkeypatch):
@@ -599,6 +671,7 @@ async def test_icp_incomplete_pagination_is_reported_and_not_saved(monkeypatch):
 
     monkeypatch.setattr(miit, "ICP_PAGINATION_RECOVERY_PASSES", 1)
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 1)
     monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
     monkeypatch.setattr(miit, "ICP_DIRECT_REQUEST_GAP_SECONDS", 0)
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
@@ -612,6 +685,70 @@ async def test_icp_incomplete_pagination_is_reported_and_not_saved(monkeypatch):
     assert "结果不完整" in errors[0]
     assert len({key for key, _page in calls}) == 2
     assert saved == []
+
+
+@pytest.mark.asyncio
+async def test_icp_accepts_valid_record_without_domain(monkeypatch):
+    import app.miit as miit
+
+    saved = []
+
+    class Repo:
+        pass
+
+    async def fake_fetch(
+        _client, _keyword, _page, timeout_seconds=10, session_key=""
+    ):
+        return {
+            "rows": [{
+                "domain": "",
+                "serviceLicence": "",
+                "mainId": 250000032407,
+                "mainLicence": "滇ICP备17004651号",
+                "unitName": "云南省烟草公司楚雄州公司",
+            }],
+            "pages": 1,
+            "total": 1,
+        }
+
+    async def fake_save(_repo, _run_id, _name, rows, _seen):
+        saved.extend(rows)
+
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+    monkeypatch.setattr(miit, "_save_icp_page", fake_save)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["云南省烟草公司楚雄州公司"]) == []
+    assert len(saved) == 1
+    assert saved[0]["mainLicence"] == "滇ICP备17004651号"
+
+
+@pytest.mark.asyncio
+async def test_icp_positive_total_empty_page_uses_fast_recovery_budget(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        pass
+
+    async def fake_fetch(
+        _client, _keyword, _page, timeout_seconds=10, session_key=""
+    ):
+        calls.append(session_key)
+        return {"rows": [], "pages": 1, "total": 1}
+
+    monkeypatch.setattr(miit, "ICP_PAGINATION_RECOVERY_PASSES", 2)
+    monkeypatch.setattr(miit, "ICP_EMPTY_RESULT_RECOVERY_PASSES", 1)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_DIRECT_REQUEST_GAP_SECONDS", 0)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    errors = await miit.collect_icp(Repo(), uuid4(), ["测试企业"])
+
+    assert len(calls) == 2
+    assert len(set(calls)) == 2
+    assert "上游报告 1 条" in errors[0]
 
 
 @pytest.mark.asyncio
@@ -704,6 +841,99 @@ async def test_icp_single_manual_proxy_keeps_one_pagination_session(monkeypatch)
 
 
 @pytest.mark.asyncio
+<<<<<<< HEAD
+=======
+async def test_icp_single_manual_proxy_runs_one_company_at_a_time(monkeypatch):
+    import app.miit as miit
+
+    active = 0
+    maximum = 0
+    routes = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {
+                "manual_proxies": [{
+                    "scheme": "http",
+                    "host": "manual.example",
+                    "port": 8080,
+                    "username": "user",
+                    "password": "pass",
+                    "enabled": True,
+                    "status": "ready",
+                }],
+            }
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        routes.append(route_proxy)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(
+        Repo(), uuid4(), [f"企业{i}" for i in range(4)]
+    ) == []
+    assert maximum == 1
+    assert routes == ["http://user:pass@manual.example:8080"] * 4
+
+
+@pytest.mark.asyncio
+async def test_icp_manual_proxy_pool_parallelism_matches_ready_nodes(monkeypatch):
+    import app.miit as miit
+
+    active = 0
+    maximum = 0
+    routes = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {
+                "manual_proxies": [
+                    {
+                        "scheme": "http",
+                        "host": f"manual{index}.example",
+                        "port": 8080,
+                        "username": "",
+                        "password": "",
+                        "enabled": True,
+                        "status": "ready",
+                    }
+                    for index in range(2)
+                ],
+            }
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        routes.append(route_proxy)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(
+        Repo(), uuid4(), [f"企业{i}" for i in range(4)]
+    ) == []
+    assert maximum == 2
+    assert set(routes) == {
+        "http://manual0.example:8080",
+        "http://manual1.example:8080",
+    }
+
+
+@pytest.mark.asyncio
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 async def test_icp_cloud_scheduler_does_not_apply_direct_ip_cooldown(monkeypatch):
     import app.miit as miit
 
@@ -776,6 +1006,40 @@ async def test_icp_direct_queries_keep_five_request_burst_and_gap(monkeypatch):
 
 
 @pytest.mark.asyncio
+<<<<<<< HEAD
+=======
+async def test_icp_direct_queries_pipeline_independent_companies(monkeypatch):
+    import app.miit as miit
+
+    active = 0
+    maximum = 0
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": False, "endpoint": ""}}
+
+    async def fake_fetch(
+        _client, _keyword, _page, timeout_seconds=10, session_key=""
+    ):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_DIRECT_REQUEST_GAP_SECONDS", 0)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(
+        Repo(), uuid4(), [f"企业{i}" for i in range(5)]
+    ) == []
+    assert maximum == 5
+
+
+@pytest.mark.asyncio
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 async def test_icp_cloud_rotation_scheduler_changes_generation_after_five_requests():
     import app.miit as miit
 
@@ -845,6 +1109,44 @@ async def test_icp_cloud_waf_retries_current_page_after_rotating_session(monkeyp
 
 
 @pytest.mark.asyncio
+<<<<<<< HEAD
+=======
+async def test_icp_cloud_waf_exhaustion_enters_company_retry(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {
+                "serverless_proxy": {
+                    "enabled": True,
+                    "endpoint": "https://example.test",
+                }
+            }
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((page, route_proxy, session_key))
+        if len(calls) <= 3:
+            raise miit.IcpPageError("当前访问已被创宇盾拦截")
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(miit, "ICP_COMPANY_RETRY_BACKOFF_SECONDS", 0)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert len(calls) == 4
+    assert all(call[0] == 1 for call in calls)
+    assert all(call[1] == miit.settings.serverless_proxy_miit_url for call in calls)
+    assert len({call[2] for call in calls}) == 4
+
+
+@pytest.mark.asyncio
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
     import app.miit as miit
 

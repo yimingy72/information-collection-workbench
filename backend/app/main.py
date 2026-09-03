@@ -636,8 +636,36 @@ async def deploy_serverless_proxy(request: ServerlessProxyRequest) -> Serverless
         config = await store.get_runtime_config()
         await configure_gateway(config, force_enabled=True)
     except ServerlessProxyError as exc:
+<<<<<<< HEAD
         await store.set_serverless_proxy_status("error", str(exc), enabled=previous_enabled)
         await configure_gateway(await store.get_runtime_config(), force_enabled=previous_enabled)
+=======
+        # Keep already healthy nodes serving traffic. The failed node remains
+        # visible as disabled/error so auto-scaling can retry it or choose the
+        # next region, instead of leaving the whole pool in an unusable state.
+        current_config = await store.get_runtime_config()
+        current_row = current_config["serverless_proxy"]
+        marked_nodes = [
+            {**item, "enabled": False, "status": "error", "last_error": str(exc)}
+            if item.get("id") == node_id else item
+            for item in pool_nodes(current_row)
+        ]
+        healthy = next(
+            (item for item in marked_nodes
+             if item.get("enabled") and item.get("status") == "ready" and item.get("endpoint")),
+            None,
+        )
+        await store.update_serverless_proxy({
+            **current_row,
+            "enabled": bool(healthy),
+            "endpoint": healthy.get("endpoint") if healthy else str(current_row.get("endpoint") or ""),
+            "nodes": marked_nodes,
+        })
+        await store.set_serverless_proxy_status(
+            "ready" if healthy else "error", "" if healthy else str(exc), enabled=bool(healthy)
+        )
+        await configure_gateway(await store.get_runtime_config(), force_enabled=bool(healthy))
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
         raise HTTPException(502, f"云函数部署或验证失败：{exc}") from exc
 
     return ServerlessProxyDeployResponse(

@@ -1,0 +1,13 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+  seamoon-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.local

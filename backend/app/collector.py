@@ -12,10 +12,21 @@ from app.providers.tianyancha import (
     ProviderError,
 )
 from app.repository import LeaseLost, Repository
+from app.serverless_proxy import ensure_icp_node_pool
 
 
 ICP_HEARTBEAT_SECONDS = 30
 ICP_STREAM_POLL_SECONDS = 0.25
+<<<<<<< HEAD
+=======
+# Keep enough names in flight to fill the scaled cloud pool. A batch of 50
+# caused hundreds of companies to be processed in many serial waves; when a
+# handful of companies hit their 30-second/3-attempt recovery path, the waves
+# dominated end-to-end time even though the 7-node gateway pool was healthy.
+# Auto-scaling still runs before the first batch and after each discovery
+# threshold, while the ICP scheduler bounds actual concurrent page requests.
+ICP_STREAM_BATCH_NAMES = 320
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 
 @dataclass(frozen=True)
@@ -89,15 +100,52 @@ async def _collect_icp_as_entities_are_discovered(
     """
     seen: set[str] = set()
     errors: list[str] = []
+<<<<<<< HEAD
+=======
+    scale_observed = 0
+    scale_errors_seen: set[str] = set()
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     while True:
         discovered = _prioritize_root_name(
             await repo.entity_names_for_run(spec.id), spec.keyword
         )
         pending = [name for name in discovered if name not in seen]
+<<<<<<< HEAD
         if pending:
             seen.update(pending)
             try:
                 errors.extend(await _collect_icp_with_heartbeat(repo, spec, pending))
+=======
+        # Keep the requested root responsive, then accumulate discovered
+        # investments until the batch is large enough to fill the cloud pool.
+        # Starting a 50-name ICP batch on every small discovery increment
+        # creates many serial waves and leaves most node capacity idle.
+        if pending and (not seen or len(pending) >= ICP_STREAM_BATCH_NAMES or producers_done.is_set()):
+            # Scale before starting the next ICP batch. Provisioning probes
+            # temporarily use the shared SeaMoon gateway; running them in the
+            # background used to divert live ICP traffic to the last probe
+            # endpoint and effectively disabled the healthy node pool.
+            if len(discovered) > scale_observed and len(discovered) >= 50:
+                scale_observed = len(discovered)
+                try:
+                    scale_result = await ensure_icp_node_pool(repo, len(discovered))
+                    scale_errors = (
+                        scale_result.get("errors")
+                        if isinstance(scale_result, dict)
+                        else []
+                    )
+                    if scale_errors:
+                        for scale_error in map(str, scale_errors):
+                            if scale_error not in scale_errors_seen:
+                                scale_errors_seen.add(scale_error)
+                                errors.append("ICP备案节点自动扩容：" + scale_error)
+                except Exception as exc:  # noqa: BLE001 - scaling is best effort
+                    errors.append(f"ICP备案节点自动扩容失败：{exc}")
+            batch = pending[:ICP_STREAM_BATCH_NAMES]
+            seen.update(batch)
+            try:
+                errors.extend(await _collect_icp_with_heartbeat(repo, spec, batch))
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
             except LeaseLost:
                 raise
             except Exception as exc:  # noqa: BLE001 - ICP is best effort

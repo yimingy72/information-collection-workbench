@@ -28,6 +28,43 @@ async def wait_for_db() -> asyncpg.Pool:
     raise AssertionError("unreachable")
 
 
+async def _collect_run_with_heartbeat(
+    repo: Repository, spec: RunSpec, providers: list,
+) -> list[str]:
+    """Keep a run lease alive across provider discovery and ICP collection.
+
+    ICP already has a scoped keepalive, but provider pagination can also take
+    longer than the lease window. Without this outer heartbeat the recoverer
+    can requeue a still-active run after 120 seconds, causing a second worker
+    to duplicate the query and the original worker to finish with ``LeaseLost``.
+    """
+    interval = max(5.0, min(30.0, settings.worker_lease_seconds / 3))
+
+    async def keepalive() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            await repo.touch_run(spec.id, lease_id=spec.lease_id)
+
+    collect_task = asyncio.create_task(collect_run(repo, providers, spec))
+    heartbeat_task = asyncio.create_task(keepalive())
+    try:
+        done, _ = await asyncio.wait(
+            {collect_task, heartbeat_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if heartbeat_task in done:
+            error = heartbeat_task.exception()
+            if error is not None:
+                raise error
+            raise RuntimeError("worker 心跳任务意外结束")
+        return collect_task.result()
+    finally:
+        for task in (collect_task, heartbeat_task):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(collect_task, heartbeat_task, return_exceptions=True)
+
+
 async def worker_loop(repo: Repository, provider_lock: asyncio.Lock) -> None:
     while True:
         run = await repo.claim_run(settings.worker_lease_seconds)
@@ -51,7 +88,7 @@ async def worker_loop(repo: Repository, provider_lock: asyncio.Lock) -> None:
                 continue
             async with provider_lock:
                 errors = list(login_errors)
-                errors.extend(await collect_run(repo, providers, spec))
+                errors.extend(await _collect_run_with_heartbeat(repo, spec, providers))
             status = "partial" if errors else "succeeded"
             await repo.finish(spec.id, status, "；".join(errors) if errors else None, lease_id=spec.lease_id)
         except asyncio.CancelledError:

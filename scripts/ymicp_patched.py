@@ -515,6 +515,14 @@ class beian:
         if cached and now - cached["time"] < 20:
             return True, cached["uuid"], cached["token"], cached["sign"], cached["base_header"]
 
+        # Page sessions already have their own state lock. Do not funnel
+        # independent manual-proxy nodes or SeaMoon tunnels through the global
+        # captcha lock; that made four of five concurrent requests wait until
+        # the nine-second route timeout. Calls without a session key keep the
+        # legacy global lock for backwards compatibility.
+        if session_key:
+            return await self._check_img_solve(proxy, session_key, session)
+
         async with self.check_img_lock:
             now = time.time()
             cached = self.check_img_cache.get(cache_key)

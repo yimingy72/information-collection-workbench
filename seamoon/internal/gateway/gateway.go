@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,15 +26,32 @@ type Config struct {
 	Endpoint           string   `json:"endpoint"` // legacy first endpoint
 	Endpoints          []string `json:"endpoints,omitempty"`
 	InsecureSkipVerify bool     `json:"insecure_skip_verify"`
+<<<<<<< HEAD
 }
 
 type Gateway struct {
 	config atomic.Value
 	cursor atomic.Uint64
+=======
+}
+
+const endpointFailureCooldown = 30 * time.Second
+
+type endpointHealth struct {
+	failures   int
+	retryAfter time.Time
+}
+
+type Gateway struct {
+	config   atomic.Value
+	cursor   atomic.Uint64
+	healthMu sync.Mutex
+	health   map[string]endpointHealth
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 }
 
 func New() *Gateway {
-	gateway := &Gateway{}
+	gateway := &Gateway{health: make(map[string]endpointHealth)}
 	gateway.config.Store(Config{})
 	return gateway
 }
@@ -74,6 +92,13 @@ func (g *Gateway) Update(next Config) error {
 		next.Endpoint = strings.TrimSpace(next.Endpoint)
 	}
 	g.config.Store(next)
+	g.healthMu.Lock()
+	for endpoint := range g.health {
+		if _, ok := seen[endpoint]; !ok {
+			delete(g.health, endpoint)
+		}
+	}
+	g.healthMu.Unlock()
 	return nil
 }
 
@@ -131,6 +156,41 @@ func (g *Gateway) ServeProxy(ctx context.Context, address string) error {
 	}
 }
 
+func (g *Gateway) availableEndpoints(endpoints []string, start int, now time.Time) []string {
+	g.healthMu.Lock()
+	defer g.healthMu.Unlock()
+	available := make([]string, 0, len(endpoints))
+	for attempt := range endpoints {
+		endpoint := endpoints[(start+attempt)%len(endpoints)]
+		state, failed := g.health[endpoint]
+		if failed && now.Before(state.retryAfter) {
+			continue
+		}
+		available = append(available, endpoint)
+	}
+	return available
+}
+
+func (g *Gateway) markEndpointSuccess(endpoint string) {
+	g.healthMu.Lock()
+	delete(g.health, endpoint)
+	g.healthMu.Unlock()
+}
+
+func (g *Gateway) markEndpointFailure(endpoint string, now time.Time) {
+	g.healthMu.Lock()
+	state := g.health[endpoint]
+	state.failures++
+	// Keep broken functions out of the hot path. A capped exponential cooldown
+	// still gives recovered endpoints periodic half-open probes without making
+	// every ICP connection pay the same failed WebSocket handshake.
+	shift := min(state.failures-1, 3)
+	cooldown := endpointFailureCooldown * time.Duration(1<<shift)
+	state.retryAfter = now.Add(cooldown)
+	g.health[endpoint] = state
+	g.healthMu.Unlock()
+}
+
 func (g *Gateway) handle(client net.Conn) {
 	defer client.Close()
 	config := g.Current()
@@ -139,7 +199,7 @@ func (g *Gateway) handle(client net.Conn) {
 		return
 	}
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 15 * time.Second,
+		HandshakeTimeout: 5 * time.Second,
 		ReadBufferSize:   32 * 1024,
 		WriteBufferSize:  32 * 1024,
 		TLSClientConfig: &tls.Config{ // #nosec G402 -- explicit user-controlled compatibility option.
@@ -148,15 +208,26 @@ func (g *Gateway) handle(client net.Conn) {
 		},
 	}
 	start := int(g.cursor.Add(1)-1) % len(config.Endpoints)
+<<<<<<< HEAD
 	for attempt := range config.Endpoints {
 		endpoint := config.Endpoints[(start+attempt)%len(config.Endpoints)]
 		ws, response, err := dialer.Dial(endpoint, nil)
 		if err == nil {
+=======
+	for _, endpoint := range g.availableEndpoints(config.Endpoints, start, time.Now()) {
+		ws, response, err := dialer.Dial(endpoint, nil)
+		if err == nil {
+			g.markEndpointSuccess(endpoint)
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 			remote := tunnel.Wrap(ws)
 			defer remote.Close()
 			relay(client, remote)
 			return
 		}
+<<<<<<< HEAD
+=======
+		g.markEndpointFailure(endpoint, time.Now())
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 		status := ""
 		if response != nil {
 			status = response.Status

@@ -9,7 +9,11 @@ from uuid import UUID, uuid4
 import httpx
 
 from app.repository import Repository
+<<<<<<< HEAD
 from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls
+=======
+from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls, pool_nodes
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 from app.settings import settings
 
 MAX_PAGES = 50
@@ -17,17 +21,27 @@ MAX_PAGES = 50
 # Larger values are silently normalized upstream and can destabilize pagination.
 PAGE_SIZE = 26
 ICP_PAGINATION_RECOVERY_PASSES = 2
+# A positive upstream total with an empty page is a transient/route anomaly,
+# not a normal multi-page pagination case. Give it one alternate page session
+# before returning to the company-level retry loop; repeating three complete
+# passes per attempt made a single bad response cost 9 requests.
+ICP_EMPTY_RESULT_RECOVERY_PASSES = 1
 
 
 # Keep one slot below the cloud-function instance concurrency of six.
 ICP_BATCH_SIZE = 5
-# Kept as a compatibility knob for existing deployments/tests that used the
-# old concurrency setting. It can only reduce the batch size, never increase it.
-ICP_CONCURRENCY = ICP_BATCH_SIZE
+# Maximum logical ICP concurrency after node-pool scaling. The compatibility
+# knob can still be lowered by an existing deployment or test.
+ICP_CONCURRENCY = 40
 ICP_DIRECT_REQUEST_GAP_SECONDS = 0.4
 ICP_BATCH_PAUSE_SECONDS = 12.0
 ICP_PAGE_TIMEOUT_SECONDS = 10
 ICP_COMPANY_TIMEOUT_SECONDS = 30
+<<<<<<< HEAD
+=======
+ICP_COMPANY_MAX_ATTEMPTS = max(1, settings.icp_company_max_attempts)
+ICP_COMPANY_RETRY_BACKOFF_SECONDS = max(0.0, settings.icp_company_retry_backoff_seconds)
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 # In cloud mode this counts actual ICP page requests, not companies. Reaching
 # the limit starts a new YMICP page session, which makes YMICP open a fresh
 # HTTP-proxy TCP connection and therefore a fresh SeaMoon WebSocket tunnel.
@@ -35,6 +49,18 @@ ICP_PROXY_REQUEST_LIMIT = 5
 # A WAF response should not discard the current page immediately. Retry it a
 # bounded number of times after the route generation has been rotated.
 ICP_PROXY_WAF_RETRIES = 2
+<<<<<<< HEAD
+=======
+# A single local gateway URL can front several cloud nodes. Rotate the tunnel
+# for non-WAF transport errors too; the gateway may have just selected a bad
+# endpoint and returning straight to the company retry wastes the page context.
+# One immediate alternate-tunnel retry is enough for transport/timeout errors;
+# further recovery is handled by the company-level retry with a fresh session.
+# Keeping two page retries here multiplied a single bad company into 9 slow
+# requests before the final failure was reported.
+ICP_PROXY_ERROR_RETRIES = 1
+ICP_MAX_CLOUD_BATCH_SIZE = 40
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 # Multiple API requests and queue workers share the same direct/cloud route.
 # Serialize complete ICP collections per event loop so separate runs cannot
@@ -187,6 +213,7 @@ class CompanyFailure:
     attempted_pages: int
     error: str
     elapsed_seconds: float
+    company_attempts: int = 1
 
 
 def _clean(value: Any) -> str:
@@ -285,15 +312,15 @@ async def _save_icp_page(
     run_id: UUID,
     requested_name: str,
     rows: list[Any],
-    seen: set[tuple[str, str]],
+    seen: set[tuple[str, ...]],
 ) -> None:
     for row in rows:
         if not isinstance(row, dict):
             continue
         domain = _clean(row.get("domain"))
         service_licence = _clean(row.get("serviceLicence"))
-        key = (domain, service_licence)
-        if not domain or key in seen:
+        key = _icp_row_key(row, requested_name)
+        if key is None or key in seen:
             continue
         seen.add(key)
         unit_name = _clean(row.get("unitName")) or requested_name
@@ -314,6 +341,28 @@ async def _save_icp_page(
         await repo.add_result(
             run_id, entity_id, "icp", payload, f"{settings.miit_api_url}/query/web", row
         )
+
+
+def _icp_row_key(row: dict[str, Any], requested_name: str = "") -> tuple[str, ...] | None:
+    """Build a stable ICP identity even when the upstream domain is blank.
+
+    MIIT legitimately returns备案 records whose ``domain`` is empty (for
+    example, a record identified only by ``mainLicence``). Treating those rows
+    as absent made a successful ``total=1, list=[...]`` response look like an
+    incomplete ``0/1`` response and needlessly consumed all retry attempts.
+    """
+    domain = _clean(row.get("domain"))
+    service_licence = _clean(row.get("serviceLicence"))
+    if domain or service_licence:
+        return ("domain", domain, service_licence)
+    main_licence = _clean(row.get("mainLicence"))
+    if main_licence:
+        return ("mainLicence", main_licence)
+    main_id = _clean(row.get("mainId"))
+    if main_id:
+        return ("mainId", main_id)
+    unit_name = _clean(row.get("unitName")) or _clean(requested_name)
+    return ("unitName", unit_name) if unit_name else None
 
 
 def _failure(
@@ -349,22 +398,52 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
         else "直连"
     )
     batch_size = max(1, min(ICP_BATCH_SIZE, ICP_CONCURRENCY))
+<<<<<<< HEAD
+=======
+    ready_cloud_nodes = [
+        item for item in pool_nodes(runtime_config.get("serverless_proxy") or {})
+        if item.get("enabled") and item.get("status") in {"ready", "deployed"}
+        and item.get("endpoint")
+    ]
+    if using_cloud_proxy:
+        # One FC instance safely carries five logical ICP requests. The local
+        # gateway round-robins connections across ready nodes, so scale the
+        # logical batch and rotation budget with the pool instead of keeping a
+        # hidden five-request ceiling after adding regions.
+        node_count = max(1, len(ready_cloud_nodes))
+        batch_size = min(
+            ICP_MAX_CLOUD_BATCH_SIZE,
+            max(1, ICP_CONCURRENCY),
+            5 * node_count,
+        )
+    if using_manual_proxy:
+        # A manual proxy is one fixed public exit. Run at most one active
+        # company per ready node; sending five companies through one node only
+        # makes their captcha/auth work contend and hit the page hard timeout.
+        batch_size = min(batch_size, len(manual_routes))
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     # A single manual proxy is a fixed route: do not apply the cloud tunnel
     # generation counter to it. Otherwise its pagination session would be
     # replaced every five pages even though no new exit IP can be created.
     cloud_scheduler = (
+<<<<<<< HEAD
         _IcpCloudRotationScheduler(ICP_PROXY_REQUEST_LIMIT)
+=======
+        _IcpCloudRotationScheduler(
+            max(ICP_PROXY_REQUEST_LIMIT, batch_size)
+        )
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
         if using_cloud_proxy and route_proxy
         else None
     )
     proxy_pool_scheduler = _IcpProxyPoolScheduler(route_proxies, ICP_PROXY_REQUEST_LIMIT) if len(route_proxies) > 1 else None
     request_scheduler = _IcpRequestScheduler(batch_size, direct=not route_proxies)
 
-    async def collect_company(name: str, client: httpx.AsyncClient) -> CompanyFailure | None:
+    async def collect_company_once(name: str, client: httpx.AsyncClient) -> CompanyFailure | None:
         started = asyncio.get_running_loop().time()
         attempted_pages = 0
         expected_total: int | None = None
-        aggregate_rows: dict[tuple[str, str], dict[str, Any]] = {}
+        aggregate_rows: dict[tuple[str, ...], dict[str, Any]] = {}
         aggregate_chunks: list[list[Any]] = []
         last_incomplete_reason = ""
 
@@ -451,7 +530,11 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                                 and page_proxy_retries < (
                                     ICP_PROXY_WAF_RETRIES
                                     if "创宇盾" in str(exc)
+<<<<<<< HEAD
                                     else max(0, len(route_proxies) - 1)
+=======
+                                    else ICP_PROXY_ERROR_RETRIES
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
                                 )
                             ):
                                 page_proxy_retries += 1
@@ -514,10 +597,9 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                         for row in page_rows:
                             if not isinstance(row, dict):
                                 continue
-                            domain = _clean(row.get("domain"))
-                            if not domain:
+                            key = _icp_row_key(row, name)
+                            if key is None:
                                 continue
-                            key = (domain, _clean(row.get("serviceLicence")))
                             aggregate_rows.setdefault(key, row)
 
                         if expected_total is not None:
@@ -546,7 +628,13 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                             f"上游报告 {expected_total} 条，分页合并后仅获取 "
                             f"{len(aggregate_rows)} 条"
                         )
-                    if pagination_pass >= ICP_PAGINATION_RECOVERY_PASSES:
+                    recovery_passes = ICP_PAGINATION_RECOVERY_PASSES
+                    if expected_total and not aggregate_rows:
+                        recovery_passes = min(
+                            recovery_passes,
+                            ICP_EMPTY_RESULT_RECOVERY_PASSES,
+                        )
+                    if pagination_pass >= recovery_passes:
                         break
 
                 if expected_total is not None:
@@ -577,6 +665,7 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             # Cloud mode limits active companies to five. Each company's page
             # pass has its own SeaMoon tunnel and session affinity; direct-mode
             # WAF pacing is handled by the scheduler above.
+<<<<<<< HEAD
             outcomes: list[CompanyFailure | None] = []
             for batch_start in range(0, len(names), batch_size):
                 batch = names[batch_start:batch_start + batch_size]
@@ -596,8 +685,74 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                     for name in batch:
                         batch_outcomes.append(await collect_company(name, client))
                 outcomes.extend(batch_outcomes)
+=======
+            # Retry in rounds so successful companies leave the queue while
+            # failed companies get a fresh session after a short cooldown.
+            pending = list(names)
+            last_failures: dict[str, CompanyFailure] = {}
+            attempt_counts: dict[str, int] = {name: 0 for name in names}
+            attempted_pages: dict[str, int] = {name: 0 for name in names}
+            elapsed_seconds: dict[str, float] = {name: 0.0 for name in names}
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
-            failed = [item for item in outcomes if item is not None]
+            for attempt_index in range(ICP_COMPANY_MAX_ATTEMPTS):
+                round_outcomes: list[tuple[str, CompanyFailure | None]] = []
+                for batch_start in range(0, len(pending), batch_size):
+                    batch = pending[batch_start:batch_start + batch_size]
+                    # Keep the request scheduler as the single gate for a
+                    # fixed direct IP, but run independent companies concurrently
+                    # behind it. This preserves the 0.4s inter-request gap and
+                    # five-request cooldown while allowing request latency to be
+                    # pipelined. Serialising the whole company batch made a
+                    # normal direct run pay one network round-trip per company
+                    # on top of the WAF pacing (the main source of the observed
+                    # ~50 minute run for 1,280 names).
+                    #
+                    # Proxy-backed mode uses the same bounded gather. Manual
+                    # proxy pools reduce ``batch_size`` to their ready-node
+                    # count, while cloud mode stays at five logical companies.
+                    batch_results = await asyncio.gather(
+                        *(collect_company_once(name, client) for name in batch)
+                    )
+                    round_outcomes.extend(zip(batch, batch_results, strict=True))
+
+                retry_names: list[str] = []
+                for name, outcome in round_outcomes:
+                    attempt_counts[name] += 1
+                    if outcome is None:
+                        last_failures.pop(name, None)
+                        continue
+                    attempted_pages[name] += outcome.attempted_pages
+                    elapsed_seconds[name] += outcome.elapsed_seconds
+                    last_failures[name] = outcome
+                    retry_names.append(name)
+
+                pending = retry_names
+                if not pending or attempt_index + 1 >= ICP_COMPANY_MAX_ATTEMPTS:
+                    break
+                await asyncio.sleep(
+                    ICP_COMPANY_RETRY_BACKOFF_SECONDS * (attempt_index + 1)
+                )
+
+            failed: list[CompanyFailure] = []
+            for name in names:
+                last_failure = last_failures.get(name)
+                if last_failure is None:
+                    continue
+                attempts = attempt_counts[name]
+                retries = max(0, attempts - 1)
+                detail = last_failure.error
+                if retries:
+                    detail = f"{detail}（企业级自动重试 {retries} 次后仍失败）"
+                failed.append(
+                    CompanyFailure(
+                        name=name,
+                        attempted_pages=attempted_pages[name],
+                        error=detail,
+                        elapsed_seconds=elapsed_seconds[name],
+                        company_attempts=attempts,
+                    )
+                )
     except Exception as exc:  # noqa: BLE001 - ICP is best effort
         return [f"ICP备案查询失败：{_clean(exc) or type(exc).__name__}"]
 
@@ -606,7 +761,9 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
 
     ok = len(names) - len(failed)
     details = "；".join(
-        f"{item.name}：请求页面 {item.attempted_pages} 次，最终错误：{item.error}，实际耗时：{item.elapsed_seconds:.2f} 秒"
+        f"{item.name}：企业尝试 {item.company_attempts} 次，"
+        f"请求页面 {item.attempted_pages} 次，"
+        f"最终错误：{item.error}，实际耗时：{item.elapsed_seconds:.2f} 秒"
         for item in failed[:3]
     )
     if len(failed) > 3:

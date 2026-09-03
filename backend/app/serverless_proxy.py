@@ -240,7 +240,15 @@ def validate_deploy_config(config: dict[str, Any]) -> None:
 async def configure_gateway(config: dict[str, Any], *, force_enabled: bool | None = None) -> None:
     row = _row(config)
     enabled = bool(row.get("enabled")) if force_enabled is None else force_enabled
+<<<<<<< HEAD
     endpoints = _gateway_endpoints(row, force_enabled=enabled)
+=======
+    # ``force_enabled`` controls whether the gateway itself is enabled. It
+    # must not implicitly admit disabled/error pool nodes. Only an explicit
+    # ``True`` (used by the single-node warm-up probe) may bypass node health
+    # filtering.
+    endpoints = _gateway_endpoints(row, force_enabled=force_enabled is True)
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     payload = {
         "enabled": enabled and bool(endpoints),
         "endpoint": endpoints[0] if endpoints else str(row.get("endpoint") or "").strip(),
@@ -268,7 +276,13 @@ async def configure_gateway_for_active_route(config: dict[str, Any]) -> None:
     await configure_gateway(config)
 
 
+<<<<<<< HEAD
 async def test_serverless_proxy(config: dict[str, Any]) -> ServerlessProxyTestResponse:
+=======
+async def test_serverless_proxy(
+    config: dict[str, Any], *, restore_gateway: bool = True
+) -> ServerlessProxyTestResponse:
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
     row = _row(config)
     validate_saved_config({**row, "enabled": True})
     nodes = pool_nodes(row)
@@ -289,7 +303,13 @@ async def test_serverless_proxy(config: dict[str, Any]) -> ServerlessProxyTestRe
                 force_enabled=True,
             )
             last_error: Exception | None = None
+<<<<<<< HEAD
             for attempt in range(3):
+=======
+            # Newly created FC triggers can return 412 while propagating or
+            # warming. Use a bounded warm-up window before marking a node bad.
+            for attempt in range(5):
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
                 started = time.monotonic()
                 timeout = httpx.Timeout(20.0, connect=15.0, read=20.0, write=20.0, pool=5.0)
                 try:
@@ -307,8 +327,13 @@ async def test_serverless_proxy(config: dict[str, Any]) -> ServerlessProxyTestRe
                     break
                 except Exception as exc:  # noqa: BLE001 - cold starts can fail transiently
                     last_error = exc
+<<<<<<< HEAD
                     if attempt < 2:
                         await asyncio.sleep(attempt + 1)
+=======
+                    if attempt < 4:
+                        await asyncio.sleep(min(8, 2 * (attempt + 1)))
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
             if last_error is not None:
                 failures.append(f"{node['region']}：{last_error}")
 
@@ -327,7 +352,14 @@ async def test_serverless_proxy(config: dict[str, Any]) -> ServerlessProxyTestRe
     except Exception as exc:
         raise ServerlessProxyError(f"云函数代理测试失败：{exc}") from exc
     finally:
+<<<<<<< HEAD
         await configure_gateway(row, force_enabled=bool(row.get("enabled")))
+=======
+        if restore_gateway:
+            # Restore the saved active pool, not the probe bypass mode. A
+            # normal health test must never re-admit disabled/error nodes.
+            await configure_gateway(row)
+>>>>>>> 00b6672 (优化ICP节点调度并同步手动代理规则)
 
 
 async def run_cloud_operation(action: str, config: dict[str, Any]) -> dict[str, str]:
@@ -372,3 +404,185 @@ async def run_cloud_operation(action: str, config: dict[str, Any]) -> dict[str, 
     if not isinstance(result, dict):
         raise ServerlessProxyError("SeaMoon 核心程序返回了无效结果")
     return {str(key): str(value) for key, value in result.items() if value is not None}
+
+_AUTO_SCALE_LOCK = asyncio.Lock()
+
+
+def desired_icp_node_count(company_count: int) -> int:
+    """Return the bounded cloud-node target for an ICP workload.
+
+    The default budget is deliberately conservative: five logical ICP requests
+    per node, a 160-company safety allowance per five-minute target window, and
+    a hard cap of eight nodes to avoid unbounded cloud spend.
+    """
+    count = max(1, int(company_count or 0))
+    target_seconds = max(60, int(settings.icp_target_seconds))
+    base_per_node = max(1, int(settings.icp_auto_scale_companies_per_node))
+    per_node = max(1, round(base_per_node * target_seconds / 300))
+    max_nodes = max(1, int(settings.icp_auto_scale_max_nodes))
+    return min(max_nodes, max(1, (count + per_node - 1) // per_node))
+
+
+def _auto_scale_regions() -> list[str]:
+    values = [str(item).strip() for item in str(settings.icp_auto_scale_regions).split(",")]
+    excluded = {
+        str(item).strip()
+        for item in str(settings.icp_auto_scale_excluded_regions).split(",")
+        if str(item).strip()
+    }
+    return list(dict.fromkeys(item for item in values if item and item not in excluded))
+
+
+async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
+    """Best-effort provision enough mainland cloud nodes for an ICP workload.
+
+    Provisioning is idempotent by ``provider:region:function_name``. Existing
+    traffic is never disabled when a new region fails; the caller can continue
+    with the healthy subset and record the scale-up failure separately.
+    """
+    runtime = await repo.get_runtime_config()
+    row = _row(runtime)
+    if not row.get("enabled") or str(row.get("provider") or "aliyun") != "aliyun":
+        return {"target": 0, "ready": 0, "deployed": 0, "errors": []}
+    # A ready manual proxy is an explicit single-route choice. Do not create
+    # cloud resources that the current route policy will not use.
+    if manual_proxy_urls(runtime):
+        return {"target": 0, "ready": 0, "deployed": 0, "errors": ["手动代理优先，跳过云函数自动扩容"]}
+
+    async with _AUTO_SCALE_LOCK:
+        runtime = await repo.get_runtime_config()
+        row = _row(runtime)
+        nodes = pool_nodes(row)
+        ready = [
+            node for node in nodes
+            if node.get("enabled") and node.get("status") == "ready"
+            and node.get("endpoint")
+        ]
+        target = desired_icp_node_count(company_count)
+        if len(ready) >= target:
+            return {"target": target, "ready": len(ready), "deployed": 0, "errors": []}
+
+        existing_ids = {str(node.get("id")) for node in nodes}
+        provider = str(row.get("provider") or "aliyun")
+        function_name = str(row.get("function_name") or "asset-workbench-seamoon")
+        # An endpoint can be created successfully but fail its first probe
+        # while the FC trigger is still propagating. Keep that region in the
+        # candidate list so a later workload-size increase can retry it; the
+        # node remains disabled until a probe succeeds.
+        candidates = [
+            region for region in _auto_scale_regions()
+            if f"{provider}:{region}:{function_name}" not in existing_ids
+            or any(
+                str(node.get("id")) == f"{provider}:{region}:{function_name}"
+                and node.get("status") == "error"
+                for node in nodes
+            )
+        ]
+        need = max(0, target - len(ready))
+        candidates = candidates[:need]
+        if not candidates:
+            return {
+                "target": target,
+                "ready": len(ready),
+                "deployed": 0,
+                "errors": ["没有更多可用的云函数地域候选"],
+            }
+
+        semaphore = asyncio.Semaphore(2)
+        probe_lock = asyncio.Lock()
+
+        async def deploy_region(region: str) -> tuple[dict[str, Any] | None, str | None]:
+            async with semaphore:
+                config = {
+                    **row,
+                    "provider": provider,
+                    "region": region,
+                    "function_name": function_name,
+                    "image_uri": str(row.get("image_uri") or ""),
+                    "access_key_id": str(row.get("access_key_id") or ""),
+                    "access_key_secret": str(row.get("access_key_secret") or ""),
+                    "deployment_id": "",
+                }
+                try:
+                    result = await run_cloud_operation("deploy", config)
+                    endpoint = str(result.get("endpoint") or "").strip()
+                    if not endpoint:
+                        raise ServerlessProxyError("云平台未返回函数地址")
+                    node = {
+                        "id": f"{provider}:{region}:{function_name}",
+                        "enabled": False,
+                        "provider": provider,
+                        "endpoint": endpoint,
+                        "region": region,
+                        "function_name": function_name,
+                        "image_uri": config["image_uri"],
+                        "access_key_id": config["access_key_id"],
+                        "access_key_secret": config["access_key_secret"],
+                        "insecure_skip_verify": bool(row.get("insecure_skip_verify")),
+                        "deployment_id": str(result.get("deployment_id") or ""),
+                        "status": "deployed",
+                        "last_error": "",
+                        "latency_ms": None,
+                        "failure_count": 0,
+                    }
+                    # Gateway configuration is shared, so probe nodes one at a
+                    # time. A node is not admitted to ICP traffic until the
+                    # WebSocket handshake succeeds.
+                    async with probe_lock:
+                        await test_serverless_proxy(
+                            {**row, "enabled": True, "endpoint": endpoint, "nodes": [node]},
+                            # The caller restores the complete healthy pool
+                            # after all probes. Restoring a single probe node
+                            # here would temporarily divert live ICP traffic
+                            # to that node while auto-scaling runs.
+                            restore_gateway=False,
+                        )
+                    node["enabled"] = True
+                    node["status"] = "ready"
+                    return node, None
+                except Exception as exc:  # noqa: BLE001 - preserve healthy pool
+                    if "node" in locals():
+                        node["enabled"] = False
+                        node["status"] = "error"
+                        node["last_error"] = str(exc)
+                        return node, f"{region}：{exc}"
+                    return None, f"{region}：{exc}"
+
+        outcomes = await asyncio.gather(*(deploy_region(region) for region in candidates))
+        errors = [error for _, error in outcomes if error]
+        # Persist failed probes for observability and future repair attempts,
+        # but only admit nodes that actually passed warm-up to the gateway.
+        # Previously every returned node (including ``status=error``) was
+        # passed to ``configure_gateway(..., force_enabled=True)``. That made
+        # the gateway round-robin through dead 502 endpoints on every ICP
+        # connection, adding a 5-second WebSocket handshake timeout per bad
+        # region and making the healthy pool look much slower than it was.
+        returned_nodes = [node for node, _ in outcomes if node is not None]
+        ready_added = [
+            node for node in returned_nodes
+            if node.get("enabled") and node.get("status") == "ready"
+        ]
+        for node in returned_nodes:
+            nodes = upsert_pool_node(row | {"nodes": nodes}, node)
+
+        if returned_nodes:
+            payload = {
+                **row,
+                "enabled": True,
+                "endpoint": str(row.get("endpoint") or returned_nodes[0]["endpoint"]),
+                "nodes": nodes,
+            }
+            await repo.update_serverless_proxy(payload)
+            if ready_added:
+                await repo.set_serverless_proxy_status("ready", enabled=True)
+            # Do not force disabled/error nodes into the active gateway
+            # endpoint list. The persisted node status is the source of truth
+            # for routing after an auto-scale attempt.
+            await configure_gateway(await repo.get_runtime_config())
+
+        return {
+            "target": target,
+            "ready": len(ready) + len(ready_added),
+            "deployed": len(ready_added),
+            "errors": errors,
+        }
