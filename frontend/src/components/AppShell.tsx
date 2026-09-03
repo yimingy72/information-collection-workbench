@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react'
 import { useState } from 'react'
 import {
+  GlobalOutlined,
   HistoryOutlined,
   MenuFoldOutlined,
   MenuOutlined,
@@ -24,6 +25,7 @@ type AppShellProps = {
 
 const navItems = [
   { key: 'collection', icon: <SearchOutlined />, label: 'ICP备案查询' },
+  { key: 'subdomains', icon: <GlobalOutlined />, label: '子域名查询' },
   { key: 'tasks', icon: <HistoryOutlined />, label: '历史查询' },
   { key: 'settings', icon: <SettingOutlined />, label: '基础配置' },
 ]
@@ -42,7 +44,7 @@ export function AppShell({
   const [collapsed, setCollapsed] = useState(false)
   const [mobileOpen, setMobileOpen] = useState(false)
   const isMobile = screens.lg === false
-  const selectedKey = page.startsWith('collection') ? 'collection' : page === 'settings' ? 'settings' : 'tasks'
+  const selectedKey = page.startsWith('collection') ? 'collection' : page.startsWith('subdomains') ? 'subdomains' : page === 'settings' ? 'settings' : 'tasks'
 
   const menu = (
     <Menu

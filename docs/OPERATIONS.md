@@ -1,6 +1,6 @@
 # 运行与排障
 
-> 最后更新：2026-09-01
+> 最后更新：2026-09-03
 
 ## 常用命令
 
@@ -124,6 +124,21 @@ docker compose -p asset-workbench exec -T postgres \
 
 工信部接口可能返回重叠页。平台会执行有限恢复分页；30秒预算内仍未达到 `total` 时标记部分成功，避免把不完整数量当成最终结果。
 
+### 子域名查询长时间停留在“等待中”
+
+检查 worker 是否运行，以及数据库中 `subdomain_runs` 的 `status`、`heartbeat_at` 和
+`lease_id`。子域名任务使用独立协程，数量由 `SUBDOMAIN_WORKER_CONCURRENCY` 控制。
+网络/超时/5xx 等被动数据源错误会进行有限重试；429 会进入该来源的限流冷却，不再立即重复请求，也不通过代理轮换硬绕过。最终失败才写入简短警告；DNS 字典和其他来源仍会继续。相同主域名、相同来源的成功结果默认缓存 6 小时，因此第二次查询通常会更快。
+
+常用 SQL：
+
+```sql
+SELECT id, domains, status, phase, progress, total, discovered, warnings, error, created_at
+FROM subdomain_runs
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
 ### 历史记录显示“部分成功”
 
 查看 `collection_runs.error` 或历史详情顶部警告。只要已有投资或 ICP 数据，单个企业/数据源失败会保留有效结果并标记 `partial`。
@@ -169,3 +184,56 @@ cd ../seamoon && go test ./...
 ## 非破坏性原则
 
 排障默认只读取日志、查询数据库和发送普通查询请求。不要删除任务、云函数、数据库卷或云资源，除非用户明确要求并确认影响范围。
+
+
+### 被动来源结果未立即更新
+
+实时列表会优先显示 DNS 字典已经验证的结果。较慢的被动来源随后命中同一子域名时，数据库会合并来源标签；任务结束事件触发后，前端会重新加载完整结果并显示最终来源集合。
+
+检查缓存：
+
+```sql
+SELECT root_domain, source, jsonb_array_length(hosts) AS host_count,
+       refreshed_at, expires_at
+FROM subdomain_source_cache
+ORDER BY refreshed_at DESC
+LIMIT 50;
+```
+
+如需排障某个来源，可只删除对应的过期/错误测试缓存；不要删除任务或业务结果。正常情况下等待 6 小时自动过期即可。
+
+
+### 如何提高结果覆盖率
+
+默认查询已经组合公开证书、DNS 数据集、SRV 记录、站点元数据、Common Crawl、DNS 字典、页面引用和有限名称变体。对于已获授权的目标，建议保持“被动数据源、DNS 字典和智能变体”开启；如果只需要快速初筛，可关闭智能变体和 HTTP 探测。平台不会默认开启需要账号/API Key 的 OneForAll 搜索/情报模块，也不会开启 AXFR、接管或端口类检查。
+
+结果不完整时先检查任务警告和 `subdomain_source_cache`，再等待限流来源冷却后重新查询。不要用代理轮换连续冲击返回 429 的来源；这不能保证增加结果，反而可能扩大限流范围。
+
+## ICP 缓存排障
+
+默认配置：
+
+```env
+ICP_CACHE_ENABLED=true
+ICP_CACHE_TTL_HOURS=24
+ICP_ZERO_CACHE_TTL_HOURS=6
+```
+
+查询页结果头的“ICP：缓存 N 家 · 实时 M 家”按企业统计。只有完整性证明仍成立的缓存才计入命中；首次查询、缓存过期、算法升级、数量不一致或缓存内容损坏都会计入实时查询。
+
+只读检查：
+
+```sql
+SELECT company_name, reported_total, saved_total, complete, query_version,
+       checked_at, expires_at
+FROM icp_company_cache
+ORDER BY checked_at DESC
+LIMIT 50;
+
+SELECT id, keyword, icp_cache_hits, icp_live_queries, status, created_at
+FROM collection_runs
+ORDER BY created_at DESC
+LIMIT 20;
+```
+
+不要把失败任务或旧 `results` 表数据手工补进缓存。旧历史结果缺少当时上游 `total` 的完整性证据，直接回填可能让不完整记录阻止实时查询。正常做法是让该企业完成一次实时查询，由程序在数量严格相等后自动建立或替换缓存。

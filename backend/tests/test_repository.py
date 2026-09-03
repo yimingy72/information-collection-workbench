@@ -94,3 +94,103 @@ async def test_results_can_load_all_relationships_without_a_fixed_limit():
     relationship_query = pool.queries[-2][0]
     assert "FROM relationships rel" in relationship_query
     assert "LIMIT $2" not in relationship_query
+
+
+@pytest.mark.asyncio
+async def test_claim_subdomain_run_uses_skip_locked_and_lease():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.claim_subdomain_run()
+    query, _ = pool.queries[0]
+    assert "FROM subdomain_runs" in query
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert "lease_id=gen_random_uuid()" in query
+
+
+@pytest.mark.asyncio
+async def test_subdomain_progress_requires_matching_lease():
+    pool = FakePool("UPDATE 0")
+    repo = Repository(pool, None)
+    with pytest.raises(LeaseLost):
+        await repo.update_subdomain_progress(
+            uuid4(), 1, 2, 1, "resolving", lease_id=uuid4()
+        )
+    query, _ = pool.queries[0]
+    assert "UPDATE subdomain_runs" in query
+    assert "lease_id=$6" in query
+
+
+@pytest.mark.asyncio
+async def test_subdomain_source_cache_uses_unexpired_rows():
+    class CachePool(FakePool):
+        async def fetchval(self, query, *args):
+            self.queries.append((query, args))
+            return []
+
+    pool = CachePool()
+    repo = Repository(pool, None)
+    await repo.get_subdomain_source_cache("example.com", "crt.sh")
+    query, args = pool.queries[0]
+    assert "expires_at > now()" in query
+    assert args == ("example.com", "crt.sh")
+
+
+@pytest.mark.asyncio
+async def test_subdomain_result_upsert_merges_sources():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.add_subdomain_result(
+        uuid4(),
+        root_domain="example.com",
+        hostname="www.example.com",
+        ips=["93.184.216.34"],
+        canonical_name="",
+        wildcard=False,
+        http_url="https://www.example.com/",
+        http_status=200,
+        title="Example",
+        sources=["crt.sh"],
+    )
+    query, _ = pool.queries[0]
+    assert "ON CONFLICT(run_id, root_domain, hostname) DO UPDATE" in query
+    assert "subdomain_results.sources || EXCLUDED.sources" in query
+
+
+@pytest.mark.asyncio
+async def test_subdomain_results_after_skips_count_query():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.subdomain_results_after(uuid4(), 12, 500)
+    assert len(pool.queries) == 1
+    query, args = pool.queries[0]
+    assert "id>$2 ORDER BY id LIMIT $3" in query
+    assert args[1:] == (12, 500)
+
+
+@pytest.mark.asyncio
+async def test_icp_company_cache_only_loads_fresh_complete_matching_version():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.get_icp_company_caches(["示例公司"], "cache-v1")
+
+    query, args = pool.queries[0]
+    assert "expires_at > now()" in query
+    assert "complete=TRUE" in query
+    assert "saved_total >= reported_total" in query
+    assert "query_version=$2" in query
+    assert args == (["示例公司"], "cache-v1")
+
+
+@pytest.mark.asyncio
+async def test_icp_company_cache_upsert_replaces_complete_snapshot():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    row = {"domain": "example.com", "serviceLicence": "京ICP备1号"}
+    await repo.upsert_icp_company_cache("示例公司", [row], 1, "cache-v1", 3600)
+
+    query, args = pool.queries[0]
+    assert "ON CONFLICT(company_name) DO UPDATE" in query
+    assert "complete=TRUE" in query
+    assert "expires_at=EXCLUDED.expires_at" in query
+    assert args[0] == "示例公司"
+    assert args[2:] == (1, 1, "cache-v1", 3600)

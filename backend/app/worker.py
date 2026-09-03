@@ -12,6 +12,7 @@ from app.providers.registry import build_providers, login_required_errors
 from app.repository import LeaseLost, Repository, create_pool
 from app.serverless_proxy import configure_gateway_for_active_route
 from app.settings import settings
+from app.subdomains import collect_subdomains
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -109,6 +110,40 @@ async def worker_loop(repo: Repository, provider_lock: asyncio.Lock) -> None:
                     await close()
 
 
+async def subdomain_worker_loop(repo: Repository) -> None:
+    while True:
+        run = await repo.claim_subdomain_run()
+        if not run:
+            await asyncio.sleep(settings.worker_poll_seconds)
+            continue
+        run_id = run["id"]
+        lease_id = run["lease_id"]
+        try:
+            warnings = await collect_subdomains(
+                repo,
+                run_id,
+                list(run["domains"] or []),
+                dict(run["options"] or {}),
+                lease_id=lease_id,
+            )
+            await repo.finish_subdomain_run(
+                run_id, "partial" if warnings else "succeeded", warnings, None,
+                lease_id=lease_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except LeaseLost:
+            log.warning("lost lease for subdomain run %s", run_id)
+        except Exception as exc:  # noqa: BLE001 - persist failure for UI/history
+            log.exception("subdomain run %s failed", run_id)
+            try:
+                await repo.finish_subdomain_run(
+                    run_id, "failed", [], str(exc), lease_id=lease_id
+                )
+            except LeaseLost:
+                log.warning("lost lease while finishing subdomain run %s", run_id)
+
+
 async def recover_loop(repo: Repository) -> None:
     while True:
         await repo.recover_stale(settings.worker_lease_seconds)
@@ -124,6 +159,10 @@ async def run_worker() -> None:
     workers.extend(
         asyncio.create_task(worker_loop(repo, lock))
         for _ in range(max(1, settings.worker_concurrency))
+    )
+    workers.extend(
+        asyncio.create_task(subdomain_worker_loop(repo))
+        for _ in range(max(1, settings.subdomain_worker_concurrency))
     )
     try:
         await asyncio.gather(*workers)

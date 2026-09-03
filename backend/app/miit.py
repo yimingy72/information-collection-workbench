@@ -51,6 +51,10 @@ ICP_PROXY_WAF_RETRIES = 2
 # requests before the final failure was reported.
 ICP_PROXY_ERROR_RETRIES = 1
 ICP_MAX_CLOUD_BATCH_SIZE = 40
+# Bump this whenever pagination, completeness, or record identity semantics
+# change. Old cache rows remain available for audit but can no longer suppress
+# a live query after the algorithm changes.
+ICP_CACHE_VERSION = "miit-web-page26-record-key-v1"
 
 # Multiple API requests and queue workers share the same direct/cloud route.
 # Serialize complete ICP collections per event loop so separate runs cannot
@@ -355,6 +359,116 @@ def _icp_row_key(row: dict[str, Any], requested_name: str = "") -> tuple[str, ..
     return ("unitName", unit_name) if unit_name else None
 
 
+def _validated_cached_rows(
+    cache: Any, requested_name: str
+) -> list[dict[str, Any]] | None:
+    """Return a cache snapshot only when its completeness proof still holds."""
+    try:
+        value = dict(cache)
+        if not value.get("complete") or value.get("query_version") != ICP_CACHE_VERSION:
+            return None
+        reported_total = int(value["reported_total"])
+        saved_total = int(value["saved_total"])
+        raw_rows = value.get("rows")
+    except (KeyError, TypeError, ValueError):
+        return None
+    if (
+        reported_total < 0
+        or saved_total != reported_total
+        or not isinstance(raw_rows, list)
+        or len(raw_rows) != saved_total
+    ):
+        return None
+
+    unique_rows: dict[tuple[str, ...], dict[str, Any]] = {}
+    for row in raw_rows:
+        if not isinstance(row, dict):
+            continue
+        key = _icp_row_key(row, requested_name)
+        if key is not None:
+            unique_rows.setdefault(key, row)
+    if len(unique_rows) != reported_total:
+        return None
+    return list(unique_rows.values())
+
+
+async def _restore_icp_cache(
+    repo: Repository, run_id: UUID, names: list[str]
+) -> tuple[list[str], list[str]]:
+    """Copy fresh complete snapshots into this run and return hits/misses.
+
+    Cache access is deliberately best-effort: an unavailable or malformed
+    cache falls back to the authoritative live query instead of losing data.
+    """
+    if not settings.icp_cache_enabled:
+        return [], names
+    get_caches = getattr(repo, "get_icp_company_caches", None)
+    if get_caches is None:
+        return [], names
+    try:
+        caches = await get_caches(names, ICP_CACHE_VERSION)
+    except Exception:  # noqa: BLE001 - cache failure must not block live ICP
+        return [], names
+
+    hits: list[str] = []
+    misses: list[str] = []
+    for name in names:
+        cached_rows = _validated_cached_rows(caches.get(name), name) if caches.get(name) else None
+        if cached_rows is None:
+            misses.append(name)
+            continue
+        try:
+            await _save_icp_page(repo, run_id, name, cached_rows, set())
+        except Exception:  # noqa: BLE001 - retry this company through live ICP
+            misses.append(name)
+            continue
+        hits.append(name)
+    return hits, misses
+
+
+async def _store_icp_cache(
+    repo: Repository,
+    company_name: str,
+    rows: list[dict[str, Any]],
+    reported_total: int | None,
+) -> None:
+    """Persist only an authoritative, exactly complete company snapshot."""
+    if not settings.icp_cache_enabled or reported_total is None:
+        return
+    if reported_total < 0 or len(rows) != reported_total:
+        return
+    upsert_cache = getattr(repo, "upsert_icp_company_cache", None)
+    if upsert_cache is None:
+        return
+    ttl_hours = (
+        settings.icp_zero_cache_ttl_hours
+        if reported_total == 0
+        else settings.icp_cache_ttl_hours
+    )
+    try:
+        await upsert_cache(
+            company_name,
+            rows,
+            reported_total,
+            ICP_CACHE_VERSION,
+            max(1, int(ttl_hours * 3600)),
+        )
+    except Exception:  # noqa: BLE001 - a completed query must survive cache failure
+        return
+
+
+async def _record_icp_cache_stats(
+    repo: Repository, run_id: UUID, cache_hits: int, live_queries: int
+) -> None:
+    add_stats = getattr(repo, "add_icp_cache_stats", None)
+    if add_stats is None:
+        return
+    try:
+        await add_stats(run_id, cache_hits, live_queries)
+    except Exception:  # noqa: BLE001 - metrics must never affect collection
+        return
+
+
 def _failure(
     name: str,
     started: float,
@@ -366,10 +480,12 @@ def _failure(
 
 
 async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list[str]:
-    if not settings.miit_api_url:
-        return []
     names = list(dict.fromkeys(_clean(name) for name in names if _clean(name)))
     if not names:
+        return []
+    cache_hits, names = await _restore_icp_cache(repo, run_id, names)
+    await _record_icp_cache_stats(repo, run_id, len(cache_hits), len(names))
+    if not names or not settings.miit_api_url:
         return []
     get_runtime_config = getattr(repo, "get_runtime_config", None)
     runtime_config = await get_runtime_config() if get_runtime_config else {}
@@ -431,9 +547,11 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
         last_incomplete_reason = ""
 
         async def save_complete_result() -> None:
-            saved_seen: set[tuple[str, str]] = set()
+            complete_rows = list(aggregate_rows.values())
+            saved_seen: set[tuple[str, ...]] = set()
             for page_rows in aggregate_chunks:
                 await _save_icp_page(repo, run_id, name, page_rows, saved_seen)
+            await _store_icp_cache(repo, name, complete_rows, expected_total)
 
         try:
             async with asyncio.timeout(ICP_COMPANY_TIMEOUT_SECONDS):

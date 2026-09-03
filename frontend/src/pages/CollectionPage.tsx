@@ -233,6 +233,14 @@ export function CollectionPage({
               <Typography.Text type="secondary">
                 查询用时 {formatDuration(query.run.started_at, query.run.finished_at)}
               </Typography.Text>
+              {query.run.icp_cache_hits + query.run.icp_live_queries > 0 ? (
+                <Typography.Text
+                  type="secondary"
+                  title="只复用未过期、算法版本一致且记录数校验完整的历史 ICP 结果"
+                >
+                  ICP：缓存 {query.run.icp_cache_hits} 家 · 实时 {query.run.icp_live_queries} 家
+                </Typography.Text>
+              ) : null}
               <Button
                 icon={<DownloadOutlined />}
                 disabled={!query.investments.length && !query.icp_records.length}

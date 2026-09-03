@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.providers.names import ProviderId, normalize_providers
 
@@ -71,6 +71,8 @@ class RunSummary(BaseModel):
     attempts: int
     progress: int
     total: int | None
+    icp_cache_hits: int = 0
+    icp_live_queries: int = 0
     error: str | None
     created_at: datetime
     started_at: datetime | None
@@ -152,6 +154,96 @@ class ResultsResponse(BaseModel):
     relationships: list[RelationshipItem]
     total_results: int
     total_relationships: int
+
+
+class SubdomainOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    passive: bool = True
+    brute_force: bool = True
+    deep_scan: bool = True
+    http_probe: bool = True
+
+    @model_validator(mode="after")
+    def require_discovery_method(self):
+        if not self.passive and not self.brute_force:
+            raise ValueError("被动数据源和 DNS 字典至少启用一项")
+        return self
+
+
+class SubdomainRunRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    domains: list[str] = Field(default_factory=list, max_length=200)
+    source_run_ids: list[UUID] = Field(default_factory=list, max_length=50)
+    options: SubdomainOptions = Field(default_factory=SubdomainOptions)
+
+    @field_validator("domains")
+    @classmethod
+    def strip_domains(cls, values: list[str]) -> list[str]:
+        return [str(value or "").strip() for value in values if str(value or "").strip()]
+
+    @model_validator(mode="after")
+    def require_source(self):
+        if not self.domains and not self.source_run_ids:
+            raise ValueError("请至少输入域名或选择一条 ICP 查询记录")
+        return self
+
+
+class SubdomainRunSummary(BaseModel):
+    id: UUID
+    domains: list[str]
+    source_run_ids: list[UUID]
+    options: SubdomainOptions
+    status: str
+    phase: str
+    attempts: int
+    progress: int
+    total: int | None
+    discovered: int
+    warnings: list[str]
+    error: str | None
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class SubdomainRunListResponse(BaseModel):
+    items: list[SubdomainRunSummary]
+    total: int
+
+
+class SubdomainResultItem(BaseModel):
+    id: int
+    run_id: UUID
+    root_domain: str
+    hostname: str
+    ips: list[str]
+    canonical_name: str
+    dns_status: str
+    wildcard: bool
+    http_url: str
+    http_status: int | None
+    title: str
+    sources: list[str]
+    discovered_at: datetime
+
+
+class SubdomainResultsResponse(BaseModel):
+    run_id: UUID
+    items: list[SubdomainResultItem]
+    total: int
+
+
+class IcpDomainRun(BaseModel):
+    id: UUID
+    keyword: str
+    created_at: datetime
+    domains: list[str]
+
+
+class IcpDomainRunListResponse(BaseModel):
+    items: list[IcpDomainRun]
 
 
 class ProviderSessionView(BaseModel):

@@ -14,12 +14,14 @@ import asyncpg
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.collector import RunSpec, collect_run
 from app.models import (
     CollectionRequest,
+    IcpDomainRun,
+    IcpDomainRunListResponse,
     IcpRow,
     ManualProxyRequest,
     ManualProxyTestResponse,
@@ -39,6 +41,11 @@ from app.models import (
     ServerlessProxyRequest,
     ServerlessProxyTestResponse,
     SettingsResponse,
+    SubdomainResultItem,
+    SubdomainResultsResponse,
+    SubdomainRunListResponse,
+    SubdomainRunRequest,
+    SubdomainRunSummary,
     ShareholderRow,
 )
 from app.providers.names import normalize_providers, provider_label
@@ -61,6 +68,7 @@ from app.serverless_proxy import (
     validate_saved_config,
 )
 from app.settings import settings
+from app.subdomains import normalize_domains, registrable_domain
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +176,10 @@ def run_summary(row: asyncpg.Record) -> RunSummary:
         providers=providers,
         depth=row["depth"], holding_percent=row["holding_percent"], include_branches=row["include_branches"],
         fields=row["fields"], status=row["status"], attempts=row["attempts"],
-        progress=row["progress"], total=row["total"], error=row["error"],
+        progress=row["progress"], total=row["total"],
+        icp_cache_hits=(row["icp_cache_hits"] if "icp_cache_hits" in row.keys() else 0),
+        icp_live_queries=(row["icp_live_queries"] if "icp_live_queries" in row.keys() else 0),
+        error=row["error"],
         created_at=row["created_at"], started_at=row["started_at"], finished_at=row["finished_at"],
     )
 
@@ -210,6 +221,37 @@ def relationship_item(row: asyncpg.Record) -> RelationshipItem:
     data.pop("raw_payload", None)
     data["source"] = _source_from(payload)
     return RelationshipItem(**data)
+
+
+def subdomain_run_summary(row: asyncpg.Record) -> SubdomainRunSummary:
+    return SubdomainRunSummary(
+        id=row["id"],
+        domains=list(row["domains"] or []),
+        source_run_ids=list(row["source_run_ids"] or []),
+        options=dict(row["options"] or {}),
+        status=row["status"],
+        phase=row["phase"],
+        attempts=row["attempts"],
+        progress=row["progress"],
+        total=row["total"],
+        discovered=row["discovered"],
+        warnings=list(row["warnings"] or []),
+        error=row["error"],
+        created_at=row["created_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+    )
+
+
+def subdomain_result_item(row: asyncpg.Record) -> SubdomainResultItem:
+    return SubdomainResultItem(
+        id=row["id"], run_id=row["run_id"], root_domain=row["root_domain"],
+        hostname=row["hostname"], ips=list(row["ips"] or []),
+        canonical_name=row["canonical_name"], dns_status=row["dns_status"],
+        wildcard=row["wildcard"], http_url=row["http_url"],
+        http_status=row["http_status"], title=row["title"],
+        sources=list(row["sources"] or []), discovered_at=row["discovered_at"],
+    )
 
 
 def parse_stored_request(raw: dict) -> CollectionRequest:
@@ -439,6 +481,132 @@ async def get_results(
         total_results=result_count,
         total_relationships=rel_count,
     )
+
+
+@app.post("/api/v1/subdomain-runs", response_model=SubdomainRunSummary, status_code=201)
+async def create_subdomain_run(request: SubdomainRunRequest) -> SubdomainRunSummary:
+    store = current_repo()
+    values = list(request.domains)
+    if not values and request.source_run_ids:
+        # API callers may submit only an ICP run id. Ignore malformed legacy
+        # domain values instead of making every valid domain in that record fail.
+        for value in await store.icp_domains_for_runs(request.source_run_ids):
+            try:
+                domain = registrable_domain(value)
+            except ValueError:
+                continue
+            if domain not in values:
+                values.append(domain)
+    try:
+        domains = normalize_domains(values)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if len(domains) > 200:
+        raise HTTPException(400, "单次最多查询 200 个主域名")
+    row = await store.create_subdomain_run(
+        domains, request.source_run_ids, request.options.model_dump()
+    )
+    return subdomain_run_summary(row)
+
+
+@app.get("/api/v1/subdomain-runs", response_model=SubdomainRunListResponse)
+async def list_subdomain_runs(
+    limit: int = Query(20, ge=1, le=100), offset: int = Query(0, ge=0)
+) -> SubdomainRunListResponse:
+    rows, total = await current_repo().list_subdomain_runs(limit, offset)
+    return SubdomainRunListResponse(
+        items=[subdomain_run_summary(row) for row in rows], total=total
+    )
+
+
+@app.get("/api/v1/subdomain-runs/{run_id}", response_model=SubdomainRunSummary)
+async def get_subdomain_run(run_id: UUID) -> SubdomainRunSummary:
+    row = await current_repo().get_subdomain_run(run_id)
+    if row is None:
+        raise HTTPException(404, "子域名查询记录不存在")
+    return subdomain_run_summary(row)
+
+
+@app.get(
+    "/api/v1/subdomain-runs/{run_id}/results", response_model=SubdomainResultsResponse
+)
+async def get_subdomain_results(
+    run_id: UUID,
+    limit: int = Query(200, ge=1, le=2000),
+    offset: int = Query(0, ge=0),
+    after_id: int | None = Query(None, ge=0),
+) -> SubdomainResultsResponse:
+    if await current_repo().get_subdomain_run(run_id) is None:
+        raise HTTPException(404, "子域名查询记录不存在")
+    rows, total = await current_repo().subdomain_results(run_id, limit, offset, after_id)
+    return SubdomainResultsResponse(
+        run_id=run_id, items=[subdomain_result_item(row) for row in rows], total=total
+    )
+
+
+@app.get("/api/v1/subdomain-runs/{run_id}/events")
+async def stream_subdomain_results(
+    run_id: UUID, after_id: int = Query(0, ge=0)
+) -> StreamingResponse:
+    if await current_repo().get_subdomain_run(run_id) is None:
+        raise HTTPException(404, "子域名查询记录不存在")
+
+    async def events():
+        cursor = after_id
+        last_progress = ""
+        while True:
+            rows = await current_repo().subdomain_results_after(run_id, cursor, 500)
+            for row in rows:
+                item = subdomain_result_item(row)
+                cursor = max(cursor, item.id)
+                yield f"event: result\ndata: {item.model_dump_json()}\n\n"
+            run = await current_repo().get_subdomain_run(run_id)
+            if run is None:
+                yield "event: error\ndata: {\"detail\":\"记录已删除\"}\n\n"
+                return
+            summary = subdomain_run_summary(run)
+            progress = summary.model_dump_json()
+            if progress != last_progress:
+                yield f"event: progress\ndata: {progress}\n\n"
+                last_progress = progress
+            if summary.status in {"succeeded", "partial", "failed", "cancelled"}:
+                yield f"event: done\ndata: {progress}\n\n"
+                return
+            yield ": keepalive\n\n"
+            await asyncio.sleep(0.75)
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.delete("/api/v1/subdomain-runs/{run_id}")
+async def delete_subdomain_run(run_id: UUID) -> dict[str, int]:
+    deleted = await current_repo().delete_subdomain_run(run_id)
+    if not deleted:
+        raise HTTPException(404, "子域名查询记录不存在")
+    return {"deleted": deleted}
+
+
+@app.get("/api/v1/icp-domain-runs", response_model=IcpDomainRunListResponse)
+async def list_icp_domain_runs(limit: int = Query(50, ge=1, le=100)) -> IcpDomainRunListResponse:
+    items: list[IcpDomainRun] = []
+    for row in await current_repo().icp_domain_runs(limit):
+        domains: list[str] = []
+        for value in row["domains"] or []:
+            try:
+                domain = registrable_domain(str(value))
+            except ValueError:
+                continue
+            if domain not in domains:
+                domains.append(domain)
+        if domains:
+            items.append(IcpDomainRun(
+                id=row["id"], keyword=row["keyword"], created_at=row["created_at"], domains=domains
+            ))
+    return IcpDomainRunListResponse(items=items)
 
 
 @app.get("/api/v1/settings", response_model=SettingsResponse)

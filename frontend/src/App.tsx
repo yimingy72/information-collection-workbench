@@ -5,6 +5,7 @@ import { deleteRuns, getQuery, getSettings, listRuns, runQuery } from './api'
 import { AppShell } from './components/AppShell'
 import { CollectionPage } from './pages/CollectionPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { SubdomainPage } from './pages/SubdomainPage'
 import { TasksPage } from './pages/TasksPage'
 import { workbenchTheme } from './theme'
 import type { CollectionValues, ProviderId, QueryView, Run, SettingsView } from './types'
@@ -174,12 +175,17 @@ function Workbench({
     }
   }
 
-  const title = page === 'settings' ? '基础配置' : page === 'proxy-settings' ? '基础配置' : page === 'tasks' ? '历史查询' : 'ICP备案查询'
+  const title = page.startsWith('subdomains') ? '子域名查询' : page === 'settings' ? '基础配置' : page === 'proxy-settings' ? '基础配置' : page === 'tasks' ? '历史查询' : 'ICP备案查询'
 
   const content = page === 'settings' ? (
     <SettingsPage />
   ) : page === 'proxy-settings' ? (
     <SettingsPage />
+  ) : page.startsWith('subdomains') ? (
+    <SubdomainPage
+      runId={page.startsWith('subdomains/') ? page.slice('subdomains/'.length) : undefined}
+      onOpenRun={(id) => navigate(id ? `subdomains/${id}` : 'subdomains')}
+    />
   ) : page === 'tasks' ? (
     <TasksPage
       runs={runs}

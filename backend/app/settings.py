@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     icp_proxy_control_token: str = "asset-workbench-local"
     icp_company_max_attempts: int = 3
     icp_company_retry_backoff_seconds: float = 2.0
+    icp_cache_enabled: bool = True
+    icp_cache_ttl_hours: int = 24
+    icp_zero_cache_ttl_hours: int = 6
     icp_target_seconds: int = 300
     icp_auto_scale_max_nodes: int = 8
     icp_auto_scale_companies_per_node: int = 160
@@ -21,6 +24,7 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = 1.0
     worker_lease_seconds: int = 120
     worker_concurrency: int = 2
+    subdomain_worker_concurrency: int = 2
     serverless_proxy_url: str = "http://127.0.0.1:19080"
     serverless_proxy_admin_url: str = "http://127.0.0.1:19081"
     serverless_proxy_miit_url: str = "http://seamoon-gateway:19080"

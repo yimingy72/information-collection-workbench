@@ -64,6 +64,16 @@ class Repository:
             """,
             lease_seconds,
         )
+        await self.pool.execute(
+            """
+            UPDATE subdomain_runs
+               SET status='queued', phase='queued', error='worker lease expired; requeued',
+                   heartbeat_at=NULL, lease_id=NULL
+             WHERE status='running'
+               AND (heartbeat_at IS NULL OR heartbeat_at < now() - ($1 * interval '1 second'))
+            """,
+            lease_seconds,
+        )
 
     async def create_run(self, request: dict[str, Any]) -> UUID:
         from app.providers.names import normalize_providers
@@ -231,6 +241,76 @@ class Repository:
             run_id, entity_id, category, json.dumps(payload), source_url, raw,
         )
 
+    async def get_icp_company_caches(
+        self, company_names: list[str], query_version: str
+    ) -> dict[str, asyncpg.Record]:
+        if not company_names:
+            return {}
+        rows = await self.pool.fetch(
+            """
+            SELECT company_name,rows,reported_total,saved_total,complete,
+                   source,query_version,checked_at,expires_at,last_error
+              FROM icp_company_cache
+             WHERE company_name = ANY($1::text[])
+               AND query_version=$2
+               AND complete=TRUE
+               AND saved_total >= reported_total
+               AND expires_at > now()
+            """,
+            company_names,
+            query_version,
+        )
+        return {str(row["company_name"]): row for row in rows}
+
+    async def upsert_icp_company_cache(
+        self,
+        company_name: str,
+        rows: list[dict[str, Any]],
+        reported_total: int,
+        query_version: str,
+        ttl_seconds: int,
+    ) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO icp_company_cache
+              (company_name,rows,reported_total,saved_total,complete,source,
+               query_version,checked_at,expires_at,last_error)
+            VALUES($1,$2::jsonb,$3,$4,TRUE,'miit',$5,now(),
+                   now() + ($6 * interval '1 second'),'')
+            ON CONFLICT(company_name) DO UPDATE SET
+              rows=EXCLUDED.rows,
+              reported_total=EXCLUDED.reported_total,
+              saved_total=EXCLUDED.saved_total,
+              complete=TRUE,
+              source='miit',
+              query_version=EXCLUDED.query_version,
+              checked_at=now(),
+              expires_at=EXCLUDED.expires_at,
+              last_error=''
+            """,
+            company_name,
+            json.dumps(rows),
+            reported_total,
+            len(rows),
+            query_version,
+            max(1, int(ttl_seconds)),
+        )
+
+    async def add_icp_cache_stats(
+        self, run_id: UUID, cache_hits: int, live_queries: int
+    ) -> None:
+        await self.pool.execute(
+            """
+            UPDATE collection_runs
+               SET icp_cache_hits=icp_cache_hits+$2,
+                   icp_live_queries=icp_live_queries+$3
+             WHERE id=$1
+            """,
+            run_id,
+            max(0, int(cache_hits)),
+            max(0, int(live_queries)),
+        )
+
     async def results(
         self, run_id: UUID, category: str | None, limit: int, offset: int,
         relationship_limit: int | None = 200, relationship_offset: int = 0,
@@ -313,6 +393,200 @@ class Repository:
             run_ids,
         )
         return int(str(result).split()[-1])
+
+    async def create_subdomain_run(
+        self, domains: list[str], source_run_ids: list[UUID], options: dict[str, Any]
+    ) -> asyncpg.Record:
+        return await self.pool.fetchrow(
+            """
+            INSERT INTO subdomain_runs(domains, source_run_ids, options)
+            VALUES($1::jsonb, $2::jsonb, $3::jsonb)
+            RETURNING *
+            """,
+            json.dumps(domains), json.dumps([str(value) for value in source_run_ids]), json.dumps(options),
+        )
+
+    async def get_subdomain_run(self, run_id: UUID) -> asyncpg.Record | None:
+        return await self.pool.fetchrow("SELECT * FROM subdomain_runs WHERE id=$1", run_id)
+
+    async def list_subdomain_runs(
+        self, limit: int, offset: int
+    ) -> tuple[list[asyncpg.Record], int]:
+        rows = await self.pool.fetch(
+            "SELECT * FROM subdomain_runs ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            limit, offset,
+        )
+        total = await self.pool.fetchval("SELECT count(*) FROM subdomain_runs")
+        return rows, int(total or 0)
+
+    async def claim_subdomain_run(self) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            """
+            WITH candidate AS (
+              SELECT id FROM subdomain_runs
+               WHERE status='queued'
+               ORDER BY created_at
+               FOR UPDATE SKIP LOCKED LIMIT 1
+            )
+            UPDATE subdomain_runs AS r
+               SET status='running', phase='collecting', attempts=r.attempts+1,
+                   started_at=COALESCE(r.started_at, now()), heartbeat_at=now(),
+                   error=NULL, lease_id=gen_random_uuid()
+              FROM candidate WHERE r.id=candidate.id
+            RETURNING r.*
+            """
+        )
+
+    async def update_subdomain_progress(
+        self, run_id: UUID, progress: int, total: int, discovered: int, phase: str,
+        *, lease_id: UUID,
+    ) -> None:
+        result = await self.pool.execute(
+            """
+            UPDATE subdomain_runs
+               SET progress=$2, total=$3, discovered=$4, phase=$5, heartbeat_at=now()
+             WHERE id=$1 AND status='running' AND lease_id=$6
+            """,
+            run_id, progress, total, discovered, phase, lease_id,
+        )
+        if result == "UPDATE 0":
+            raise LeaseLost(str(run_id))
+
+    async def finish_subdomain_run(
+        self, run_id: UUID, status: str, warnings: list[str], error: str | None,
+        *, lease_id: UUID,
+    ) -> None:
+        result = await self.pool.execute(
+            """
+            UPDATE subdomain_runs
+               SET status=$2, phase=CASE WHEN $2='failed' THEN 'failed' ELSE 'completed' END,
+                   warnings=$3::jsonb, error=$4, finished_at=now(), heartbeat_at=NULL
+             WHERE id=$1 AND status='running' AND lease_id=$5
+            """,
+            run_id, status, json.dumps(warnings), error, lease_id,
+        )
+        if result == "UPDATE 0":
+            raise LeaseLost(str(run_id))
+
+    async def get_subdomain_source_cache(
+        self, root_domain: str, source: str
+    ) -> list[str] | None:
+        value = await self.pool.fetchval(
+            """
+            SELECT hosts FROM subdomain_source_cache
+             WHERE root_domain=$1 AND source=$2 AND expires_at > now()
+            """,
+            root_domain, source,
+        )
+        return list(value) if value is not None else None
+
+    async def set_subdomain_source_cache(
+        self, root_domain: str, source: str, hosts: list[str], ttl_hours: int = 6
+    ) -> None:
+        await self.pool.execute(
+            """
+            INSERT INTO subdomain_source_cache(root_domain, source, hosts, expires_at)
+            VALUES($1,$2,$3::jsonb,now() + ($4 * interval '1 hour'))
+            ON CONFLICT(root_domain, source) DO UPDATE
+               SET hosts=EXCLUDED.hosts, refreshed_at=now(), expires_at=EXCLUDED.expires_at
+            """,
+            root_domain, source, json.dumps(hosts), ttl_hours,
+        )
+
+    async def add_subdomain_result(
+        self, run_id: UUID, *, root_domain: str, hostname: str, ips: list[str],
+        canonical_name: str, wildcard: bool, http_url: str, http_status: int | None,
+        title: str, sources: list[str],
+    ) -> bool:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO subdomain_results
+              (run_id, root_domain, hostname, ips, canonical_name, wildcard,
+               http_url, http_status, title, sources)
+            VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10::jsonb)
+            ON CONFLICT(run_id, root_domain, hostname) DO UPDATE
+               SET ips=EXCLUDED.ips,
+                   canonical_name=CASE WHEN EXCLUDED.canonical_name <> ''
+                                       THEN EXCLUDED.canonical_name ELSE subdomain_results.canonical_name END,
+                   wildcard=EXCLUDED.wildcard,
+                   http_url=CASE WHEN EXCLUDED.http_url <> ''
+                                 THEN EXCLUDED.http_url ELSE subdomain_results.http_url END,
+                   http_status=COALESCE(EXCLUDED.http_status, subdomain_results.http_status),
+                   title=CASE WHEN EXCLUDED.title <> ''
+                              THEN EXCLUDED.title ELSE subdomain_results.title END,
+                   sources=(SELECT jsonb_agg(DISTINCT source ORDER BY source)
+                              FROM jsonb_array_elements_text(
+                                subdomain_results.sources || EXCLUDED.sources
+                              ) AS source)
+            RETURNING (xmax = 0) AS inserted
+            """,
+            run_id, root_domain, hostname, json.dumps(ips), canonical_name, wildcard,
+            http_url, http_status, title, json.dumps(sources),
+        )
+        return bool(row and row.get("inserted"))
+
+    async def subdomain_results_after(
+        self, run_id: UUID, after_id: int, limit: int
+    ) -> list[asyncpg.Record]:
+        return await self.pool.fetch(
+            """
+            SELECT * FROM subdomain_results
+             WHERE run_id=$1 AND id>$2 ORDER BY id LIMIT $3
+            """,
+            run_id, after_id, limit,
+        )
+
+    async def subdomain_results(
+        self, run_id: UUID, limit: int, offset: int = 0, after_id: int | None = None
+    ) -> tuple[list[asyncpg.Record], int]:
+        if after_id is not None:
+            rows = await self.subdomain_results_after(run_id, after_id, limit)
+        else:
+            rows = await self.pool.fetch(
+                """
+                SELECT * FROM subdomain_results
+                 WHERE run_id=$1 ORDER BY id DESC LIMIT $2 OFFSET $3
+                """,
+                run_id, limit, offset,
+            )
+        total = await self.pool.fetchval(
+            "SELECT count(*) FROM subdomain_results WHERE run_id=$1", run_id
+        )
+        return rows, int(total or 0)
+
+    async def delete_subdomain_run(self, run_id: UUID) -> int:
+        result = await self.pool.execute("DELETE FROM subdomain_runs WHERE id=$1", run_id)
+        return int(str(result).split()[-1])
+
+    async def icp_domain_runs(self, limit: int = 50) -> list[asyncpg.Record]:
+        return await self.pool.fetch(
+            """
+            SELECT cr.id, cr.keyword, cr.created_at,
+                   array_agg(DISTINCT lower(trim(r.payload->>'domain')))
+                     FILTER (WHERE trim(COALESCE(r.payload->>'domain','')) <> '') AS domains
+              FROM collection_runs cr
+              JOIN results r ON r.run_id=cr.id AND r.category='icp'
+             GROUP BY cr.id, cr.keyword, cr.created_at
+             ORDER BY cr.created_at DESC
+             LIMIT $1
+            """,
+            limit,
+        )
+
+    async def icp_domains_for_runs(self, run_ids: list[UUID]) -> list[str]:
+        if not run_ids:
+            return []
+        rows = await self.pool.fetch(
+            """
+            SELECT DISTINCT lower(trim(payload->>'domain')) AS domain
+              FROM results
+             WHERE run_id = ANY($1::uuid[]) AND category='icp'
+               AND trim(COALESCE(payload->>'domain','')) <> ''
+             ORDER BY domain
+            """,
+            run_ids,
+        )
+        return [str(row["domain"]) for row in rows]
 
     async def get_runtime_config(self) -> dict[str, Any]:
         sessions = await self.pool.fetch("SELECT provider, cookie, expires_at, updated_at FROM provider_sessions")

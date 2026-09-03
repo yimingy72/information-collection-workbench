@@ -730,3 +730,130 @@ body,
     flex-wrap: wrap;
   }
 }
+
+/* Subdomain discovery */
+.subdomain-domain-input {
+  flex: 1 1 360px;
+  min-width: 280px;
+  max-width: 620px;
+}
+
+.subdomain-icp-inputs {
+  flex: 1 1 560px;
+  min-width: 320px;
+}
+
+.subdomain-icp-run-select {
+  flex: 1 1 340px;
+  min-width: 260px;
+}
+
+.subdomain-icp-domain-select {
+  flex: 1 1 260px;
+  min-width: 220px;
+}
+
+.subdomain-options {
+  min-height: 32px;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.subdomain-history-select {
+  width: 280px;
+}
+
+.subdomain-summary {
+  flex: none;
+  padding: 2px 4px 8px;
+}
+
+.subdomain-progress-wrap {
+  flex: 1 1 320px;
+  min-width: 260px;
+}
+
+.subdomain-empty {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+}
+
+.subdomain-source-row {
+  min-width: 0;
+}
+
+.subdomain-mode-switch {
+  flex: none;
+}
+
+.subdomain-source-row > .subdomain-domain-input,
+.subdomain-source-row > .subdomain-icp-inputs {
+  max-width: none;
+}
+
+.subdomain-option-row {
+  padding-left: 2px;
+}
+
+.subdomain-card-actions {
+  justify-content: flex-end;
+}
+
+.subdomain-result-toolbar {
+  flex: none;
+}
+
+.subdomain-result-search {
+  width: min(380px, 100%);
+}
+
+@media (max-width: 900px) {
+  .subdomain-history-select {
+    width: 180px;
+  }
+
+  .subdomain-options {
+    width: 100%;
+    white-space: normal;
+  }
+}
+
+@media (max-width: 760px) {
+  .subdomain-source-row {
+    flex-direction: column;
+  }
+
+  .subdomain-source-row > .subdomain-domain-input,
+  .subdomain-source-row > .subdomain-icp-inputs {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .subdomain-icp-run-select,
+  .subdomain-icp-domain-select {
+    min-width: 0;
+  }
+
+  .subdomain-option-row {
+    align-items: flex-start;
+  }
+
+  .subdomain-card-actions {
+    width: 100%;
+  }
+
+  .subdomain-result-filter-group {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .subdomain-history-select {
+    flex: 1 1 160px;
+    width: auto;
+    min-width: 140px;
+  }
+}

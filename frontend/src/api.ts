@@ -13,6 +13,12 @@ import type {
   ServerlessProxyValues,
   SessionProviderId,
   SettingsView,
+  IcpDomainRun,
+  SubdomainOptions,
+  SubdomainResult,
+  SubdomainResults,
+  SubdomainRun,
+  SubdomainRunList,
 } from './types'
 
 const readError = async (response: Response) => {
@@ -140,3 +146,57 @@ export const pollQrLogin = (provider: SessionProviderId, sessionId: string) =>
 
 export const cancelQrLogin = (provider: SessionProviderId, sessionId: string) =>
   api<{ status: string }>(`/api/v1/settings/sessions/${provider}/qr/${sessionId}`, { method: 'DELETE' })
+
+
+export const createSubdomainRun = (values: {
+  domains: string[]
+  source_run_ids?: string[]
+  options: SubdomainOptions
+}) =>
+  api<SubdomainRun>('/api/v1/subdomain-runs', {
+    method: 'POST',
+    body: JSON.stringify(values),
+  })
+
+export const listSubdomainRuns = (page = 1, pageSize = 20) => {
+  const query = new URLSearchParams({
+    limit: String(pageSize),
+    offset: String((page - 1) * pageSize),
+  })
+  return api<SubdomainRunList>(`/api/v1/subdomain-runs?${query.toString()}`)
+}
+
+export const getSubdomainRun = (runId: string) =>
+  api<SubdomainRun>(`/api/v1/subdomain-runs/${runId}`)
+
+export const getSubdomainResults = (runId: string, limit = 2000, afterId?: number) => {
+  const query = new URLSearchParams({ limit: String(limit), offset: '0' })
+  if (afterId !== undefined) query.set('after_id', String(afterId))
+  return api<SubdomainResults>(`/api/v1/subdomain-runs/${runId}/results?${query.toString()}`)
+}
+
+export const getAllSubdomainResults = async (runId: string) => {
+  const items: SubdomainResult[] = []
+  let cursor = 0
+  let total = 0
+  while (true) {
+    const response = await getSubdomainResults(runId, 2000, cursor)
+    total = response.total
+    if (!response.items.length) break
+    items.push(...response.items)
+    cursor = response.items.reduce((value, item) => Math.max(value, item.id), cursor)
+    if (response.items.length < 2000 && items.length >= total) break
+  }
+  return { run_id: runId, items, total } satisfies SubdomainResults
+}
+
+export const deleteSubdomainRun = (runId: string) =>
+  api<{ deleted: number }>(`/api/v1/subdomain-runs/${runId}`, { method: 'DELETE' })
+
+export const listIcpDomainRuns = (limit = 50) =>
+  api<{ items: IcpDomainRun[] }>(`/api/v1/icp-domain-runs?limit=${limit}`)
+
+export const subdomainEventUrl = (runId: string, afterId = 0) =>
+  `/api/v1/subdomain-runs/${runId}/events?after_id=${afterId}`
+
+export type { SubdomainResult }

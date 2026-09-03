@@ -29,6 +29,8 @@ export type Run = {
   attempts: number
   progress: number
   total?: number | null
+  icp_cache_hits: number
+  icp_live_queries: number
   error?: string | null
   created_at: string
   started_at?: string | null
@@ -206,4 +208,63 @@ export type QrPollStatus = 'pending' | 'scanned' | 'success' | 'failed' | 'expir
 
 export type QrPoll = {
   status: QrPollStatus
+}
+
+export type SubdomainOptions = {
+  passive: boolean
+  brute_force: boolean
+  deep_scan: boolean
+  http_probe: boolean
+}
+
+export type SubdomainRun = {
+  id: string
+  domains: string[]
+  source_run_ids: string[]
+  options: SubdomainOptions
+  status: RunStatus
+  phase: string
+  attempts: number
+  progress: number
+  total?: number | null
+  discovered: number
+  warnings: string[]
+  error?: string | null
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+}
+
+export type SubdomainRunList = {
+  items: SubdomainRun[]
+  total: number
+}
+
+export type SubdomainResult = {
+  id: number
+  run_id: string
+  root_domain: string
+  hostname: string
+  ips: string[]
+  canonical_name: string
+  dns_status: string
+  wildcard: boolean
+  http_url: string
+  http_status?: number | null
+  title: string
+  sources: string[]
+  discovered_at: string
+}
+
+export type SubdomainResults = {
+  run_id: string
+  items: SubdomainResult[]
+  total: number
+}
+
+export type IcpDomainRun = {
+  id: string
+  keyword: string
+  created_at: string
+  domains: string[]
 }
