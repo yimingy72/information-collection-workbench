@@ -56,13 +56,25 @@ def _normalise_node(row: dict[str, Any]) -> dict[str, Any]:
     node["last_error"] = str(node.get("last_error") or "")
     node["latency_ms"] = int(node["latency_ms"]) if node.get("latency_ms") is not None else None
     node["failure_count"] = int(node.get("failure_count") or 0)
+    node["auto_managed"] = bool(node.get("auto_managed"))
     return node
 
 
 def pool_nodes(config: dict[str, Any]) -> list[dict[str, Any]]:
     """Return persisted pool nodes, with a backwards-compatible legacy node."""
     row = _row(config)
-    nodes = [_normalise_node(item) for item in _json_nodes(row)]
+    raw_nodes = _json_nodes(row)
+    nodes = [_normalise_node(item) for item in raw_nodes]
+    primary_id = f"{row.get('provider') or 'aliyun'}:{row.get('region') or 'cn-hangzhou'}:{row.get('function_name') or 'asset-workbench-seamoon'}"
+    # Nodes created by the earlier auto-scaler predate the explicit marker.
+    # Infer only non-primary deployed nodes as recyclable; the configured
+    # primary node is always retained and user-added/custom nodes are never
+    # automatically destroyed.
+    for raw, node in zip(raw_nodes, nodes, strict=True):
+        if "auto_managed" not in raw:
+            node["auto_managed"] = bool(
+                node.get("deployment_id") and node["id"] != primary_id
+            )
     if nodes:
         return nodes
     if str(row.get("endpoint") or "").strip():
@@ -180,6 +192,7 @@ def serverless_proxy_view(config: dict[str, Any]) -> ServerlessProxyView:
             last_error=node["last_error"],
             latency_ms=node["latency_ms"],
             failure_count=node["failure_count"],
+            auto_managed=node["auto_managed"],
             updated_at=node.get("updated_at"),
         )
         for node in nodes
@@ -503,6 +516,7 @@ async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
                         "last_error": "",
                         "latency_ms": None,
                         "failure_count": 0,
+                        "auto_managed": True,
                     }
                     # Gateway configuration is shared, so probe nodes one at a
                     # time. A node is not admitted to ICP traffic until the
@@ -563,5 +577,76 @@ async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
             "target": target,
             "ready": len(ready) + len(ready_added),
             "deployed": len(ready_added),
+            "errors": errors,
+        }
+
+
+async def release_icp_node_pool(repo: Any, company_count: int = 0) -> dict[str, Any]:
+    """Remove only idle, platform-managed surplus nodes.
+
+    The configured primary node and any node without ``auto_managed`` are
+    intentionally preserved. This makes automatic cost reduction safe for
+    manually deployed or externally managed functions. Callers invoke this
+    only between ICP batches, when no page request is using the old pool.
+    """
+    runtime = await repo.get_runtime_config()
+    row = _row(runtime)
+    if not row.get("enabled") or str(row.get("provider") or "aliyun") != "aliyun":
+        return {"target": 0, "ready": 0, "removed": 0, "errors": []}
+    if manual_proxy_urls(runtime):
+        return {"target": 0, "ready": 0, "removed": 0, "errors": ["手动代理优先，跳过云函数自动缩容"]}
+
+    async with _AUTO_SCALE_LOCK:
+        runtime = await repo.get_runtime_config()
+        row = _row(runtime)
+        nodes = pool_nodes(row)
+        ready = [
+            node for node in nodes
+            if node.get("enabled") and node.get("status") == "ready" and node.get("endpoint")
+        ]
+        target = desired_icp_node_count(company_count)
+        surplus = max(0, len(ready) - target)
+        candidates = [
+            node for node in ready
+            if node.get("auto_managed") and node.get("deployment_id")
+        ]
+        if surplus <= 0 or not candidates:
+            return {"target": target, "ready": len(ready), "removed": 0, "errors": []}
+
+        # Retain the oldest/primary-like managed nodes first and remove the
+        # newest surplus regions. Never remove more than the calculated excess.
+        candidates = list(reversed(candidates))[:surplus]
+        errors: list[str] = []
+        removed = 0
+        for node in candidates:
+            try:
+                await run_cloud_operation("destroy", node)
+            except Exception as exc:  # noqa: BLE001 - preserve service capacity
+                errors.append(f"{node.get('region') or node.get('id')}：{exc}")
+                continue
+            nodes = [item for item in nodes if item.get("id") != node.get("id")]
+            removed += 1
+
+        if removed:
+            healthy = [
+                node for node in nodes
+                if node.get("enabled") and node.get("status") == "ready" and node.get("endpoint")
+            ]
+            primary_id = f"{row.get('provider') or 'aliyun'}:{row.get('region') or 'cn-hangzhou'}:{row.get('function_name') or 'asset-workbench-seamoon'}"
+            primary = next((node for node in healthy if node.get("id") == primary_id), None)
+            payload = {
+                **row,
+                "nodes": nodes,
+                "endpoint": (primary or (healthy[0] if healthy else {})).get("endpoint", row.get("endpoint") or ""),
+                "enabled": bool(row.get("enabled")) and bool(healthy),
+                "status": "ready" if healthy else "configured",
+            }
+            await repo.update_serverless_proxy(payload)
+            await configure_gateway(await repo.get_runtime_config())
+
+        return {
+            "target": target,
+            "ready": max(0, len(ready) - removed),
+            "removed": removed,
             "errors": errors,
         }

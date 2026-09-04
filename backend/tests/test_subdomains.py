@@ -456,3 +456,43 @@ async def test_rate_limited_source_is_not_retried_immediately(monkeypatch):
     assert first[1] == set()
     assert "429" in first[2]
     assert "暂停" in second[2]
+
+
+@pytest.mark.asyncio
+async def test_multiple_roots_are_processed_with_a_bounded_pool(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(subdomains, "COMMON_PREFIXES", ("www",))
+    active = 0
+    peak = 0
+
+    async def resolve(hostname):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return ResolvedHost(hostname, ["93.184.216.34"])
+
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", lambda _root: asyncio.sleep(0, result=set()))
+
+    class Repo:
+        async def subdomain_result_count(self, _run_id):
+            return 0
+
+        async def update_subdomain_progress(self, *_args, **_kwargs):
+            return None
+
+        async def add_subdomain_result(self, _run_id, **values):
+            return True
+
+    await subdomains.collect_subdomains(
+        Repo(),
+        uuid4(),
+        ["one.example", "two.example", "three.example", "four.example"],
+        {"passive": False, "brute_force": True, "deep_scan": False, "http_probe": False},
+        lease_id=uuid4(),
+    )
+
+    assert 1 < peak <= subdomains.ROOT_CONCURRENCY

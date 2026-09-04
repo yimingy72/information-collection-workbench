@@ -12,10 +12,10 @@ from app.providers.tianyancha import (
     ProviderError,
 )
 from app.repository import LeaseLost, Repository
-from app.serverless_proxy import ensure_icp_node_pool
+from app.serverless_proxy import ensure_icp_node_pool, release_icp_node_pool
 
 
-ICP_HEARTBEAT_SECONDS = 30
+ICP_HEARTBEAT_SECONDS = 5
 ICP_STREAM_POLL_SECONDS = 0.25
 # Keep enough names in flight to fill the scaled cloud pool. A batch of 50
 # caused hundreds of companies to be processed in many serial waves; when a
@@ -99,6 +99,7 @@ async def _collect_icp_as_entities_are_discovered(
     errors: list[str] = []
     scale_observed = 0
     scale_errors_seen: set[str] = set()
+    pool_released = False
     while True:
         discovered = _prioritize_root_name(
             await repo.entity_names_for_run(spec.id), spec.keyword
@@ -139,6 +140,30 @@ async def _collect_icp_as_entities_are_discovered(
                 errors.append(f"ICP备案：{exc}")
             continue
         if producers_done.is_set():
+            if not pool_released:
+                pool_released = True
+                # Scale down only after every discovered company has been
+                # consumed. ICP collection is globally serialized, so no other
+                # run can be using the pool while these idle nodes are removed.
+                # Lightweight test/fake repositories do not carry runtime
+                # configuration; skip the optional cost-management hook there.
+                if getattr(repo, "get_runtime_config", None) is not None:
+                    try:
+                        release_result = await release_icp_node_pool(repo, len(discovered))
+                        release_errors = (
+                            release_result.get("errors")
+                            if isinstance(release_result, dict)
+                            else []
+                        )
+                        for release_error in map(str, release_errors or []):
+                            if release_error not in scale_errors_seen:
+                                scale_errors_seen.add(release_error)
+                                errors.append("ICP备案节点自动缩容：" + release_error)
+                    except Exception as exc:  # noqa: BLE001 - scaling is best effort
+                        detail = f"ICP备案节点自动缩容失败：{exc}"
+                        if detail not in scale_errors_seen:
+                            scale_errors_seen.add(detail)
+                            errors.append(detail)
             return errors
 
         # Wait for a provider to persist another entity, or for all providers

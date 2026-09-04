@@ -19,6 +19,7 @@ function Sources({ value }: { value: string }) {
 
 export function QueryResultsPanel({ query, loading = false }: { query: QueryView; loading?: boolean }) {
   const [view, setView] = useState<'invest' | 'icp'>('invest')
+  const running = query.run.status === 'queued' || query.run.status === 'running'
   const investments = query.investments ?? []
   const icpRecords = query.icp_records ?? []
   const investPage = usePagedData(investments, query.run.id)
@@ -78,7 +79,14 @@ export function QueryResultsPanel({ query, loading = false }: { query: QueryView
             loading={loading}
             scroll={{ x: 1150 }}
             pagination={false}
-            locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无 ICP 备案数据" /> }}
+            locale={{
+              emptyText: (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={running ? '正在实时查询 ICP 备案' : '暂无 ICP 备案数据'}
+                />
+              ),
+            }}
           />
         ) : (
           <Table
@@ -89,7 +97,14 @@ export function QueryResultsPanel({ query, loading = false }: { query: QueryView
             loading={loading}
             scroll={{ x: 720 }}
             pagination={false}
-            locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有对外投资" /> }}
+            locale={{
+              emptyText: (
+                <Empty
+                  image={Empty.PRESENTED_IMAGE_SIMPLE}
+                  description={running ? '正在实时发现投资关系' : '没有对外投资'}
+                />
+              ),
+            }}
           />
         )}
       </TableFrame>

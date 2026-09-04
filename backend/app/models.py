@@ -146,6 +146,8 @@ class QueryResponse(BaseModel):
     shareholders: list[ShareholderRow]
     icp_records: list[IcpRow]
     source_errors: list[str]
+    relationship_cursor: int = 0
+    result_cursor: int = 0
 
 
 class ResultsResponse(BaseModel):
@@ -216,6 +218,9 @@ class SubdomainRunListResponse(BaseModel):
 class SubdomainResultItem(BaseModel):
     id: int
     run_id: UUID
+    # Monotonic server cursor used by the SSE stream. It is intentionally
+    # exposed so a refreshed page can resume after the latest row/update.
+    stream_seq: int = 0
     root_domain: str
     hostname: str
     ips: list[str]
@@ -273,6 +278,7 @@ class ServerlessProxyNodeView(BaseModel):
     last_error: str
     latency_ms: int | None = None
     failure_count: int = 0
+    auto_managed: bool = False
     updated_at: datetime | None = None
 
 

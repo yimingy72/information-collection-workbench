@@ -28,6 +28,10 @@ PROGRESS_BATCH_SIZE = 25
 INSPECTION_BATCH_SIZE = 500
 DNS_CONCURRENCY = 40
 HTTP_CONCURRENCY = 16
+# Run a few root domains concurrently. DNS/HTTP semaphores below still cap
+# total outbound work, while preventing one large root from blocking all other
+# ICP-derived domains for the full duration of its scan.
+ROOT_CONCURRENCY = 3
 HTTP_PROBE_TIMEOUT = 8.0
 MAX_CANDIDATES_PER_DOMAIN = 10_000
 ALTDNS_CANDIDATE_LIMIT = 2_000
@@ -658,12 +662,23 @@ async def collect_subdomains(
     *,
     lease_id: UUID,
 ) -> list[str]:
+    """Collect multiple roots concurrently with bounded shared I/O.
+
+    A previous implementation processed every root serially. For a task with
+    dozens of ICP domains that made one slow/large root hold the entire queue
+    for hours. Roots now run in a small bounded pool while DNS/HTTP semaphores
+    still cap total outbound work. Results remain idempotent in PostgreSQL, so
+    a retry or page refresh cannot create duplicates.
+    """
     warnings: list[str] = []
     processed = 0
     total = 0
-    discovered = 0
+    result_count = getattr(repo, "subdomain_result_count", None)
+    discovered = await result_count(run_id) if result_count is not None else 0
     last_reported = 0
     last_report_at = 0.0
+    progress_lock = asyncio.Lock()
+    root_semaphore = asyncio.Semaphore(ROOT_CONCURRENCY)
     dns_semaphore = asyncio.Semaphore(DNS_CONCURRENCY)
     http_semaphore = asyncio.Semaphore(HTTP_CONCURRENCY)
     passive_enabled = bool(options.get("passive", True))
@@ -676,17 +691,33 @@ async def collect_subdomains(
     async def report_progress(phase: str, *, force: bool = False) -> None:
         nonlocal last_reported, last_report_at
         now = time.monotonic()
-        if not force:
-            if (
-                processed - last_reported < PROGRESS_BATCH_SIZE
-                and now - last_report_at < PROGRESS_INTERVAL_SECONDS
-            ):
-                return
-        await repo.update_subdomain_progress(
-            run_id, processed, total, discovered, phase, lease_id=lease_id
-        )
-        last_reported = processed
-        last_report_at = now
+        async with progress_lock:
+            if not force:
+                if (
+                    processed - last_reported < PROGRESS_BATCH_SIZE
+                    and now - last_report_at < PROGRESS_INTERVAL_SECONDS
+                ):
+                    return
+            await repo.update_subdomain_progress(
+                run_id, processed, total, discovered, phase, lease_id=lease_id
+            )
+            last_reported = processed
+            last_report_at = now
+
+    async def increment_total(value: int) -> None:
+        nonlocal total
+        async with progress_lock:
+            total += value
+
+    async def increment_processed() -> None:
+        nonlocal processed
+        async with progress_lock:
+            processed += 1
+
+    async def increment_discovered() -> None:
+        nonlocal discovered
+        async with progress_lock:
+            discovered += 1
 
     passive_timeout = httpx.Timeout(
         PASSIVE_TIMEOUT, connect=8.0, read=PASSIVE_TIMEOUT, write=10.0, pool=5.0
@@ -711,177 +742,186 @@ async def collect_subdomains(
             headers=headers,
         ) as probe_client,
     ):
-        for root in domains:
-            await report_progress("collecting", force=True)
-            sources: dict[str, set[str]] = {}
-            inspected: dict[str, tuple[ResolvedHost | None, HttpProbe]] = {}
-            resolved_cache: dict[str, ResolvedHost | None] = {}
 
-            async def resolve_cached(hostname: str) -> ResolvedHost | None:
-                if hostname not in resolved_cache:
-                    async with dns_semaphore:
-                        resolved_cache[hostname] = await resolve_hostname(hostname)
-                return resolved_cache[hostname]
+        async def process_root(root: str) -> list[str]:
+            root_warnings: list[str] = []
+            async with root_semaphore:
+                await report_progress("collecting", force=True)
+                sources: dict[str, set[str]] = {}
+                inspected: dict[str, tuple[ResolvedHost | None, HttpProbe]] = {}
+                resolved_cache: dict[str, ResolvedHost | None] = {}
 
-            passive_tasks = [
-                asyncio.create_task(
-                    _call_source(
-                        repo,
-                        source_name,
-                        globals()[function_name],
-                        passive_client,
-                        root,
-                    )
-                )
-                for source_name, function_name in PASSIVE_SOURCES
-            ] if passive_enabled else []
-            wildcard_task = (
-                asyncio.create_task(_wildcard_ips(root))
-                if passive_enabled or brute_enabled else None
-            )
+                async def resolve_cached(hostname: str) -> ResolvedHost | None:
+                    if hostname not in resolved_cache:
+                        async with dns_semaphore:
+                            resolved_cache[hostname] = await resolve_hostname(hostname)
+                    return resolved_cache[hostname]
 
-            async def persist(
-                resolved: ResolvedHost, probe: HttpProbe, wildcard_ips: set[str]
-            ) -> None:
-                nonlocal discovered
-                host = resolved.hostname
-                is_wildcard = bool(
-                    wildcard_ips and set(resolved.ips).issubset(wildcard_ips)
-                )
-                passive_sources = sources[host] - {"DNS字典"}
-                if is_wildcard and not passive_sources:
-                    return
-                inserted = await repo.add_subdomain_result(
-                    run_id,
-                    root_domain=root,
-                    hostname=host,
-                    ips=resolved.ips,
-                    canonical_name=resolved.canonical_name,
-                    wildcard=is_wildcard,
-                    http_url=probe.url,
-                    http_status=probe.status,
-                    title=probe.title,
-                    sources=sorted(sources[host]),
-                )
-                if inserted:
-                    discovered += 1
-
-            async def merge_inspected(
-                candidates: set[str], wildcard_ips: set[str]
-            ) -> None:
-                for host in sorted(candidates & set(inspected)):
-                    resolved, probe = inspected[host]
-                    if resolved:
-                        await persist(resolved, probe, wildcard_ips)
-
-            async def inspect_many(
-                candidates: list[str], wildcard_ips: set[str]
-            ) -> None:
-                nonlocal processed, total
-                pending = [host for host in candidates if host not in inspected]
-                if not pending:
-                    return
-                phase = "probing" if http_enabled else "resolving"
-                while pending:
-                    remaining = MAX_CANDIDATES_PER_DOMAIN - len(inspected)
-                    if remaining <= 0:
-                        warnings.append(
-                            f"{root}：候选数超过单域名上限 {MAX_CANDIDATES_PER_DOMAIN}，已截断"
+                passive_tasks = [
+                    asyncio.create_task(
+                        _call_source(
+                            repo,
+                            source_name,
+                            globals()[function_name],
+                            passive_client,
+                            root,
                         )
+                    )
+                    for source_name, function_name in PASSIVE_SOURCES
+                ] if passive_enabled else []
+                wildcard_task = (
+                    asyncio.create_task(_wildcard_ips(root))
+                    if passive_enabled or brute_enabled else None
+                )
+
+                async def persist(
+                    resolved: ResolvedHost, probe: HttpProbe, wildcard_ips: set[str]
+                ) -> None:
+                    host = resolved.hostname
+                    is_wildcard = bool(
+                        wildcard_ips and set(resolved.ips).issubset(wildcard_ips)
+                    )
+                    passive_sources = sources[host] - {"DNS字典"}
+                    if is_wildcard and not passive_sources:
                         return
-                    if len(pending) > remaining:
-                        warnings.append(
-                            f"{root}：候选数超过单域名上限 {MAX_CANDIDATES_PER_DOMAIN}，已截断"
-                        )
-                        pending = pending[:remaining]
-                    batch = pending[:INSPECTION_BATCH_SIZE]
-                    pending = pending[INSPECTION_BATCH_SIZE:]
-                    total += len(batch)
-                    await report_progress("resolving", force=True)
-
-                    async def inspect(
-                        hostname: str,
-                    ) -> tuple[str, ResolvedHost | None, HttpProbe]:
-                        resolved = await resolve_cached(hostname)
-                        if not resolved:
-                            return hostname, None, HttpProbe()
-                        # Persist the DNS result before HTTP enrichment. A slow
-                        # or blocked web server must not hide a valid DNS hit.
-                        await persist(resolved, HttpProbe(), wildcard_ips)
-                        if not http_enabled:
-                            return hostname, resolved, HttpProbe()
-                        async with http_semaphore:
-                            probe = await probe_http(probe_client, resolved, root)
-                        return hostname, resolved, probe
-
-                    tasks = [asyncio.create_task(inspect(host)) for host in batch]
-                    newly_discovered: set[str] = set()
-                    try:
-                        for task in asyncio.as_completed(tasks):
-                            host, resolved, probe = await task
-                            inspected[host] = (resolved, probe)
-                            processed += 1
-                            if resolved:
-                                if probe.url or probe.status is not None or probe.title:
-                                    await persist(resolved, probe, wildcard_ips)
-                                for found_host in probe.discovered:
-                                    sources.setdefault(found_host, set()).add("页面内容")
-                                    newly_discovered.add(found_host)
-                            await report_progress(phase)
-                    finally:
-                        for task in tasks:
-                            if not task.done():
-                                task.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                    pending.extend(
-                        sorted(host for host in newly_discovered if host not in inspected)
+                    inserted = await repo.add_subdomain_result(
+                        run_id,
+                        root_domain=root,
+                        hostname=host,
+                        ips=resolved.ips,
+                        canonical_name=resolved.canonical_name,
+                        wildcard=is_wildcard,
+                        http_url=probe.url,
+                        http_status=probe.status,
+                        title=probe.title,
+                        sources=sorted(sources[host]),
                     )
-                await report_progress(phase, force=True)
+                    if inserted:
+                        await increment_discovered()
 
+                async def merge_inspected(
+                    candidates: set[str], wildcard_ips: set[str]
+                ) -> None:
+                    for host in sorted(candidates & set(inspected)):
+                        resolved, probe = inspected[host]
+                        if resolved:
+                            await persist(resolved, probe, wildcard_ips)
+
+                async def inspect_many(
+                    candidates: list[str], wildcard_ips: set[str]
+                ) -> None:
+                    pending = [host for host in candidates if host not in inspected]
+                    if not pending:
+                        return
+                    phase = "probing" if http_enabled else "resolving"
+                    while pending:
+                        remaining = MAX_CANDIDATES_PER_DOMAIN - len(inspected)
+                        if remaining <= 0:
+                            root_warnings.append(
+                                f"{root}：候选数超过单域名上限 {MAX_CANDIDATES_PER_DOMAIN}，已截断"
+                            )
+                            return
+                        if len(pending) > remaining:
+                            root_warnings.append(
+                                f"{root}：候选数超过单域名上限 {MAX_CANDIDATES_PER_DOMAIN}，已截断"
+                            )
+                            pending = pending[:remaining]
+                        batch = pending[:INSPECTION_BATCH_SIZE]
+                        pending = pending[INSPECTION_BATCH_SIZE:]
+                        await increment_total(len(batch))
+                        await report_progress("resolving", force=True)
+
+                        async def inspect(
+                            hostname: str,
+                        ) -> tuple[str, ResolvedHost | None, HttpProbe]:
+                            resolved = await resolve_cached(hostname)
+                            if not resolved:
+                                return hostname, None, HttpProbe()
+                            # Persist DNS before HTTP enrichment. A slow or
+                            # blocked web server must not hide a valid DNS hit.
+                            await persist(resolved, HttpProbe(), wildcard_ips)
+                            if not http_enabled:
+                                return hostname, resolved, HttpProbe()
+                            async with http_semaphore:
+                                probe = await probe_http(probe_client, resolved, root)
+                            return hostname, resolved, probe
+
+                        tasks = [asyncio.create_task(inspect(host)) for host in batch]
+                        newly_discovered: set[str] = set()
+                        try:
+                            for task in asyncio.as_completed(tasks):
+                                host, resolved, probe = await task
+                                inspected[host] = (resolved, probe)
+                                await increment_processed()
+                                if resolved:
+                                    if probe.url or probe.status is not None or probe.title:
+                                        await persist(resolved, probe, wildcard_ips)
+                                    for found_host in probe.discovered:
+                                        sources.setdefault(found_host, set()).add("页面内容")
+                                        newly_discovered.add(found_host)
+                                await report_progress(phase)
+                        finally:
+                            for task in tasks:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                        pending.extend(
+                            sorted(host for host in newly_discovered if host not in inspected)
+                        )
+                    await report_progress(phase, force=True)
+
+                try:
+                    if brute_enabled:
+                        for prefix in COMMON_PREFIXES:
+                            sources.setdefault(f"{prefix}.{root}", set()).add("DNS字典")
+                        wildcard_ips = await wildcard_task if wildcard_task else set()
+                        # Dictionary DNS verification starts immediately; passive
+                        # sources are merged when each one finishes.
+                        await inspect_many(sorted(sources), wildcard_ips)
+                    else:
+                        wildcard_ips = await wildcard_task if wildcard_task else set()
+
+                    if passive_tasks:
+                        for task in asyncio.as_completed(passive_tasks):
+                            source_name, hosts, error = await task
+                            if error:
+                                root_warnings.append(f"{root} · {source_name}：{error}")
+                            for host in hosts:
+                                sources.setdefault(host, set()).add(source_name)
+                            if hosts:
+                                await merge_inspected(set(hosts), wildcard_ips)
+                                await inspect_many(sorted(hosts), wildcard_ips)
+
+                        if brute_enabled and deep_scan_enabled:
+                            altdns_hosts = generate_altdns_candidates(set(sources), root)
+                            for host in altdns_hosts:
+                                sources.setdefault(host, set()).add("AltDNS")
+                            await inspect_many(sorted(altdns_hosts), wildcard_ips)
+                finally:
+                    for task in passive_tasks:
+                        if not task.done():
+                            task.cancel()
+                    if wildcard_task and not wildcard_task.done():
+                        wildcard_task.cancel()
+                    await asyncio.gather(*passive_tasks, return_exceptions=True)
+                    if wildcard_task:
+                        await asyncio.gather(wildcard_task, return_exceptions=True)
+            return root_warnings
+
+        async def process_root_safely(root: str) -> list[str]:
             try:
-                if brute_enabled:
-                    for prefix in COMMON_PREFIXES:
-                        sources.setdefault(f"{prefix}.{root}", set()).add("DNS字典")
-                    wildcard_ips = await wildcard_task if wildcard_task else set()
-                    # Start dictionary DNS verification without waiting for the
-                    # passive sources. Results become visible as soon as DNS is
-                    # resolved; HTTP enrichment follows independently.
-                    await inspect_many(sorted(sources), wildcard_ips)
-                else:
-                    wildcard_ips = await wildcard_task if wildcard_task else set()
+                return await process_root(root)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate one root
+                detail = " ".join(str(exc).split())[:240] or type(exc).__name__
+                return [f"{root}：查询失败：{detail}"]
 
-                if passive_tasks:
-                    # Consume sources in completion order. A fast source is no
-                    # longer hidden behind a slower or rate-limited source.
-                    for task in asyncio.as_completed(passive_tasks):
-                        source_name, hosts, error = await task
-                        if error:
-                            warnings.append(f"{root} · {source_name}：{error}")
-                        for host in hosts:
-                            sources.setdefault(host, set()).add(source_name)
-                        if hosts:
-                            await merge_inspected(set(hosts), wildcard_ips)
-                            await inspect_many(sorted(hosts), wildcard_ips)
-
-                    # AltDNS-style mutations use only observed names and remain
-                    # bounded, so completeness improves without an unbounded
-                    # brute-force expansion. Keep this behind the DNS dictionary
-                    # switch so passive-only runs remain predictable and cheap.
-                    if brute_enabled and deep_scan_enabled:
-                        altdns_hosts = generate_altdns_candidates(set(sources), root)
-                        for host in altdns_hosts:
-                            sources.setdefault(host, set()).add("AltDNS")
-                        await inspect_many(sorted(altdns_hosts), wildcard_ips)
-            finally:
-                for task in passive_tasks:
-                    if not task.done():
-                        task.cancel()
-                if wildcard_task and not wildcard_task.done():
-                    wildcard_task.cancel()
-                await asyncio.gather(*passive_tasks, return_exceptions=True)
-                if wildcard_task:
-                    await asyncio.gather(wildcard_task, return_exceptions=True)
+        root_warnings = await asyncio.gather(
+            *(process_root_safely(root) for root in domains)
+        )
+        for values in root_warnings:
+            warnings.extend(values)
 
     await report_progress("completed", force=True)
     return list(dict.fromkeys(warnings))
-

@@ -1,5 +1,5 @@
-import { useLayoutEffect, useRef, useState } from 'react'
-import { DownloadOutlined, SearchOutlined } from '@ant-design/icons'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { DownloadOutlined, SearchOutlined, StopOutlined } from '@ant-design/icons'
 import {
   Alert,
   App,
@@ -41,6 +41,26 @@ function QueryRouteStatus({ settings }: { settings: SettingsView | null }) {
       <Typography.Text type="secondary">代理统一在“基础配置”中管理，查询页面不单独选择代理。</Typography.Text>
     </div>
   )
+}
+
+function QueryDuration({
+  startedAt,
+  finishedAt,
+  running,
+}: {
+  startedAt?: string | null
+  finishedAt?: string | null
+  running: boolean
+}) {
+  const [, setTick] = useState(0)
+
+  useEffect(() => {
+    if (!running) return
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [running])
+
+  return <>查询用时 {formatDuration(startedAt, finishedAt)}</>
 }
 
 
@@ -135,6 +155,7 @@ export function CollectionPage({
   onFinish,
   onPick,
   onForget,
+  onCancel,
   settings,
 }: {
   form: FormInstance<CollectionValues>
@@ -145,6 +166,7 @@ export function CollectionPage({
   onFinish: (values: CollectionValues) => void
   onPick: (run: Run) => void
   onForget: (run: Run) => void
+  onCancel: () => void
   settings: SettingsView | null
 }) {
   const { message } = App.useApp()
@@ -231,7 +253,11 @@ export function CollectionPage({
             <Space>
               <StatusTag status={query.run.status} />
               <Typography.Text type="secondary">
-                查询用时 {formatDuration(query.run.started_at, query.run.finished_at)}
+                <QueryDuration
+                  startedAt={query.run.started_at}
+                  finishedAt={query.run.finished_at}
+                  running={query.run.status === 'queued' || query.run.status === 'running'}
+                />
               </Typography.Text>
               {query.run.icp_cache_hits + query.run.icp_live_queries > 0 ? (
                 <Typography.Text
@@ -240,6 +266,11 @@ export function CollectionPage({
                 >
                   ICP：缓存 {query.run.icp_cache_hits} 家 · 实时 {query.run.icp_live_queries} 家
                 </Typography.Text>
+              ) : null}
+              {query.run.status === 'queued' || query.run.status === 'running' ? (
+                <Button danger icon={<StopOutlined />} onClick={onCancel}>
+                  停止
+                </Button>
               ) : null}
               <Button
                 icon={<DownloadOutlined />}
@@ -257,7 +288,7 @@ export function CollectionPage({
           <Alert type="warning" showIcon title={query.source_errors.join('；')} style={{ marginBottom: 16 }} />
         ) : null}
         {query ? (
-          <QueryResultsPanel query={query} loading={loading} />
+          <QueryResultsPanel query={query} loading={loading && !query} />
         ) : (
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}

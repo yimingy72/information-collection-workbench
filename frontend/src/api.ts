@@ -75,6 +75,35 @@ export const runQuery = (values: CollectionValues) =>
     }),
   })
 
+export const createCollectionRun = (values: CollectionValues) =>
+  api<Run>('/api/v1/collection-runs', {
+    method: 'POST',
+    body: JSON.stringify({
+      keyword: values.keyword,
+      providers: values.providers,
+      depth: values.depth,
+      holding_percent: values.holding_percent,
+      fields: ['invest'],
+      include_branches: false,
+    }),
+  })
+
+export const cancelCollectionRun = (runId: string) =>
+  api<Run>(`/api/v1/collection-runs/${runId}/cancel`, { method: 'POST' })
+
+export const collectionEventUrl = (
+  runId: string,
+  relationshipCursor: number,
+  resultCursor: number,
+) => {
+  const query = new URLSearchParams({
+    relationship_cursor: String(relationshipCursor),
+    result_cursor: String(resultCursor),
+  })
+  return `/api/v1/collection-runs/${runId}/events?${query.toString()}`
+}
+
+
 export const getQuery = (runId: string) =>
   api<QueryView>(`/api/v1/queries/${runId}`)
 
@@ -193,10 +222,13 @@ export const getAllSubdomainResults = async (runId: string) => {
 export const deleteSubdomainRun = (runId: string) =>
   api<{ deleted: number }>(`/api/v1/subdomain-runs/${runId}`, { method: 'DELETE' })
 
+export const cancelSubdomainRun = (runId: string) =>
+  api<SubdomainRun>(`/api/v1/subdomain-runs/${runId}/cancel`, { method: 'POST' })
+
 export const listIcpDomainRuns = (limit = 50) =>
   api<{ items: IcpDomainRun[] }>(`/api/v1/icp-domain-runs?limit=${limit}`)
 
-export const subdomainEventUrl = (runId: string, afterId = 0) =>
-  `/api/v1/subdomain-runs/${runId}/events?after_id=${afterId}`
+export const subdomainEventUrl = (runId: string, afterSeq = 0) =>
+  `/api/v1/subdomain-runs/${runId}/events?after_seq=${afterSeq}`
 
 export type { SubdomainResult }

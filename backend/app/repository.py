@@ -189,6 +189,18 @@ class Repository:
         if lease_id is not None and result == "UPDATE 0":
             raise LeaseLost(str(run_id))
 
+    async def cancel_run(self, run_id: UUID) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            """
+            UPDATE collection_runs
+               SET status='cancelled', error='用户主动停止查询', finished_at=now(),
+                   heartbeat_at=NULL, lease_id=NULL
+             WHERE id=$1 AND status IN ('queued','running')
+            RETURNING *
+            """,
+            run_id,
+        )
+
     async def has_results(self, run_id: UUID) -> bool:
         return bool(
             await self.pool.fetchval(
@@ -362,6 +374,55 @@ class Repository:
         count_rel = await self.pool.fetchval("SELECT count(*) FROM relationships WHERE run_id=$1", run_id)
         return rows, rels, int(count_result or 0), int(count_rel or 0)
 
+    async def collection_event_cursors(self, run_id: UUID) -> tuple[int, int]:
+        row = await self.pool.fetchrow(
+            """
+            SELECT COALESCE((SELECT max(stream_seq) FROM relationships WHERE run_id=$1), 0) relationship_cursor,
+                   COALESCE((SELECT max(stream_seq) FROM results WHERE run_id=$1 AND category='icp'), 0) result_cursor
+            """,
+            run_id,
+        )
+        return int(row["relationship_cursor"] or 0), int(row["result_cursor"] or 0)
+
+    async def collection_events_after(
+        self,
+        run_id: UUID,
+        relationship_cursor: int,
+        result_cursor: int,
+        limit: int = 1000,
+    ) -> tuple[list[asyncpg.Record], list[asyncpg.Record]]:
+        limit = max(1, min(int(limit), 2000))
+        relationships = await self.pool.fetch(
+            """
+            SELECT rel.stream_seq,rel.parent_entity_id,p.name parent_name,
+                   rel.child_entity_id,c.name child_name,rel.relation_type,
+                   rel.holding_percent,rel.depth,rel.raw_payload
+              FROM relationships rel
+              JOIN entities p ON p.id=rel.parent_entity_id
+              JOIN entities c ON c.id=rel.child_entity_id
+             WHERE rel.run_id=$1 AND rel.stream_seq>$2
+             ORDER BY rel.stream_seq
+             LIMIT $3
+            """,
+            run_id,
+            max(0, int(relationship_cursor)),
+            limit,
+        )
+        icp_results = await self.pool.fetch(
+            """
+            SELECT r.stream_seq,e.name entity_name,r.payload
+              FROM results r
+              JOIN entities e ON e.id=r.entity_id
+             WHERE r.run_id=$1 AND r.category='icp' AND r.stream_seq>$2
+             ORDER BY r.stream_seq
+             LIMIT $3
+            """,
+            run_id,
+            max(0, int(result_cursor)),
+            limit,
+        )
+        return relationships, icp_results
+
     async def entity_names_for_run(self, run_id: UUID) -> list[str]:
         rows = await self.pool.fetch(
             """
@@ -408,6 +469,18 @@ class Repository:
 
     async def get_subdomain_run(self, run_id: UUID) -> asyncpg.Record | None:
         return await self.pool.fetchrow("SELECT * FROM subdomain_runs WHERE id=$1", run_id)
+
+    async def cancel_subdomain_run(self, run_id: UUID) -> asyncpg.Record | None:
+        return await self.pool.fetchrow(
+            """
+            UPDATE subdomain_runs
+               SET status='cancelled', phase='completed', error=NULL,
+                   finished_at=now(), heartbeat_at=NULL, lease_id=NULL
+             WHERE id=$1 AND status IN ('queued','running')
+            RETURNING *
+            """,
+            run_id,
+        )
 
     async def list_subdomain_runs(
         self, limit: int, offset: int
@@ -505,7 +578,8 @@ class Repository:
                http_url, http_status, title, sources)
             VALUES($1,$2,$3,$4::jsonb,$5,$6,$7,$8,$9,$10::jsonb)
             ON CONFLICT(run_id, root_domain, hostname) DO UPDATE
-               SET ips=EXCLUDED.ips,
+               SET stream_seq=nextval('subdomain_results_stream_seq_seq'),
+                   ips=EXCLUDED.ips,
                    canonical_name=CASE WHEN EXCLUDED.canonical_name <> ''
                                        THEN EXCLUDED.canonical_name ELSE subdomain_results.canonical_name END,
                    wildcard=EXCLUDED.wildcard,
@@ -525,6 +599,14 @@ class Repository:
         )
         return bool(row and row.get("inserted"))
 
+    async def subdomain_result_count(self, run_id: UUID) -> int:
+        return int(
+            await self.pool.fetchval(
+                "SELECT count(*) FROM subdomain_results WHERE run_id=$1", run_id
+            )
+            or 0
+        )
+
     async def subdomain_results_after(
         self, run_id: UUID, after_id: int, limit: int
     ) -> list[asyncpg.Record]:
@@ -534,6 +616,18 @@ class Repository:
              WHERE run_id=$1 AND id>$2 ORDER BY id LIMIT $3
             """,
             run_id, after_id, limit,
+        )
+
+    async def subdomain_events_after(
+        self, run_id: UUID, after_seq: int, limit: int
+    ) -> list[asyncpg.Record]:
+        return await self.pool.fetch(
+            """
+            SELECT * FROM subdomain_results
+             WHERE run_id=$1 AND stream_seq>$2
+             ORDER BY stream_seq LIMIT $3
+            """,
+            run_id, after_seq, limit,
         )
 
     async def subdomain_results(

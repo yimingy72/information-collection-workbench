@@ -168,6 +168,18 @@ async def test_subdomain_results_after_skips_count_query():
 
 
 @pytest.mark.asyncio
+async def test_subdomain_events_after_uses_monotonic_stream_cursor():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.subdomain_events_after(uuid4(), 12, 500)
+    assert len(pool.queries) == 1
+    query, args = pool.queries[0]
+    assert "stream_seq>$2" in query
+    assert "ORDER BY stream_seq" in query
+    assert args[1:] == (12, 500)
+
+
+@pytest.mark.asyncio
 async def test_icp_company_cache_only_loads_fresh_complete_matching_version():
     pool = FakePool()
     repo = Repository(pool, None)
@@ -194,3 +206,67 @@ async def test_icp_company_cache_upsert_replaces_complete_snapshot():
     assert "expires_at=EXCLUDED.expires_at" in query
     assert args[0] == "示例公司"
     assert args[2:] == (1, 1, "cache-v1", 3600)
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_marks_active_work_cancelled_and_releases_lease():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.cancel_run(uuid4())
+
+    query, _ = pool.queries[0]
+    assert "status='cancelled'" in query
+    assert "status IN ('queued','running')" in query
+    assert "heartbeat_at=NULL" in query
+    assert "lease_id=NULL" in query
+
+
+@pytest.mark.asyncio
+async def test_collection_event_queries_use_monotonic_stream_cursors():
+    class EventPool(FakePool):
+        async def fetchrow(self, query, *args):
+            self.queries.append((query, args))
+            return {"relationship_cursor": 12, "result_cursor": 34}
+
+    pool = EventPool()
+    repo = Repository(pool, None)
+    cursors = await repo.collection_event_cursors(uuid4())
+    assert cursors == (12, 34)
+    assert "max(stream_seq)" in pool.queries[0][0]
+
+    pool.queries.clear()
+    await repo.collection_events_after(uuid4(), 12, 34, 500)
+    relationship_query, relationship_args = pool.queries[0]
+    result_query, result_args = pool.queries[1]
+    assert "rel.stream_seq>$2" in relationship_query
+    assert "ORDER BY rel.stream_seq" in relationship_query
+    assert relationship_args[1:] == (12, 500)
+    assert "r.stream_seq>$2" in result_query
+    assert "r.category='icp'" in result_query
+    assert result_args[1:] == (34, 500)
+
+
+@pytest.mark.asyncio
+async def test_cancel_subdomain_run_preserves_results_and_releases_lease():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.cancel_subdomain_run(uuid4())
+
+    query, _ = pool.queries[0]
+    assert "status='cancelled'" in query
+    assert "status IN ('queued','running')" in query
+    assert "lease_id=NULL" in query
+    assert "DELETE" not in query
+
+
+@pytest.mark.asyncio
+async def test_subdomain_result_count_reads_persisted_rows():
+    class CountPool(FakePool):
+        async def fetchval(self, query, *args):
+            self.queries.append((query, args))
+            return 8
+
+    pool = CountPool()
+    repo = Repository(pool, None)
+    assert await repo.subdomain_result_count(uuid4()) == 8
+    assert "count(*) FROM subdomain_results" in pool.queries[0][0]

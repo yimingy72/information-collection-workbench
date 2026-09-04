@@ -1,12 +1,12 @@
 # 系统架构
 
-> 最后更新：2026-09-03
+> 最后更新：2026-09-04
 
 ## 组件
 
 | 组件 | 技术 | 职责 |
 |---|---|---|
-| `frontend/` | React 19、TypeScript、Ant Design 6、Vite | 查询、历史记录、基础配置、分页和Excel导出 |
+| `frontend/` | React 19、TypeScript、Ant Design 6、Vite | 异步查询、SSE 实时结果、历史记录、基础配置、分页和Excel导出 |
 | `backend/app/main.py` | FastAPI | HTTP API、同步查询、设置管理、前端静态文件 |
 | `backend/app/worker.py` | asyncio worker | 领取异步任务、租约恢复、执行采集 |
 | `backend/app/repository.py` | asyncpg | PostgreSQL 持久化与迁移 |
@@ -19,13 +19,28 @@
 
 ## 查询时序
 
-1. API 刷新数据源登录状态，并根据路由优先级决定是否配置本地 SeaMoon 网关。
-2. 所选 provider 并行启动；根企业搜索结果写入 PostgreSQL 后立即触发该企业的 ICP 查询。
+1. 页面调用 `POST /api/v1/collection-runs` 创建排队任务并立即进入详情，不再让浏览器长时间等待同步查询响应。
+2. Worker 刷新数据源登录状态，并根据路由优先级配置本地 SeaMoon 网关；所选 provider 并行启动，根企业搜索结果写入 PostgreSQL 后立即触发该企业的 ICP 查询。
 3. provider 遍历投资关系时，每个符合持股比例的新企业写入后立即进入 ICP 队列，不必等待全部层级遍历完成。
 4. ICP 消费者先按精确企业全称批量读取缓存。只有未过期、算法版本一致且缓存唯一记录数与上游报告总数完全相等的快照才复制到本次任务；其他企业继续实时查询。
 5. 实时查询按当前代理模式分批运行：云函数模式按就绪节点数扩展（每节点5个逻辑槽位，最多40个），手动代理按节点数并发，直连模式串行节流。ICP备案结果不会再次作为待查询企业，避免队列自反馈。
 6. 每个实时企业执行分页查询、完整性检查、跨页去重和结果保存；确认完整后再原子替换企业缓存。ICP 阶段持续刷新任务心跳。
 7. 任一阶段存在错误但已有结果时，任务状态为 `partial`；无错误时为 `succeeded`。
+
+## 企业查询实时事件
+
+- 迁移 `026_collection_event_stream.sql` 为 `relationships` 和 `results` 增加单调递增的 `stream_seq`，分别建立 `(run_id, stream_seq)` 索引。
+- `GET /api/v1/collection-runs/{id}/events` 使用 SSE 批量发送新增投资关系、ICP 结果和任务摘要；每次最多读取1,000条增量，空闲时发送 keepalive。
+- `GET /api/v1/subdomain-runs/{id}/events` 使用 `subdomain_results.stream_seq` 作为变更游标；DNS 初次写入和后续 HTTP 丰富字段更新都会被推送，刷新页面可从快照后的游标继续接收。
+- 初始 `QueryResponse` 在读取完整快照前先捕获关系/结果游标。并发写入的数据可能重复出现在快照和增量中，但前端按稳定业务键合并，因此不会因竞态漏掉数据。
+- SSE 断开时浏览器自动重连；最终状态到达后重新读取一次完整查询结果，校准多数据源合并、错误信息和最终数量。
+- `POST /api/v1/collection-runs/{id}/cancel` 将排队或运行任务标记为 `cancelled` 并释放租约。ICP 心跳缩短到5秒，使运行协程及时发现租约失效并退出，同时保留已保存结果。
+
+## 子域名并发与缓存
+
+- 多个主域名以最多 `ROOT_CONCURRENCY=3` 个根任务并发处理；总 DNS 并发和 HTTP 并发仍分别受 `DNS_CONCURRENCY`、`HTTP_CONCURRENCY` 限制，避免把单域名优化成全局洪峰。
+- `subdomain_source_cache` 缓存被动来源；数据库结果使用 `(run_id, root_domain, hostname)` 去重。
+- `027_subdomain_result_stream.sql` 为结果增加单调递增变更游标，避免“先展示 DNS、后补充 HTTP”时前端长期看不到更新。
 
 ## ICP 企业级缓存
 
@@ -75,6 +90,7 @@ ICP_COMPANY_RETRY_BACKOFF_SECONDS = 2
 7. 单页始终受10秒双重硬超时约束，每次企业级尝试受30秒预算约束。
 8. `total=0` 或已返回有效记录时立即结束；正数 `total` 但空列表仅执行1次快速恢复。
 9. 一轮完成后只重新调度失败企业，默认最多执行3次企业级尝试，轮次间线性退避；每次尝试从新的分页会话开始。
+10. 同一轮使用滚动信号量维护并发槽位，快速企业释放槽位后立即启动下一家，不再按固定切片等待最慢企业完成。
 
 结果在确认完整前保存在内存集合中，避免把已知不完整的企业分页静默保存为成功结果。数据库同时使用唯一索引防止重复写入。
 

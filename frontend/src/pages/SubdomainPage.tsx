@@ -18,8 +18,9 @@ import {
   Typography,
 } from 'antd'
 import type { TableProps } from 'antd'
-import { DeleteOutlined, DownloadOutlined, PlayCircleOutlined, ReloadOutlined } from '@ant-design/icons'
+import { DeleteOutlined, DownloadOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
 import {
+  cancelSubdomainRun,
   createSubdomainRun,
   deleteSubdomainRun,
   getAllSubdomainResults,
@@ -42,6 +43,15 @@ const phaseLabels: Record<string, string> = {
   probing: 'HTTP 存活探测',
   completed: '查询完成',
   failed: '查询失败',
+}
+
+const statusLabels: Record<string, string> = {
+  queued: '等待中',
+  running: '进行中',
+  succeeded: '成功',
+  partial: '部分成功',
+  failed: '失败',
+  cancelled: '已取消',
 }
 
 function parseDomains(value: string) {
@@ -129,6 +139,7 @@ export function SubdomainPage({
   const deferredResultKeyword = useDeferredValue(resultKeyword)
   const [resultView, setResultView] = useState<'all' | 'web' | 'wildcard'>('all')
   const eventSourceRef = useRef<EventSource | null>(null)
+  const autoOpenedRef = useRef(false)
 
   const results = useMemo(() => [...resultsByIdRef.current.values()], [resultsVersion])
   const replaceResults = (items: SubdomainResult[]) => {
@@ -181,16 +192,45 @@ export function SubdomainPage({
   const refreshRecent = async () => {
     const data = await listSubdomainRuns(1, 30)
     setRecentRuns(data.items)
+    if (runId) {
+      const current = data.items.find((item) => item.id === runId)
+      if (current) setRun(current)
+    }
+    return data.items
   }
 
   useEffect(() => {
-    Promise.all([listIcpDomainRuns(), listSubdomainRuns(1, 30)])
-      .then(([icp, recent]) => {
-        setIcpRuns(icp.items)
-        setRecentRuns(recent.items)
+    let cancelled = false
+    void listIcpDomainRuns()
+      .then((icp) => {
+        if (!cancelled) setIcpRuns(icp.items)
       })
-      .catch(() => message.error('无法加载子域名查询数据'))
+      .catch(() => message.warning('ICP 历史域名暂时无法加载，可继续手动输入域名'))
+    void listSubdomainRuns(1, 30)
+      .then((recent) => {
+        if (cancelled) return
+        setRecentRuns(recent.items)
+        if (!runId && !autoOpenedRef.current && recent.items.length) {
+          autoOpenedRef.current = true
+          const active = recent.items.find((item) => !terminalStatuses.has(item.status))
+          onOpenRun((active ?? recent.items[0]).id)
+        }
+      })
+      .catch(() => message.error('无法加载子域名历史查询'))
+    return () => {
+      cancelled = true
+    }
   }, [])
+
+  const hasActiveRecent = recentRuns.some((item) => !terminalStatuses.has(item.status))
+
+  useEffect(() => {
+    if (!hasActiveRecent) return
+    const timer = window.setInterval(() => {
+      void refreshRecent().catch(() => undefined)
+    }, 3000)
+    return () => window.clearInterval(timer)
+  }, [hasActiveRecent, runId])
 
   useEffect(() => {
     if (!selectedIcpRunIds.length) {
@@ -223,8 +263,8 @@ export function SubdomainPage({
           ...current.filter((item) => item.id !== nextRun.id),
         ].slice(0, 30))
         if (terminalStatuses.has(nextRun.status)) return
-        const afterId = response.items.reduce((value, item) => Math.max(value, item.id), 0)
-        const source = new EventSource(subdomainEventUrl(runId, afterId))
+        const afterSeq = response.items.reduce((value, item) => Math.max(value, item.stream_seq), 0)
+        const source = new EventSource(subdomainEventUrl(runId, afterSeq))
         eventSourceRef.current = source
         source.addEventListener('result', (event) => {
           const item = JSON.parse((event as MessageEvent).data) as SubdomainResult
@@ -308,6 +348,18 @@ export function SubdomainPage({
         await refreshRecent()
       },
     })
+  }
+
+  const stopCurrent = async () => {
+    if (!run || terminalStatuses.has(run.status)) return
+    try {
+      const cancelled = await cancelSubdomainRun(run.id)
+      setRun(cancelled)
+      await refreshRecent()
+      message.success('查询已停止，现有结果已保留')
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '停止查询失败')
+    }
   }
 
   const columns: TableProps<SubdomainResult>['columns'] = [
@@ -431,15 +483,47 @@ export function SubdomainPage({
               className="subdomain-history-select"
               allowClear
               showSearch={{ optionFilterProp: 'label' }}
-              placeholder="最近查询"
+              placeholder={`查询记录（${recentRuns.length}）`}
               value={run?.id}
               options={recentRuns.map((item) => ({
                 value: item.id,
-                label: recentRunLabel(item),
+                label: `${statusLabels[item.status] ?? item.status} · ${recentRunLabel(item)}`,
+                run: item,
               }))}
+              optionRender={(option) => {
+                const item = option.data.run as SubdomainRun
+                return (
+                  <Flex align="center" justify="space-between" gap={12}>
+                    <Typography.Text ellipsis>{recentRunLabel(item)}</Typography.Text>
+                    <Space size={6}>
+                      {!terminalStatuses.has(item.status) ? (
+                        <Typography.Text type="secondary">
+                          {item.total ? `${item.progress}/${item.total}` : phaseLabels[item.phase] ?? item.phase}
+                        </Typography.Text>
+                      ) : null}
+                      <StatusTag status={item.status} />
+                    </Space>
+                  </Flex>
+                )
+              }}
               onChange={(value) => onOpenRun(value)}
             />
-            <Button icon={<ReloadOutlined />} onClick={() => setRefreshKey((value) => value + 1)} disabled={!runId}>刷新</Button>
+            {hasActiveRecent ? <Tag color="processing">进行中 {recentRuns.filter((item) => !terminalStatuses.has(item.status)).length}</Tag> : null}
+            <Button
+              icon={<ReloadOutlined />}
+              onClick={() => {
+                setRefreshKey((value) => value + 1)
+                void refreshRecent().catch(() => message.error('刷新查询记录失败'))
+              }}
+              disabled={!runId}
+            >
+              刷新
+            </Button>
+            {!run || terminalStatuses.has(run.status) ? null : (
+              <Button danger icon={<StopOutlined />} onClick={() => void stopCurrent()}>
+                停止
+              </Button>
+            )}
             <Button icon={<DownloadOutlined />} disabled={!run || !results.length} onClick={() => run && exportResults(run, sortedResults)}>导出 CSV</Button>
             <Button danger icon={<DeleteOutlined />} disabled={!run} onClick={removeCurrent}>删除</Button>
           </Space>
@@ -465,6 +549,7 @@ export function SubdomainPage({
             {run.error ? <Alert type="error" showIcon title={run.error} /> : null}
             {run.warnings.length ? (
               <Alert
+                className="subdomain-warning-alert"
                 type="warning"
                 showIcon
                 title={`部分数据源未完成（${run.warnings.length}）`}

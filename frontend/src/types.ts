@@ -73,6 +73,15 @@ export type QueryView = {
   shareholders: ShareholderRow[]
   icp_records: IcpRow[]
   source_errors: string[]
+  relationship_cursor: number
+  result_cursor: number
+}
+
+export type CollectionDelta = {
+  relationship_cursor: number
+  result_cursor: number
+  investments: InvestmentRow[]
+  icp_records: IcpRow[]
 }
 
 
@@ -111,6 +120,7 @@ export type ServerlessProxyNode = {
   last_error: string
   latency_ms?: number | null
   failure_count: number
+  auto_managed: boolean
   updated_at?: string | null
 }
 
@@ -243,6 +253,7 @@ export type SubdomainRunList = {
 export type SubdomainResult = {
   id: number
   run_id: string
+  stream_seq: number
   root_domain: string
   hostname: string
   ips: string[]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 from weakref import WeakKeyDictionary
 from uuid import UUID, uuid4
@@ -479,6 +480,21 @@ def _failure(
     return CompanyFailure(name, attempted_pages, error, elapsed)
 
 
+async def _run_company_round(
+    names: list[str],
+    concurrency: int,
+    collect: Callable[[str], Awaitable[CompanyFailure | None]],
+) -> list[tuple[str, CompanyFailure | None]]:
+    """Run a rolling company queue without fixed-wave head-of-line blocking."""
+    semaphore = asyncio.Semaphore(max(1, int(concurrency)))
+
+    async def run_one(name: str) -> tuple[str, CompanyFailure | None]:
+        async with semaphore:
+            return name, await collect(name)
+
+    return list(await asyncio.gather(*(run_one(name) for name in names)))
+
+
 async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list[str]:
     names = list(dict.fromkeys(_clean(name) for name in names if _clean(name)))
     if not names:
@@ -771,25 +787,16 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             elapsed_seconds: dict[str, float] = {name: 0.0 for name in names}
 
             for attempt_index in range(ICP_COMPANY_MAX_ATTEMPTS):
-                round_outcomes: list[tuple[str, CompanyFailure | None]] = []
-                for batch_start in range(0, len(pending), batch_size):
-                    batch = pending[batch_start:batch_start + batch_size]
-                    # Keep the request scheduler as the single gate for a
-                    # fixed direct IP, but run independent companies concurrently
-                    # behind it. This preserves the 0.4s inter-request gap and
-                    # five-request cooldown while allowing request latency to be
-                    # pipelined. Serialising the whole company batch made a
-                    # normal direct run pay one network round-trip per company
-                    # on top of the WAF pacing (the main source of the observed
-                    # ~50 minute run for 1,280 names).
-                    #
-                    # Proxy-backed mode uses the same bounded gather. Manual
-                    # proxy pools reduce ``batch_size`` to their ready-node
-                    # count, while cloud mode stays at five logical companies.
-                    batch_results = await asyncio.gather(
-                        *(collect_company_once(name, client) for name in batch)
-                    )
-                    round_outcomes.extend(zip(batch, batch_results, strict=True))
+                # Keep at most ``batch_size`` companies active, but start the
+                # next pending company as soon as any slot is released. The old
+                # fixed-wave gather waited for the slowest 30-second timeout in
+                # each slice before using the freed fast slots, which made a
+                # 320-company batch look stalled for several minutes.
+                round_outcomes = await _run_company_round(
+                    pending,
+                    batch_size,
+                    lambda name: collect_company_once(name, client),
+                )
 
                 retry_names: list[str] = []
                 for name, outcome in round_outcomes:

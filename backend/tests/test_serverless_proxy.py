@@ -305,3 +305,79 @@ def test_auto_scale_regions_excludes_configured_regions(monkeypatch):
     )
     monkeypatch.setattr(proxy.settings, "icp_auto_scale_excluded_regions", "cn-chengdu")
     assert proxy._auto_scale_regions() == ["cn-hangzhou", "cn-shanghai"]
+
+
+@pytest.mark.asyncio
+async def test_release_icp_node_pool_removes_only_auto_managed_surplus(monkeypatch):
+    import app.serverless_proxy as proxy
+
+    base = config(
+        enabled=True,
+        endpoint="https://hangzhou.example",
+        access_key_id="ak",
+        access_key_secret="secret",
+        nodes=[
+            {
+                "id": "aliyun:cn-hangzhou:asset-workbench-seamoon",
+                "enabled": True,
+                "provider": "aliyun",
+                "endpoint": "https://hangzhou.example",
+                "region": "cn-hangzhou",
+                "function_name": "asset-workbench-seamoon",
+                "deployment_id": "primary",
+                "status": "ready",
+                "auto_managed": False,
+            },
+            *[
+                {
+                    "id": f"aliyun:cn-{region}:asset-workbench-seamoon",
+                    "enabled": True,
+                    "provider": "aliyun",
+                    "endpoint": f"https://{region}.example",
+                    "region": region,
+                    "function_name": "asset-workbench-seamoon",
+                    "deployment_id": region,
+                    "status": "ready",
+                    "auto_managed": True,
+                }
+                for region in ("shanghai", "beijing", "shenzhen")
+            ],
+        ],
+    )["serverless_proxy"]
+
+    class Repo:
+        def __init__(self):
+            self.row = base
+            self.updated = None
+
+        async def get_runtime_config(self):
+            return {"serverless_proxy": self.row, "manual_proxies": []}
+
+        async def update_serverless_proxy(self, payload):
+            self.row = payload
+            self.updated = payload
+            return payload
+
+    destroyed = []
+
+    async def fake_destroy(action, node):
+        assert action == "destroy"
+        destroyed.append(node["region"])
+        return {"message": "deleted"}
+
+    async def fake_configure(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(proxy, "run_cloud_operation", fake_destroy)
+    monkeypatch.setattr(proxy, "configure_gateway", fake_configure)
+    monkeypatch.setattr(proxy.settings, "icp_target_seconds", 300)
+    monkeypatch.setattr(proxy.settings, "icp_auto_scale_companies_per_node", 160)
+    monkeypatch.setattr(proxy.settings, "icp_auto_scale_max_nodes", 8)
+
+    repo = Repo()
+    result = await proxy.release_icp_node_pool(repo, 1)
+
+    assert result["target"] == 1
+    assert result["removed"] == 3
+    assert set(destroyed) == {"shanghai", "beijing", "shenzhen"}
+    assert [node["region"] for node in repo.updated["nodes"]] == ["cn-hangzhou"]

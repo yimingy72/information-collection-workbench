@@ -1,17 +1,37 @@
 import { useEffect, useRef, useState } from 'react'
 import { App as AntdApp, ConfigProvider, Form } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
-import { deleteRuns, getQuery, getSettings, listRuns, runQuery } from './api'
+import {
+  cancelCollectionRun,
+  collectionEventUrl,
+  createCollectionRun,
+  deleteRuns,
+  getQuery,
+  getSettings,
+  listRuns,
+} from './api'
 import { AppShell } from './components/AppShell'
 import { CollectionPage } from './pages/CollectionPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SubdomainPage } from './pages/SubdomainPage'
 import { TasksPage } from './pages/TasksPage'
+import { sourceTags } from './formatters'
 import { workbenchTheme } from './theme'
-import type { CollectionValues, ProviderId, QueryView, Run, SettingsView } from './types'
+import type {
+  CollectionDelta,
+  CollectionValues,
+  IcpRow,
+  InvestmentRow,
+  ProviderId,
+  QueryView,
+  Run,
+  SettingsView,
+} from './types'
 import { PROVIDER_OPTIONS, SESSION_PROVIDERS } from './types'
 import { TABLE_PAGE_SIZE } from './pagination'
 import './styles.css'
+
+const terminalStatuses = new Set(['succeeded', 'partial', 'failed', 'cancelled'])
 
 const parseHash = () => {
   const raw = location.hash.replace(/^#/, '') || 'collection'
@@ -19,6 +39,33 @@ const parseHash = () => {
   if (raw === 'proxy-settings') return 'settings'
   if (raw.startsWith('results/')) return `collection/${raw.slice('results/'.length)}`
   return raw
+}
+
+const investmentKey = (row: InvestmentRow) =>
+  [row.parent_name, row.child_name, row.depth, row.holding_percent ?? ''].join('\u0000')
+
+const mergeInvestments = (current: InvestmentRow[], incoming: InvestmentRow[]) => {
+  const rows = new Map(current.map((item) => [investmentKey(item), item]))
+  incoming.forEach((item) => {
+    const key = investmentKey(item)
+    const existing = rows.get(key)
+    rows.set(
+      key,
+      existing
+        ? { ...existing, source: sourceTags(`${existing.source}、${item.source}`).join('、') }
+        : item,
+    )
+  })
+  return [...rows.values()]
+}
+
+const icpKey = (row: IcpRow) =>
+  [row.unit_name, row.main_licence, row.service_licence, row.domain].join('\u0000')
+
+const mergeIcpRecords = (current: IcpRow[], incoming: IcpRow[]) => {
+  const rows = new Map(current.map((item) => [icpKey(item), item]))
+  incoming.forEach((item) => rows.set(icpKey(item), item))
+  return [...rows.values()]
 }
 
 function Workbench({
@@ -43,6 +90,7 @@ function Workbench({
   const [apiError, setApiError] = useState<string | null>(null)
   const [form] = Form.useForm<CollectionValues>()
   const loadedId = useRef<string | null>(null)
+  const collectionEventSource = useRef<EventSource | null>(null)
   const [settings, setSettings] = useState<SettingsView | null>(null)
 
   const refreshSettings = async () => {
@@ -63,6 +111,7 @@ function Workbench({
     if (next === 'collection') {
       setQuery(null)
       setQueryError(null)
+      setQuerying(false)
       loadedId.current = null
       void refreshSettings()
     }
@@ -126,26 +175,97 @@ function Workbench({
   }, [page, runPage, runPageSize, runKeyword, runStatus])
 
   useEffect(() => {
+    collectionEventSource.current?.close()
+    collectionEventSource.current = null
     if (!page.startsWith('collection/')) return
     const id = page.slice('collection/'.length)
-    if (!id || loadedId.current === id) return
-    loadedId.current = id
+    if (!id) return
+
+    let cancelled = false
     setQuerying(true)
-    getQuery(id)
-      .then((view) => {
-        setQuery(view)
-        setQueryError(null)
+    setQueryError(null)
+
+    const load = async () => {
+      const view = await getQuery(id)
+      if (cancelled) return
+      setQuery(view)
+      if (loadedId.current !== id) {
+        loadedId.current = id
         form.setFieldsValue({
           keyword: view.run.keyword,
-          providers: (view.run.providers ?? [view.run.provider]).filter((id): id is ProviderId =>
-            PROVIDER_OPTIONS.some((item) => item.value === id)
+          providers: (view.run.providers ?? [view.run.provider]).filter((providerId): providerId is ProviderId =>
+            PROVIDER_OPTIONS.some((item) => item.value === providerId)
           ),
           depth: view.run.depth,
           holding_percent: Number(view.run.holding_percent),
         })
+      }
+      if (terminalStatuses.has(view.run.status)) {
+        setQuerying(false)
+        return
+      }
+
+      const source = new EventSource(
+        collectionEventUrl(id, view.relationship_cursor, view.result_cursor),
+      )
+      collectionEventSource.current = source
+      source.addEventListener('delta', (event) => {
+        const delta = JSON.parse((event as MessageEvent).data) as CollectionDelta
+        setQuery((current) => {
+          if (!current || current.run.id !== id) return current
+          return {
+            ...current,
+            investments: mergeInvestments(current.investments, delta.investments),
+            icp_records: mergeIcpRecords(current.icp_records, delta.icp_records),
+            relationship_cursor: Math.max(current.relationship_cursor, delta.relationship_cursor),
+            result_cursor: Math.max(current.result_cursor, delta.result_cursor),
+          }
+        })
       })
-      .catch((error) => setQueryError(error instanceof Error ? error.message : '查询记录不存在'))
-      .finally(() => setQuerying(false))
+      source.addEventListener('progress', (event) => {
+        const run = JSON.parse((event as MessageEvent).data) as Run
+        setQuery((current) => current?.run.id === id ? { ...current, run } : current)
+        setQuerying(!terminalStatuses.has(run.status))
+      })
+      source.addEventListener('done', (event) => {
+        const run = JSON.parse((event as MessageEvent).data) as Run
+        setQuery((current) => current?.run.id === id ? { ...current, run } : current)
+        setQuerying(false)
+        source.close()
+        collectionEventSource.current = null
+        void getQuery(id)
+          .then((finalView) => {
+            if (cancelled) return
+            setQuery(finalView)
+            if (finalView.source_errors.length && finalView.run.status !== 'cancelled') {
+              message.warning('部分数据源未返回结果')
+            }
+          })
+          .catch(() => undefined)
+        void refreshRecents()
+      })
+      source.onerror = () => {
+        // EventSource reconnects automatically. Refresh only the lightweight
+        // run/snapshot on transport recovery rather than polling all rows.
+        void getQuery(id)
+          .then((next) => {
+            if (!cancelled) setQuery(next)
+          })
+          .catch(() => undefined)
+      }
+    }
+
+    void load().catch((error) => {
+      if (cancelled) return
+      setQuerying(false)
+      setQueryError(error instanceof Error ? error.message : '查询记录不存在')
+    })
+
+    return () => {
+      cancelled = true
+      collectionEventSource.current?.close()
+      collectionEventSource.current = null
+    }
   }, [page, form])
 
   const loggedIn = new Set(
@@ -159,19 +279,29 @@ function Workbench({
       return
     }
     setQuerying(true)
+    setQuery(null)
     setQueryError(null)
+    loadedId.current = null
     try {
-      const view = await runQuery(values)
-      loadedId.current = view.run.id
-      setQuery(view)
-      if (view.source_errors.length) message.warning('部分数据源未返回结果')
-      navigate(`collection/${view.run.id}`)
+      const created = await createCollectionRun(values)
+      navigate(`collection/${created.id}`)
       void refreshRecents()
     } catch (error) {
-      setQuery(null)
-      setQueryError(error instanceof Error ? error.message : '查询失败')
-    } finally {
       setQuerying(false)
+      setQueryError(error instanceof Error ? error.message : '查询失败')
+    }
+  }
+
+  const cancelCurrentQuery = async () => {
+    if (!query || terminalStatuses.has(query.run.status)) return
+    try {
+      const run = await cancelCollectionRun(query.run.id)
+      setQuery((current) => current?.run.id === run.id ? { ...current, run } : current)
+      setQuerying(false)
+      message.success('查询已停止，现有结果已保留')
+      void refreshRecents()
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '停止查询失败')
     }
   }
 
@@ -237,6 +367,7 @@ function Workbench({
           message.error(error instanceof Error ? error.message : '删除失败')
         }
       }}
+      onCancel={cancelCurrentQuery}
       settings={settings}
     />
   )

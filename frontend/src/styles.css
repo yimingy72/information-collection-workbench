@@ -803,6 +803,23 @@ body,
   justify-content: flex-end;
 }
 
+.subdomain-warning-alert {
+  flex: none;
+  padding: 8px 12px;
+}
+
+/* Keep a large passive-source warning from consuming the result table. The
+   complete warning list is still available by scrolling this compact area. */
+.subdomain-warning-alert .ant-alert-description {
+  max-height: 64px;
+  overflow-y: auto;
+  padding-inline-end: 4px;
+}
+
+.subdomain-warning-alert .ant-alert-description .ant-flex {
+  gap: 0 !important;
+}
+
 .subdomain-result-toolbar {
   flex: none;
 }

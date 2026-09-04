@@ -158,3 +158,29 @@ async def test_incomplete_result_is_never_cached():
     repo = CacheRepo()
     await miit._store_icp_cache(repo, "示例公司", [icp_row()], reported_total=2)
     assert repo.cache_writes == []
+
+
+@pytest.mark.asyncio
+async def test_company_round_reuses_slot_without_waiting_for_slowest_company():
+    import asyncio
+
+    release_slow = asyncio.Event()
+    next_started = asyncio.Event()
+    started = []
+
+    async def collect(name):
+        started.append(name)
+        if name == "slow":
+            await release_slow.wait()
+        if name == "next":
+            next_started.set()
+        return None
+
+    task = asyncio.create_task(
+        miit._run_company_round(["slow", "fast", "next"], 2, collect)
+    )
+    await asyncio.wait_for(next_started.wait(), timeout=1)
+    assert started == ["slow", "fast", "next"]
+    assert not task.done()
+    release_slow.set()
+    assert await task == [("slow", None), ("fast", None), ("next", None)]
