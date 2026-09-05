@@ -26,6 +26,7 @@ import locale
 from contextlib import asynccontextmanager
 from load_config import config
 from cachetools import TTLCache
+from urllib.parse import urlsplit, urlunsplit, quote
 import ymicp_jsl
 
 ssl._create_default_https_context = ssl._create_unverified_context()
@@ -100,6 +101,27 @@ def get_local_ipv6_addresses():
     return list(dict.fromkeys(addresses))
 
 
+
+def _proxy_with_lane(proxy, session_key=""):
+    """Pin SeaMoon CONNECT tunnels to one cloud function via proxy user."""
+    if not proxy or not session_key:
+        return proxy
+    try:
+        parsed = urlsplit(proxy)
+    except ValueError:
+        return proxy
+    if parsed.username:
+        return proxy
+    if parsed.hostname not in {"seamoon-gateway", "127.0.0.1", "localhost"}:
+        return proxy
+    lane = quote(str(session_key), safe="-_")
+    host = parsed.hostname
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    netloc = f"{lane}:{lane}@{host}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+
 class beian:
     def __init__(self):
         self.typj = {
@@ -146,7 +168,7 @@ class beian:
         self._token_cache = {}
         self.check_img_cache = {}
         self.check_img_lock = asyncio.Lock()
-        self.timeout = aiohttp.ClientTimeout(total=getattr(getattr(config, 'system', object()), 'http_client_timeout', 30))
+        self.timeout = aiohttp.ClientTimeout(total=max(40, int(getattr(getattr(config, 'system', object()), 'http_client_timeout', 30) or 30)))
         self.local_ipv6_addresses = get_local_ipv6_addresses() if getattr(getattr(getattr(config, 'proxy', object()), 'local_ipv6_pool', object()), 'enable', False) else []
         self.ipv6_index = 0
 
@@ -177,7 +199,7 @@ class beian:
         # WebSocket tunnel and cloud-function exit for the complete pagination.
         self._page_sessions = {}
         self._page_sessions_lock = asyncio.Lock()
-        self._page_session_ttl = 45
+        self._page_session_ttl = 180
         self._page_session_limit = 100
 
     # Bug 5 修复：异步黑名单操作方法
@@ -310,6 +332,7 @@ class beian:
             logger.debug(f"关闭分页会话失败：{exc}")
 
     async def _get_page_session(self, session_key, proxy=""):
+        proxy = _proxy_with_lane(proxy, session_key)
         now = time.monotonic()
         stale = []
         async with self._page_sessions_lock:
@@ -363,6 +386,7 @@ class beian:
         # Keep clearance and token state scoped to the same YMICP page session.
         # The proxy URL itself is a shared logical address and does not identify
         # the actual cloud-function egress IP.
+        proxy = _proxy_with_lane(proxy, session_key)
         cache_key = session_key or proxy or "direct"
         base_header = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/101.0.4951.41 Safari/537.36 Edg/101.0.1210.32",
@@ -646,6 +670,7 @@ class beian:
         info["pageSize"] = pageSize
         info["unitName"] = name
         use_captcha = getattr(getattr(config, 'captcha', object()), 'enable', False)
+        proxy = _proxy_with_lane(proxy, session_key)
         state = await self._get_page_session(session_key, proxy) if session_key else None
 
         async def query_with_session(session, cached_auth=None):
@@ -747,6 +772,9 @@ class beian:
                 return False, "当前访问已被创宇盾拦截"
 
             result = ujson.loads(res)
+        except asyncio.CancelledError:
+            # Outer HTTP timeout should not destroy a still-warming lane.
+            raise
         except Exception:
             if state is not None:
                 await self._close_page_session(session_key, state)
@@ -814,16 +842,9 @@ class beian:
             result["params"]["list"] = detailed_list
             logger.info(f"并发详情完成，总计 {len(detailed_list)} 条")
 
-        if state is not None:
-            params = result.get("params", {}) if isinstance(result, dict) else {}
-            try:
-                current_page = int(pageNum or 1)
-                page_count = max(1, int(params.get("pages") or 1))
-            except (TypeError, ValueError):
-                current_page = 1
-                page_count = 1
-            if result.get("code") not in (200, 0) or current_page >= page_count:
-                await self._close_page_session(session_key, state)
+        # Keep the warm SeaMoon tunnel after a successful last page. Closing
+        # here forced the next company on the same lane to pay JSL+captcha
+        # again and burned the 14s page budget. TTL / rotate still recycle it.
 
         return True, result
 

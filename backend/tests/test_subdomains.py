@@ -496,3 +496,68 @@ async def test_multiple_roots_are_processed_with_a_bounded_pool(monkeypatch):
     )
 
     assert 1 < peak <= subdomains.ROOT_CONCURRENCY
+
+
+@pytest.mark.asyncio
+async def test_certspotter_resolves_relative_next_link():
+    import asyncio
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        page = len(calls)
+        headers = {}
+        if page == 1:
+            headers["link"] = '</v1/issuances?after=1&domain=example.com&expand=dns_names&include_subdomains=true>; rel="next"'
+        return httpx.Response(
+            200,
+            headers=headers,
+            json=[{"dns_names": [f"page{page}.example.com"]}],
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await subdomains.collect_certspotter(client, "example.com")
+
+    assert result == {"page1.example.com", "page2.example.com"}
+    assert calls[1].startswith("https://api.certspotter.com/v1/issuances?")
+
+
+@pytest.mark.asyncio
+async def test_passive_source_uses_proxy_fallback_after_direct_connect_failure():
+    direct_calls = 0
+    proxy_calls = 0
+
+    def direct_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal direct_calls
+        direct_calls += 1
+        raise httpx.ConnectError("TLS path unavailable", request=request)
+
+    def proxy_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal proxy_calls
+        proxy_calls += 1
+        return httpx.Response(200, json=[{"dns_names": ["api.example.com"]}])
+
+    class Repo:
+        async def get_subdomain_source_cache(self, _domain, _source):
+            return None
+
+        async def set_subdomain_source_cache(self, *_args):
+            return None
+
+    async def collect(client, domain):
+        return await subdomains.collect_certspotter(client, domain)
+
+    async with (
+        httpx.AsyncClient(transport=httpx.MockTransport(direct_handler)) as direct,
+        httpx.AsyncClient(transport=httpx.MockTransport(proxy_handler)) as proxy,
+    ):
+        name, hosts, error = await subdomains._call_source(
+            Repo(), "CertSpotter", collect, direct, "example.com", fallback_client=proxy
+        )
+
+    assert name == "CertSpotter"
+    assert hosts == {"api.example.com"}
+    assert error == ""
+    assert direct_calls == 1
+    assert proxy_calls == 1

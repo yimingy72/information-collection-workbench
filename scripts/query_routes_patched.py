@@ -16,10 +16,12 @@ routes = web.RouteTableDef()
 ALLOWED_PROXY = os.getenv("SEAMOON_PROXY_URL", "http://seamoon-gateway:19080").strip()
 PROXY_CONTROL_TOKEN = os.getenv("SEAMOON_PROXY_CONTROL_TOKEN", "asset-workbench-local").strip()
 SESSION_KEY_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
-# Keep the YMICP handler below the backend's 10-second page hard timeout.
-# This prevents a slow upstream/proxy operation from continuing in the
-# background after the backend has already moved to the next proxy/page.
-QUERY_HARD_TIMEOUT_SECONDS = float(os.getenv("YMICP_QUERY_HARD_TIMEOUT_SECONDS", "9"))
+# Keep the YMICP handler just below the backend cold-page timeout (90s).
+# Cold SeaMoon sessions need JSL + captcha + query; 48s still 504ed the first
+# handshake and forced every lane into a timeout/retry storm.
+QUERY_HARD_TIMEOUT_SECONDS = float(os.getenv("YMICP_QUERY_HARD_TIMEOUT_SECONDS", "88"))
+_INFLIGHT_QUERIES: dict[tuple[str, str, str, int], asyncio.Task] = {}
+_INFLIGHT_LOCK = asyncio.Lock()
 
 
 def _valid_proxy_url(value: str) -> bool:
@@ -74,43 +76,74 @@ async def geturl(request):
         # The backend may pass a tested manual proxy. Keep the existing
         # SeaMoon allow-list for ordinary callers, while requiring an
         # internal control token for manually configured routes.
-        if proxy != ALLOWED_PROXY and request.headers.get("X-Workbench-Proxy-Token", "") != PROXY_CONTROL_TOKEN:
+        allowed_host = urlsplit(ALLOWED_PROXY).hostname
+        proxy_host = urlsplit(proxy).hostname
+        same_gateway = bool(allowed_host) and proxy_host == allowed_host and urlsplit(proxy).port == urlsplit(ALLOWED_PROXY).port
+        if proxy != ALLOWED_PROXY and not same_gateway and request.headers.get("X-Workbench-Proxy-Token", "") != PROXY_CONTROL_TOKEN:
             return wj({"code": 101, "msg": "不允许的代理地址"})
 
-    try:
-        async with asyncio.timeout(max(0.1, QUERY_HARD_TIMEOUT_SECONDS)):
-            for _ in range(config.captcha.retry_times):
-                if path in appth:
-                    kwargs = {"proxy": proxy}
-                    if path == "web" and session_key:
-                        kwargs["session_key"] = session_key
-                    result = await appth[path](appname, page_num, page_size, **kwargs)
-                else:
-                    result = await bappth[path](appname, proxy=proxy)
+    async def run_query():
+        result = None
+        for _ in range(config.captcha.retry_times):
+            if path in appth:
+                kwargs = {"proxy": proxy}
+                if path == "web" and session_key:
+                    kwargs["session_key"] = session_key
+                result = await appth[path](appname, page_num, page_size, **kwargs)
+            else:
+                result = await bappth[path](appname, proxy=proxy)
 
-                if result.get("code", 500) == 200:
-                    save_history = (
-                        getattr(config, 'history', None)
-                        and getattr(config.history, 'save_query_history', True)
-                    )
-                    if save_history:
-                        db = request.app.get("db")
-                        if db:
-                            result_count = (
-                                len(result.get("params", {}).get("list", []))
-                                if path in appth
-                                else len(result.get("params", []))
-                            )
-                            db.add_history(path, appname, result_count, result.get("params"))
-                    return wj(result)
-                if result.get("message", "") == "当前访问已被创宇盾拦截":
-                    logger.warning("当前访问已被创宇盾拦截")
-                    return wj(result)
-                await asyncio.sleep(1)
-            return wj(result)
+            if result.get("code", 500) == 200:
+                save_history = (
+                    getattr(config, 'history', None)
+                    and getattr(config.history, 'save_query_history', True)
+                )
+                if save_history:
+                    db = request.app.get("db")
+                    if db:
+                        result_count = (
+                            len(result.get("params", {}).get("list", []))
+                            if path in appth
+                            else len(result.get("params", []))
+                        )
+                        db.add_history(path, appname, result_count, result.get("params"))
+                return result
+            if result.get("message", "") == "当前访问已被创宇盾拦截":
+                logger.warning("当前访问已被创宇盾拦截")
+                return result
+            await asyncio.sleep(1)
+        return result
+
+    # Do not cancel an in-flight JSL/captcha handshake just because the HTTP
+    # caller hit 34s. A later retry for the same lane/company/page waits on
+    # that task instead of starting a second query that trips 创宇盾.
+    inflight_key = (session_key or "", path, str(appname), int(page_num or 1) if path in appth else 1)
+    async with _INFLIGHT_LOCK:
+        task = _INFLIGHT_QUERIES.get(inflight_key)
+        if task is None or task.done():
+            task = asyncio.create_task(run_query())
+            _INFLIGHT_QUERIES[inflight_key] = task
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.1, QUERY_HARD_TIMEOUT_SECONDS))
     except TimeoutError:
-        logger.warning("ICP page timed out after %.1fs: %s page=%s", QUERY_HARD_TIMEOUT_SECONDS, appname, page_num)
+        logger.warning(
+            "ICP page timed out after %.1fs: %s page=%s; handshake continues on %s",
+            QUERY_HARD_TIMEOUT_SECONDS,
+            appname,
+            page_num,
+            session_key or "no-session",
+        )
         return wj({"code": 504, "message": "ICP 页面请求超时"})
+    except Exception:
+        if not task.done():
+            task.cancel()
+        raise
+    finally:
+        async with _INFLIGHT_LOCK:
+            current = _INFLIGHT_QUERIES.get(inflight_key)
+            if current is task and task.done():
+                _INFLIGHT_QUERIES.pop(inflight_key, None)
+    return wj(result)
 
 
 def setup_query_routes(app):

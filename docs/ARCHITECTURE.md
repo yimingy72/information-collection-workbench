@@ -40,6 +40,8 @@
 
 - 多个主域名以最多 `ROOT_CONCURRENCY=3` 个根任务并发处理；总 DNS 并发和 HTTP 并发仍分别受 `DNS_CONCURRENCY`、`HTTP_CONCURRENCY` 限制，避免把单域名优化成全局洪峰。
 - `subdomain_source_cache` 缓存被动来源；数据库结果使用 `(run_id, root_domain, hostname)` 去重。
+- 被动来源先走容器直连；遇到连接/超时、403、429 或 5xx 时，若已配置并验证手动代理或 SeaMoon 路由，则立即通过代理重试，不等待下一轮。DNS 解析和发现主机的 HTTP 探测不自动改走该兜底代理。
+- CertSpotter 的分页 `Link` 既支持绝对地址也支持相对地址，会先解析为完整 URL，避免第二页出现 `unknown url type`。
 - `027_subdomain_result_stream.sql` 为结果增加单调递增变更游标，避免“先展示 DNS、后补充 HTTP”时前端长期看不到更新。
 
 ## ICP 企业级缓存
@@ -66,30 +68,31 @@
 
 ```text
 PAGE_SIZE                       = 26
-ICP_PAGINATION_RECOVERY_PASSES = 2
+ICP_PAGINATION_RECOVERY_PASSES = 1
 ICP_EMPTY_RESULT_RECOVERY_PASSES = 1
 ICP_BATCH_SIZE                  = 5
 ICP_CONCURRENCY                 = 40
 ICP_PROXY_REQUEST_LIMIT         = 5
 ICP_PROXY_WAF_RETRIES           = 2
 ICP_PROXY_ERROR_RETRIES         = 1
-ICP_PAGE_TIMEOUT_SECONDS        = 10
-ICP_COMPANY_TIMEOUT_SECONDS     = 30
-ICP_COMPANY_MAX_ATTEMPTS        = 3
-ICP_COMPANY_RETRY_BACKOFF_SECONDS = 2
+ICP_PAGE_TIMEOUT_SECONDS        = 36
+ICP_COMPANY_TIMEOUT_SECONDS     = 80
+ICP_COMPANY_MAX_ATTEMPTS        = 2
+ICP_COMPANY_RETRY_BACKOFF_SECONDS = 0.5
+INVEST_CONCURRENCY              = 12
 ```
 
 算法：
 
-1. 为每个分页轮次生成新的 `sessionKey`。
-2. 同一轮的所有页在 YMICP 中复用短期会话和认证上下文。
+1. 云函数按就绪节点分配固定 `lane_{slot}_{generation}` 会话；同一通道的多家企业复用热隧道。
+2. 同一通道内的分页和连续查询复用 YMICP 认证上下文，直到创宇盾/传输失败才提升 generation。
 3. 解析每页的 `list`、`pages` 和 `total`。
 4. 对不同轮次的记录按 `domain + serviceLicence` 合并；域名为空时退化使用 `mainLicence`、`mainId` 或企业名称。
 5. 唯一记录数等于 `total` 时立即结束并写入数据库。
 6. 超过 `total` 时报告结果不一致；恢复轮次耗尽仍不足时报告结果不完整。
-7. 单页始终受10秒双重硬超时约束，每次企业级尝试受30秒预算约束。
+7. 单页始终受36秒双重硬超时约束（覆盖冷启动 JSL+验证码）；每次企业级尝试受80秒预算约束。同一云函数通道在 5 次查询后暂停 12 秒，不重建隧道。
 8. `total=0` 或已返回有效记录时立即结束；正数 `total` 但空列表仅执行1次快速恢复。
-9. 一轮完成后只重新调度失败企业，默认最多执行3次企业级尝试，轮次间线性退避；每次尝试从新的分页会话开始。
+9. 一轮完成后只重新调度失败企业，默认最多执行2次企业级尝试，轮次间短退避；每次尝试从新的分页会话开始。
 10. 同一轮使用滚动信号量维护并发槽位，快速企业释放槽位后立即启动下一家，不再按固定切片等待最慢企业完成。
 
 结果在确认完整前保存在内存集合中，避免把已知不完整的企业分页静默保存为成功结果。数据库同时使用唯一索引防止重复写入。
@@ -106,7 +109,8 @@ ICP_COMPANY_RETRY_BACKOFF_SECONDS = 2
 - 每家企业拥有独立分页会话；云函数路由代次变化时会为当前页切换到新的会话键。单个手动代理保持同一分页会话，不套用云函数代次轮换。
 - 云函数批次不使用直连出口的12秒全局冷却；传输错误只做1次页面级快速换隧道，后续交给企业级重试。
 - 云函数单实例并发6，保留1个槽位。
-- 一个代理 TCP 连接对应一个 WebSocket 隧道；单个 FC 函数地址仍不保证获得不同的公网出口IP。
+- 一个代理 TCP 连接对应一个 WebSocket 隧道；单个 FC 函数地址仍不保证获得不同的公网出口IP。同一函数在并发升高时由云平台复用或新建容器，最小实例为 0 时第一次请求可能冷启动。
+- 平台扩容先加不同地域的函数；地域用尽后才在健康地域部署 `function-r2` 这类副本。网关单次握手最多尝试 2 个节点，握手超时 12 秒，避免把整池冷启动失败叠加到一次 ICP 页面请求上。
 
 ### 手动代理路由
 

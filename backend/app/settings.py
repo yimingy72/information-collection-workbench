@@ -6,8 +6,8 @@ class Settings(BaseSettings):
     tianyancha_base_url: str = "https://capi.tianyancha.com"
     miit_api_url: str = "http://127.0.0.1:16181"
     icp_proxy_control_token: str = "asset-workbench-local"
-    icp_company_max_attempts: int = 3
-    icp_company_retry_backoff_seconds: float = 2.0
+    icp_company_max_attempts: int = 2
+    icp_company_retry_backoff_seconds: float = 0.5
     icp_cache_enabled: bool = True
     icp_cache_ttl_hours: int = 24
     icp_zero_cache_ttl_hours: int = 6

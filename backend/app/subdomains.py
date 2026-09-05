@@ -201,7 +201,12 @@ async def collect_certspotter(client: httpx.AsyncClient, domain: str) -> set[str
                 host = _candidate(str(value), domain)
                 if host:
                     found.add(host)
-        next_url = _next_link(response)
+        next_link = _next_link(response)
+        # CertSpotter currently returns a relative Link header (for example
+        # ``</v1/issuances?...>; rel=next``). httpx cannot request that path
+        # without a base URL, so resolve it against the response URL before the
+        # next page. This also supports absolute links from older responses.
+        next_url = urljoin(str(response.url), next_link) if next_link else None
         params = None
         if not next_url:
             break
@@ -580,6 +585,8 @@ async def _call_source(
     function: Callable[[httpx.AsyncClient, str], Awaitable[set[str]]],
     client: httpx.AsyncClient,
     domain: str,
+    *,
+    fallback_client: httpx.AsyncClient | None = None,
 ) -> tuple[str, set[str], str]:
     cached = await repo.get_subdomain_source_cache(domain, name)
     if cached is not None:
@@ -596,7 +603,32 @@ async def _call_source(
             return name, hosts, ""
         except Exception as exc:  # noqa: BLE001 - a passive source must not stop the run
             detail, retryable, cooldown = _source_error(exc)
-            errors.append(detail)
+            errors.append(f"直连：{detail}")
+
+            # The worker container may not have a usable direct IPv6/TLS path
+            # to public passive APIs even while the host can reach them. If a
+            # tested SeaMoon/manual route exists, try it immediately instead
+            # of waiting for another direct retry. This is fallback-only: it
+            # does not proxy DNS resolution or HTTP probing of discovered hosts.
+            fallback_allowed = fallback_client is not None and (
+                isinstance(exc, (httpx.RequestError, httpx.TimeoutException, asyncio.TimeoutError))
+                or (
+                    isinstance(exc, httpx.HTTPStatusError)
+                    and exc.response.status_code in {403, 429, *range(500, 600)}
+                )
+            )
+            if fallback_allowed:
+                try:
+                    async with asyncio.timeout(PASSIVE_TIMEOUT):
+                        hosts = await function(fallback_client, domain)
+                    await repo.set_subdomain_source_cache(domain, name, sorted(hosts))
+                    return name, hosts, ""
+                except Exception as fallback_exc:  # noqa: BLE001 - keep source isolated
+                    fallback_detail, fallback_retryable, fallback_cooldown = _source_error(fallback_exc)
+                    errors.append(f"代理兜底：{fallback_detail}")
+                    retryable = retryable or fallback_retryable
+                    cooldown = max(cooldown, fallback_cooldown)
+
             if cooldown:
                 await SOURCE_THROTTLE.cool_down(name, cooldown)
             if not retryable or attempt >= PASSIVE_ATTEMPTS:
@@ -742,6 +774,28 @@ async def collect_subdomains(
             headers=headers,
         ) as probe_client,
     ):
+        runtime_config = (
+            await repo.get_runtime_config()
+            if getattr(repo, "get_runtime_config", None) is not None
+            else {}
+        )
+        try:
+            from app.serverless_proxy import miit_proxy_urls
+            proxy_routes = miit_proxy_urls(runtime_config)
+        except Exception:  # noqa: BLE001 - proxy fallback is optional
+            proxy_routes = []
+        fallback_proxy = next((value for value in proxy_routes if value), "")
+        passive_proxy_client = (
+            httpx.AsyncClient(
+                proxy=fallback_proxy,
+                timeout=passive_timeout,
+                follow_redirects=False,
+                trust_env=False,
+                headers=headers,
+            )
+            if fallback_proxy
+            else None
+        )
 
         async def process_root(root: str) -> list[str]:
             root_warnings: list[str] = []
@@ -765,6 +819,7 @@ async def collect_subdomains(
                             globals()[function_name],
                             passive_client,
                             root,
+                            fallback_client=passive_proxy_client,
                         )
                     )
                     for source_name, function_name in PASSIVE_SOURCES
@@ -917,11 +972,15 @@ async def collect_subdomains(
                 detail = " ".join(str(exc).split())[:240] or type(exc).__name__
                 return [f"{root}：查询失败：{detail}"]
 
-        root_warnings = await asyncio.gather(
-            *(process_root_safely(root) for root in domains)
-        )
-        for values in root_warnings:
-            warnings.extend(values)
+        try:
+            root_warnings = await asyncio.gather(
+                *(process_root_safely(root) for root in domains)
+            )
+            for values in root_warnings:
+                warnings.extend(values)
+        finally:
+            if passive_proxy_client is not None:
+                await passive_proxy_client.aclose()
 
     await report_progress("completed", force=True)
     return list(dict.fromkeys(warnings))

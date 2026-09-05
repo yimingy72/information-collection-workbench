@@ -92,6 +92,8 @@ class AnonymousTianyancha:
             "Referer": "https://www.tianyancha.com/",
         }
         self.client = self._make_client()
+        self._client_lock = asyncio.Lock()
+        self._retired_clients: list[httpx.AsyncClient] = []
         self.retries = max(0, retries)
         # After one query has exhausted its immediate attempts, the collector
         # retries only that failed company once at the end of the queue.
@@ -116,14 +118,21 @@ class AnonymousTianyancha:
         # A new client also resets a stale keep-alive connection. With several
         # routes, advance to the next exit; with one route, simply recreate the
         # connection without pretending the public IP changed.
-        previous = self.client
-        if len(self._proxy_routes) > 1:
-            self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
-        self.client = self._make_client()
-        await previous.aclose()
+        # Do not close the previous client immediately: concurrent investment
+        # requests may still be reading from it.
+        async with self._client_lock:
+            previous = self.client
+            if len(self._proxy_routes) > 1:
+                self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
+            self.client = self._make_client()
+            self._retired_clients.append(previous)
 
     async def close(self) -> None:
-        await self.client.aclose()
+        async with self._client_lock:
+            clients = [self.client, *self._retired_clients]
+            self._retired_clients = []
+        for client in clients:
+            await client.aclose()
 
     async def reset_after_failure(self) -> None:
         """Open a fresh proxy tunnel before retrying only the failed company."""
@@ -134,7 +143,8 @@ class AnonymousTianyancha:
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
-                response = await self.client.request(method, path, **kwargs)
+                client = self.client
+                response = await client.request(method, path, **kwargs)
                 if response.status_code in {403, 429, 433, 500, 501, 502, 503, 504, 521}:
                     raise ProviderError(f"Tianyancha request rejected (HTTP {response.status_code})")
                 response.raise_for_status()

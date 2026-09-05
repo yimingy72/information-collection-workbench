@@ -295,6 +295,122 @@ async def test_ensure_icp_node_pool_deploys_only_missing_regions(monkeypatch):
     assert len(repo.updated["nodes"]) == 4
 
 
+@pytest.mark.asyncio
+async def test_ensure_icp_node_pool_adds_same_region_replicas(monkeypatch):
+    import app.serverless_proxy as proxy
+
+    regions = ["cn-hangzhou", "cn-shanghai", "cn-beijing"]
+    base = config(
+        enabled=True,
+        endpoint="https://hangzhou.example",
+        access_key_id="ak",
+        access_key_secret="secret",
+        nodes=[
+            {
+                "id": f"aliyun:{region}:asset-workbench-seamoon",
+                "enabled": True,
+                "provider": "aliyun",
+                "endpoint": f"https://{region}.example",
+                "region": region,
+                "function_name": "asset-workbench-seamoon",
+                "status": "ready",
+            }
+            for region in regions
+        ],
+    )["serverless_proxy"]
+
+    class Repo:
+        def __init__(self):
+            self.row = base
+            self.updated = None
+
+        async def get_runtime_config(self):
+            return {"serverless_proxy": self.row, "manual_proxies": []}
+
+        async def update_serverless_proxy(self, payload):
+            self.row = payload
+            self.updated = payload
+            return payload
+
+        async def set_serverless_proxy_status(self, *_args, **_kwargs):
+            return self.row
+
+    deployed = []
+
+    async def fake_deploy(_action, cfg):
+        deployed.append((cfg["region"], cfg["function_name"]))
+        return {
+            "endpoint": f"https://{cfg['region']}-{cfg['function_name']}.example",
+            "deployment_id": cfg["function_name"],
+        }
+
+    async def fake_configure(*_args, **_kwargs):
+        return None
+
+    async def fake_test(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(proxy.settings, "icp_target_seconds", 300)
+    monkeypatch.setattr(proxy.settings, "icp_auto_scale_companies_per_node", 160)
+    monkeypatch.setattr(proxy.settings, "icp_auto_scale_max_nodes", 8)
+    monkeypatch.setattr(proxy.settings, "icp_auto_scale_regions", ",".join(regions))
+    monkeypatch.setattr(proxy, "run_cloud_operation", fake_deploy)
+    monkeypatch.setattr(proxy, "test_serverless_proxy", fake_test)
+    monkeypatch.setattr(proxy, "configure_gateway", fake_configure)
+
+    result = await proxy.ensure_icp_node_pool(Repo(), 640)
+
+    assert result["target"] == 4
+    assert result["deployed"] == 1
+    assert deployed == [("cn-hangzhou", "asset-workbench-seamoon-r2")]
+
+
+def test_auto_scale_candidates_prefer_new_regions_then_replicas(monkeypatch):
+    import app.serverless_proxy as proxy
+
+    monkeypatch.setattr(
+        proxy.settings,
+        "icp_auto_scale_regions",
+        "cn-hangzhou,cn-shanghai,cn-beijing",
+    )
+    monkeypatch.setattr(proxy.settings, "icp_auto_scale_excluded_regions", "")
+
+    nodes = [
+        {
+            "id": "aliyun:cn-hangzhou:asset-workbench-seamoon",
+            "region": "cn-hangzhou",
+            "function_name": "asset-workbench-seamoon",
+            "enabled": True,
+            "status": "ready",
+            "endpoint": "https://hangzhou.example",
+        },
+        {
+            "id": "aliyun:cn-qingdao:asset-workbench-seamoon",
+            "region": "cn-qingdao",
+            "function_name": "asset-workbench-seamoon",
+            "enabled": False,
+            "status": "error",
+            "endpoint": "https://qingdao.example",
+        },
+    ]
+    candidates = proxy._auto_scale_candidates(
+        nodes,
+        "aliyun",
+        "asset-workbench-seamoon",
+        3,
+    )
+    assert [item["function_name"] for item in candidates] == [
+        "asset-workbench-seamoon",
+        "asset-workbench-seamoon",
+        "asset-workbench-seamoon-r2",
+    ]
+    assert [item["region"] for item in candidates] == [
+        "cn-shanghai",
+        "cn-beijing",
+        "cn-hangzhou",
+    ]
+
+
 def test_auto_scale_regions_excludes_configured_regions(monkeypatch):
     import app.serverless_proxy as proxy
 

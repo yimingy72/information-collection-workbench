@@ -119,6 +119,7 @@ def test_holding_filter_and_depth_with_fake_provider(monkeypatch):
     provider, repo = FakeProvider(), FakeRepo()
     import app.collector as collector
     monkeypatch.setattr(collector, "collect_icp", _no_icp)
+    monkeypatch.setattr(collector, "collect_icp_from_queue", _no_icp)
     asyncio.run(collect_run(repo, [provider], RunSpec(uuid4(), "root", 2, 51, ["invest"])))
     assert ("partner", "1") not in provider.calls
     assert {item[5] for item in repo.relationships} == {1, 2}
@@ -131,10 +132,82 @@ def test_holding_filter_and_depth_with_fake_provider(monkeypatch):
 
 
 
+@pytest.mark.asyncio
+async def test_investment_traversal_visits_siblings_concurrently(monkeypatch):
+    import app.collector as collector
+
+    monkeypatch.setattr(collector, "collect_icp", _no_icp)
+    monkeypatch.setattr(collector, "collect_icp_from_queue", _no_icp)
+    monkeypatch.setattr(collector, "INVEST_CONCURRENCY", 4)
+    started = {"2": asyncio.Event(), "3": asyncio.Event()}
+    overlap = False
+
+    class FakeProvider:
+        id = "tianyancha"
+        label = "天眼查"
+        failed_company_retries = 0
+
+        def __init__(self):
+            self.client = type("Client", (), {"base_url": "https://example.test"})()
+
+        async def search(self, keyword):
+            root = Company("1", keyword, {"id": "1", "name": keyword})
+            return root, [root]
+
+        async def all_pages(self, fetch):
+            rows, _ = await fetch(1)
+            return rows
+
+        async def investments(self, external_id, page=1):
+            nonlocal overlap
+            if external_id == "1":
+                return [
+                    Investment("一级企业A", "2", 100, {"id": "2", "name": "一级企业A", "percent": 100}),
+                    Investment("一级企业B", "3", 100, {"id": "3", "name": "一级企业B", "percent": 100}),
+                ], 2
+            started[external_id].set()
+            other = "3" if external_id == "2" else "2"
+            await asyncio.wait_for(started[other].wait(), timeout=1)
+            overlap = True
+            return [], 0
+
+    class FakeRepo:
+        def __init__(self):
+            self.entities = {}
+            self.relationships = []
+            self.results = []
+
+        async def upsert_entity(self, provider, external_id, name, payload):
+            self.entities.setdefault(external_id, uuid4())
+            return self.entities[external_id]
+
+        async def add_result(self, *args):
+            self.results.append(args)
+
+        async def add_relationship(self, *args):
+            self.relationships.append(args)
+
+        async def heartbeat(self, *args, **kwargs):
+            pass
+
+        async def has_results(self, run_id):
+            return bool(self.results or self.relationships)
+
+        async def entity_names_for_run(self, run_id):
+            return ["root", "一级企业A", "一级企业B"]
+
+    errors = await collect_run(
+        FakeRepo(), [FakeProvider()], RunSpec(uuid4(), "root", 2, 100, ["invest"])
+    )
+    assert errors == []
+    assert overlap is True
+
+
 def test_failed_child_company_is_retried_without_requerying_parent(monkeypatch):
     import app.collector as collector
 
     monkeypatch.setattr(collector, "collect_icp", _no_icp)
+    monkeypatch.setattr(collector, "collect_icp_from_queue", _no_icp)
 
     class FakeProvider:
         id = "tianyancha"
@@ -204,7 +277,11 @@ def test_failed_child_company_is_retried_without_requerying_parent(monkeypatch):
     )
 
     assert errors == []
-    assert provider.calls == ["1", "2", "3", "2"]
+    assert provider.calls[0] == "1"
+    assert provider.calls.count("1") == 1
+    assert provider.calls.count("2") == 2
+    assert provider.calls.count("3") == 1
+    assert set(provider.calls) == {"1", "2", "3"}
     assert provider.resets == 1
     assert len(repo.relationships) == 3
     assert {item[2] for item in repo.relationships} == {
@@ -221,11 +298,21 @@ async def test_icp_starts_while_investment_traversal_is_running(monkeypatch):
     icp_names = []
 
     async def fake_icp(_repo, _run_id, names):
-        icp_names.extend(names)
-        icp_started.set()
+        if hasattr(names, "get"):
+            while True:
+                item = await names.get()
+                if item is None:
+                    break
+                icp_names.append(item)
+                icp_started.set()
+        else:
+            icp_names.extend(names)
+            icp_started.set()
         return []
 
     monkeypatch.setattr(collector, "collect_icp", fake_icp)
+    monkeypatch.setattr(collector, "collect_icp_from_queue", fake_icp)
+    monkeypatch.setattr(collector, "ICP_STREAM_MIN_START", 1)
 
     class FakeProvider:
         id = "tianyancha"
@@ -291,6 +378,7 @@ def test_collect_run_queries_providers_in_parallel(monkeypatch):
     import app.collector as collector
 
     monkeypatch.setattr(collector, "collect_icp", _no_icp)
+    monkeypatch.setattr(collector, "collect_icp_from_queue", _no_icp)
 
     class SlowProvider:
         def __init__(self, provider_id, delay):
@@ -360,12 +448,18 @@ async def test_icp_keepalive_refreshes_run_lease(monkeypatch):
         async def touch_run(self, run_id, lease_id=None):
             touches.append((run_id, lease_id))
 
-    async def slow_icp(_repo, _run_id, _names):
+    async def slow_icp(_repo, _run_id, names):
+        if hasattr(names, "get"):
+            while True:
+                item = await names.get()
+                if item is None:
+                    break
         await asyncio.sleep(0.035)
         return []
 
     monkeypatch.setattr(collector, "ICP_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(collector, "collect_icp", slow_icp)
+    monkeypatch.setattr(collector, "collect_icp_from_queue", slow_icp)
     spec = RunSpec(uuid4(), "root", 1, 100, ["invest"], lease_id=uuid4())
 
     assert await collector._collect_icp_with_heartbeat(Repo(), spec, ["root"]) == []
@@ -477,9 +571,10 @@ async def test_icp_direct_multi_page_saves_each_page_without_proxy_lookup(monkey
     monkeypatch.setattr(miit, "_save_icp_page", fake_save)
 
     assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    page_timeout = miit.ICP_PAGE_TIMEOUT_SECONDS
     assert [(item[0], item[1], item[2]) for item in fetch_calls] == [
-        ("测试企业", 1, 10),
-        ("测试企业", 2, 10),
+        ("测试企业", 1, page_timeout),
+        ("测试企业", 2, page_timeout),
     ]
     assert fetch_calls[0][3]
     assert fetch_calls[0][3] == fetch_calls[1][3]
@@ -518,7 +613,7 @@ async def test_icp_direct_failure_retries_company_until_exhausted(monkeypatch):
     assert "请求页面 3 次" in errors[0]
     assert "企业级自动重试 2 次后仍失败" in errors[0]
     assert len(calls) == 3
-    assert all(call[0:2] == (1, 10) for call in calls)
+    assert all(call[0:2] == (1, miit.ICP_PAGE_TIMEOUT_SECONDS) for call in calls)
     assert len({call[2] for call in calls}) == 3
 
 
@@ -778,7 +873,7 @@ async def test_icp_serverless_proxy_is_forwarded_to_local_icp_service(monkeypatc
 
     assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
     assert len(calls) == 1
-    assert calls[0][0:3] == (1, 10, miit.settings.serverless_proxy_miit_url)
+    assert calls[0][0:3] == (1, miit.ICP_PAGE_TIMEOUT_SECONDS, miit.settings.serverless_proxy_miit_url)
     assert calls[0][3]
 
 
@@ -945,7 +1040,7 @@ async def test_icp_cloud_scheduler_does_not_apply_direct_ip_cooldown(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_icp_cloud_queries_are_processed_in_batches_of_five(monkeypatch):
+async def test_icp_cloud_queries_are_processed_one_company_per_node(monkeypatch):
     import app.miit as miit
 
     active = 0
@@ -973,7 +1068,7 @@ async def test_icp_cloud_queries_are_processed_in_batches_of_five(monkeypatch):
     errors = await miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(12)])
 
     assert errors == []
-    assert maximum == 5
+    assert maximum == 1
     assert len(calls) == 12
     assert all(call[2] == miit.settings.serverless_proxy_miit_url for call in calls)
 
@@ -1034,23 +1129,24 @@ async def test_icp_direct_queries_pipeline_independent_companies(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_icp_cloud_rotation_scheduler_changes_generation_after_five_requests():
+async def test_icp_cloud_rotation_scheduler_pauses_without_changing_generation():
     import app.miit as miit
 
-    scheduler = miit._IcpCloudRotationScheduler(5)
+    scheduler = miit._IcpCloudRotationScheduler(5, pause_seconds=0)
     generations = []
     for _ in range(6):
         generation = await scheduler.acquire()
         generations.append(generation)
         await scheduler.release()
 
-    assert generations == [0, 0, 0, 0, 0, 1]
+    assert generations == [0, 0, 0, 0, 0, 0]
     assert scheduler.used == 1
     assert scheduler.active == 0
+    assert scheduler.generation == 0
 
 
 @pytest.mark.asyncio
-async def test_icp_cloud_uses_new_session_key_after_five_actual_requests(monkeypatch):
+async def test_icp_cloud_reuses_session_key_after_five_actual_requests(monkeypatch):
     import app.miit as miit
 
     calls = []
@@ -1066,12 +1162,12 @@ async def test_icp_cloud_uses_new_session_key_after_five_actual_requests(monkeyp
         return {"rows": [], "pages": 1}
 
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
 
     assert await miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(6)]) == []
     assert len(calls) == 6
-    assert [item[3].rsplit("_", 1)[-1] for item in calls] == ["0", "0", "0", "0", "0", "1"]
-    assert calls[5][3] != calls[0][3]
+    assert {item[3] for item in calls} == {"lane_0_0"}
 
 
 @pytest.mark.asyncio
@@ -1134,7 +1230,7 @@ async def test_icp_cloud_waf_exhaustion_enters_company_retry(monkeypatch):
     assert len(calls) == 4
     assert all(call[0] == 1 for call in calls)
     assert all(call[1] == miit.settings.serverless_proxy_miit_url for call in calls)
-    assert len({call[2] for call in calls}) == 4
+    assert [call[2] for call in calls] == ["lane_0_0", "lane_0_1", "lane_0_2", "lane_0_2"]
 
 
 @pytest.mark.asyncio
@@ -1157,6 +1253,7 @@ async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
 
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
 
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
     errors = await asyncio.wait_for(
         miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(5)]),
         timeout=2,
@@ -1166,3 +1263,137 @@ async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
     assert len(calls) == 6
     assert calls[0][1].endswith("_0")
     assert all(item[1].endswith("_1") for item in calls[1:])
+
+
+@pytest.mark.asyncio
+async def test_icp_proxy_pool_skips_pause_when_burst_already_covers_waf_window():
+    import app.miit as miit
+
+    scheduler = miit._IcpProxyPoolScheduler(["http://a"], 2, pause_seconds=0.05)
+    first = await scheduler.acquire()
+    await scheduler.release()
+    await asyncio.sleep(0.06)
+    second = await scheduler.acquire()
+    await scheduler.release()
+    started = asyncio.get_running_loop().time()
+    third = await scheduler.acquire()
+    await scheduler.release()
+    elapsed = asyncio.get_running_loop().time() - started
+    assert [first[1], second[1], third[1]] == [0, 0, 0]
+    assert elapsed < 0.02
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_scheduler_only_pauses_remaining_waf_window():
+    import app.miit as miit
+
+    scheduler = miit._IcpCloudRotationScheduler(2, pause_seconds=0.05)
+    first = await scheduler.acquire()
+    await scheduler.release()
+    await asyncio.sleep(0.02)
+    second = await scheduler.acquire()
+    await scheduler.release()
+    started = asyncio.get_running_loop().time()
+    third = await scheduler.acquire()
+    await scheduler.release()
+    elapsed = asyncio.get_running_loop().time() - started
+    assert [first, second, third] == [0, 0, 0]
+    assert 0.02 <= elapsed < 0.05
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_timeout_keeps_same_lane(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((page, session_key))
+        if len(calls) == 1:
+            raise miit.IcpPageError("请求硬超时（不超过 36 秒）")
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert [item[1] for item in calls] == ["lane_0_0", "lane_0_0"]
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_timeout_does_not_start_company_budget(monkeypatch):
+    import app.miit as miit
+
+    calls = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        calls.append((page, session_key, timeout_seconds))
+        if len(calls) <= 2:
+            raise miit.IcpPageError("请求硬超时（不超过 36 秒）")
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "ICP_COMPANY_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert [item[1] for item in calls] == ["lane_0_0", "lane_0_0", "lane_0_0"]
+    assert calls[0][2] == miit.ICP_PAGE_TIMEOUT_SECONDS
+    assert all(item[2] == miit.ICP_WARM_PAGE_TIMEOUT_SECONDS for item in calls[1:])
+
+
+@pytest.mark.asyncio
+async def test_icp_cloud_timeout_does_not_reacquire_lane(monkeypatch):
+    import app.miit as miit
+
+    acquire_calls = []
+    fetch_calls = []
+
+    class CountingScheduler:
+        def __init__(self, *args, **kwargs):
+            self.used = [0]
+            self.generations = [0]
+            self.active = 0
+
+        async def acquire(self, preferred_index=None):
+            acquire_calls.append(preferred_index)
+            self.active += 1
+            self.used[0] += 1
+            return "http://seamoon-gateway:19080", 0, 0
+
+        async def release(self):
+            self.active = max(0, self.active - 1)
+
+        async def rotate(self, index, generation):
+            self.generations[index] += 1
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fake_fetch(
+        _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
+    ):
+        fetch_calls.append(session_key)
+        if len(fetch_calls) == 1:
+            raise miit.IcpPageError("请求硬超时（不超过 36 秒）")
+        return {"rows": [], "pages": 1, "total": 0}
+
+    monkeypatch.setattr(miit, "_IcpProxyPoolScheduler", CountingScheduler)
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+    assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
+    assert acquire_calls == [None]
+    assert fetch_calls == ["lane_0_0", "lane_0_0"]

@@ -60,7 +60,7 @@ async def _solve_clearance(session: aiohttp.ClientSession, proxy: str = "") -> s
     for _ in range(5):
         if cookies:
             headers["Cookie"] = _join_cookies(cookies)
-        async with session.get(HOME_URL, headers=headers, proxy=proxy or None, timeout=15) as response:
+        async with session.get(HOME_URL, headers=headers, proxy=proxy or None, timeout=20) as response:
             text = await response.text()
             set_cookie = response.headers.get("set-cookie")
             if set_cookie:

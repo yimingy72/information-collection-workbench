@@ -1,17 +1,21 @@
 package gateway
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -190,8 +194,22 @@ func (g *Gateway) handle(client net.Conn) {
 		_, _ = io.WriteString(client, "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 37\r\n\r\nSeaMoon cloud function is not enabled")
 		return
 	}
+	buffered := bufio.NewReader(client)
+	request, err := http.ReadRequest(buffered)
+	if err != nil {
+		return
+	}
+	raw, err := captureProxyRequest(request)
+	if err != nil {
+		return
+	}
+	start := g.endpointStart(config.Endpoints, request)
+	available := g.availableEndpoints(config.Endpoints, start, time.Now())
+	if len(available) > 1 {
+		available = available[:1]
+	}
 	dialer := websocket.Dialer{
-		HandshakeTimeout: 5 * time.Second,
+		HandshakeTimeout: 12 * time.Second,
 		ReadBufferSize:   32 * 1024,
 		WriteBufferSize:  32 * 1024,
 		TLSClientConfig: &tls.Config{ // #nosec G402 -- explicit user-controlled compatibility option.
@@ -199,14 +217,16 @@ func (g *Gateway) handle(client net.Conn) {
 			InsecureSkipVerify: config.InsecureSkipVerify,
 		},
 	}
-	start := int(g.cursor.Add(1)-1) % len(config.Endpoints)
-	for _, endpoint := range g.availableEndpoints(config.Endpoints, start, time.Now()) {
+	for _, endpoint := range available {
 		ws, response, err := dialer.Dial(endpoint, nil)
 		if err == nil {
 			g.markEndpointSuccess(endpoint)
 			remote := tunnel.Wrap(ws)
 			defer remote.Close()
-			relay(client, remote)
+			if _, err := remote.Write(raw); err != nil {
+				return
+			}
+			relay(bufferedConn{Conn: client, Reader: buffered}, remote)
 			return
 		}
 		g.markEndpointFailure(endpoint, time.Now())
@@ -217,6 +237,83 @@ func (g *Gateway) handle(client net.Conn) {
 		log.Printf("SeaMoon gateway dial failed endpoint=%s status=%s err=%v", endpoint, status, err)
 	}
 	_, _ = io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 34\r\n\r\nSeaMoon cloud function unavailable")
+}
+
+type bufferedConn struct {
+	net.Conn
+	Reader *bufio.Reader
+}
+
+func (c bufferedConn) Read(p []byte) (int, error) {
+	return c.Reader.Read(p)
+}
+
+func captureProxyRequest(request *http.Request) ([]byte, error) {
+	var builder strings.Builder
+	if err := request.Write(&builder); err != nil {
+		return nil, err
+	}
+	return []byte(builder.String()), nil
+}
+
+func (g *Gateway) endpointStart(endpoints []string, request *http.Request) int {
+	if len(endpoints) == 0 {
+		return 0
+	}
+	if key := stickyKey(request); key != "" {
+		if index, ok := laneIndex(key); ok {
+			return index % len(endpoints)
+		}
+		hash := fnv.New32a()
+		_, _ = hash.Write([]byte(key))
+		return int(hash.Sum32()) % len(endpoints)
+	}
+	return int(g.cursor.Add(1)-1) % len(endpoints)
+}
+
+func laneIndex(key string) (int, bool) {
+	// lane_{slot}_{generation} must stay on the same cloud function.
+	// Hashing the whole key made two slots collide, share one egress IP,
+	// and trip 创宇盾 after five combined queries.
+	parts := strings.Split(key, "_")
+	if len(parts) < 3 || parts[0] != "lane" {
+		return 0, false
+	}
+	index, err := strconv.Atoi(parts[1])
+	if err != nil || index < 0 {
+		return 0, false
+	}
+	return index, true
+}
+
+func stickyKey(request *http.Request) string {
+	if request == nil {
+		return ""
+	}
+	if value := strings.TrimSpace(request.Header.Get("X-SeaMoon-Lane")); value != "" {
+		return value
+	}
+	if user, _, ok := proxyBasicUser(request); ok {
+		return user
+	}
+	return ""
+}
+
+func proxyBasicUser(request *http.Request) (string, string, bool) {
+	header := request.Header.Get("Proxy-Authorization")
+	if header == "" {
+		return "", "", false
+	}
+	scheme, encoded, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Basic") {
+		return "", "", false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", "", false
+	}
+	user, _, _ := strings.Cut(string(decoded), ":")
+	return user, "", true
 }
 
 func relay(left, right net.Conn) {

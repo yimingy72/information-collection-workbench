@@ -4,7 +4,8 @@ import asyncio
 from dataclasses import dataclass, field
 from uuid import UUID
 
-from app.miit import collect_icp
+from app.miit import collect_icp, collect_icp_from_queue
+from app.settings import settings
 from app.providers.names import provider_label
 from app.providers.tianyancha import (
     INVEST_URL,
@@ -12,18 +13,18 @@ from app.providers.tianyancha import (
     ProviderError,
 )
 from app.repository import LeaseLost, Repository
-from app.serverless_proxy import ensure_icp_node_pool, release_icp_node_pool
+from app.serverless_proxy import ensure_icp_node_pool, prewarm_cloud_nodes, release_icp_node_pool
 
 
 ICP_HEARTBEAT_SECONDS = 5
 ICP_STREAM_POLL_SECONDS = 0.25
-# Keep enough names in flight to fill the scaled cloud pool. A batch of 50
-# caused hundreds of companies to be processed in many serial waves; when a
-# handful of companies hit their 30-second/3-attempt recovery path, the waves
-# dominated end-to-end time even though the 7-node gateway pool was healthy.
-# Auto-scaling still runs before the first batch and after each discovery
-# threshold, while the ICP scheduler bounds actual concurrent page requests.
-ICP_STREAM_BATCH_NAMES = 320
+# Feed ICP as soon as a handful of names exist. The collector now owns a
+# rolling queue instead of waiting for 200 names to finish before the next
+# wave can start.
+ICP_STREAM_MIN_START = 8
+# Traverse investment companies concurrently. The previous BFS visited one
+# company at a time, so a 1500-node tree paid full RTT for every node.
+INVEST_CONCURRENCY = 16
 
 
 @dataclass(frozen=True)
@@ -44,14 +45,17 @@ def _provider_label(provider) -> str:
 async def _collect_icp_with_heartbeat(
     repo: Repository,
     spec: RunSpec,
-    names: list[str],
+    names: list[str] | asyncio.Queue,
 ) -> list[str]:
     async def keepalive() -> None:
         while True:
             await asyncio.sleep(ICP_HEARTBEAT_SECONDS)
             await repo.touch_run(spec.id, lease_id=spec.lease_id)
 
-    collect_task = asyncio.create_task(collect_icp(repo, spec.id, names))
+    if isinstance(names, asyncio.Queue):
+        collect_task = asyncio.create_task(collect_icp_from_queue(repo, spec.id, names))
+    else:
+        collect_task = asyncio.create_task(collect_icp(repo, spec.id, names))
     heartbeat_task = asyncio.create_task(keepalive())
     try:
         done, _ = await asyncio.wait(
@@ -91,106 +95,136 @@ async def _collect_icp_as_entities_are_discovered(
 
     The repository query intentionally excludes ``icp`` results, otherwise an
     ICP response could feed its own unit names back into this queue forever.
-    Each discovered name is claimed once for this run; ``collect_icp`` keeps
-    the existing per-batch concurrency, page timeout, deduplication, and route
-    rotation rules.
+    Each discovered name is claimed once for this run and appended to one
+    rolling ICP collector so later companies do not wait for a 200-name wave
+    to finish.
     """
     seen: set[str] = set()
     errors: list[str] = []
-    scale_observed = 0
     scale_errors_seen: set[str] = set()
     pool_released = False
-    while True:
-        discovered = _prioritize_root_name(
-            await repo.entity_names_for_run(spec.id), spec.keyword
-        )
-        pending = [name for name in discovered if name not in seen]
-        # Keep the requested root responsive, then accumulate discovered
-        # investments until the batch is large enough to fill the cloud pool.
-        # Starting a 50-name ICP batch on every small discovery increment
-        # creates many serial waves and leaves most node capacity idle.
-        if pending and (not seen or len(pending) >= ICP_STREAM_BATCH_NAMES or producers_done.is_set()):
-            # Scale before starting the next ICP batch. Provisioning probes
-            # temporarily use the shared SeaMoon gateway; running them in the
-            # background used to divert live ICP traffic to the last probe
-            # endpoint and effectively disabled the healthy node pool.
-            if len(discovered) > scale_observed and len(discovered) >= 50:
-                scale_observed = len(discovered)
-                try:
-                    scale_result = await ensure_icp_node_pool(repo, len(discovered))
-                    scale_errors = (
-                        scale_result.get("errors")
-                        if isinstance(scale_result, dict)
-                        else []
-                    )
-                    if scale_errors:
-                        for scale_error in map(str, scale_errors):
-                            if scale_error not in scale_errors_seen:
-                                scale_errors_seen.add(scale_error)
-                                errors.append("ICP备案节点自动扩容：" + scale_error)
-                except Exception as exc:  # noqa: BLE001 - scaling is best effort
-                    errors.append(f"ICP备案节点自动扩容失败：{exc}")
-            batch = pending[:ICP_STREAM_BATCH_NAMES]
-            seen.update(batch)
-            try:
-                errors.extend(await _collect_icp_with_heartbeat(repo, spec, batch))
-            except LeaseLost:
-                raise
-            except Exception as exc:  # noqa: BLE001 - ICP is best effort
-                errors.append(f"ICP备案：{exc}")
-            continue
-        if producers_done.is_set():
-            if not pool_released:
-                pool_released = True
-                # Scale down only after every discovered company has been
-                # consumed. ICP collection is globally serialized, so no other
-                # run can be using the pool while these idle nodes are removed.
-                # Lightweight test/fake repositories do not carry runtime
-                # configuration; skip the optional cost-management hook there.
-                if getattr(repo, "get_runtime_config", None) is not None:
-                    try:
-                        release_result = await release_icp_node_pool(repo, len(discovered))
-                        release_errors = (
-                            release_result.get("errors")
-                            if isinstance(release_result, dict)
-                            else []
-                        )
-                        for release_error in map(str, release_errors or []):
-                            if release_error not in scale_errors_seen:
-                                scale_errors_seen.add(release_error)
-                                errors.append("ICP备案节点自动缩容：" + release_error)
-                    except Exception as exc:  # noqa: BLE001 - scaling is best effort
-                        detail = f"ICP备案节点自动缩容失败：{exc}"
-                        if detail not in scale_errors_seen:
-                            scale_errors_seen.add(detail)
-                            errors.append(detail)
-            return errors
+    warmed = False
+    incoming: asyncio.Queue[str | None] = asyncio.Queue()
+    collector_task: asyncio.Task[list[str]] | None = None
 
-        # Wait for a provider to persist another entity, or for all providers
-        # to finish. The timeout is only a safety net for repositories that do
-        # not expose an event-backed notification; normal discovery wakes this
-        # consumer immediately.
-        entity_changed.clear()
-        change_task = asyncio.create_task(entity_changed.wait())
-        done_task = asyncio.create_task(producers_done.wait())
-        try:
-            done, _ = await asyncio.wait(
-                {change_task, done_task},
-                timeout=ICP_STREAM_POLL_SECONDS,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if done_task in done and producers_done.is_set():
-                # Producers can finish while the consumer is waiting for the
-                # final discovery event. Do not return here: the top of the
-                # loop must process any names that were persisted after the
-                # last ICP batch (the small-run case otherwise queried only
-                # the root entity).
+    def _record_scale_errors(prefix: str, values) -> None:
+        for scale_error in map(str, values or []):
+            if scale_error not in scale_errors_seen:
+                scale_errors_seen.add(scale_error)
+                errors.append(prefix + scale_error)
+
+    async def start_collector(discovered_count: int) -> None:
+        nonlocal collector_task, warmed
+        if collector_task is not None:
+            return
+        if getattr(repo, "get_runtime_config", None) is not None:
+            try:
+                # Deep investment trees need the full node pool immediately.
+                # Waiting until 160/320 names exist left the first minutes on
+                # a single function and blew the 15-minute budget.
+                if not producers_done.is_set() and spec.depth >= 3:
+                    scale_count = max(
+                        discovered_count,
+                        settings.icp_auto_scale_max_nodes
+                        * settings.icp_auto_scale_companies_per_node,
+                    )
+                else:
+                    scale_count = discovered_count
+                scale_result = await ensure_icp_node_pool(repo, scale_count)
+                _record_scale_errors(
+                    "ICP备案节点自动扩容：",
+                    scale_result.get("errors") if isinstance(scale_result, dict) else [],
+                )
+            except Exception as extra:  # noqa: BLE001 - scaling is best effort
+                errors.append(f"ICP备案节点自动扩容失败：{extra}")
+            if not warmed:
+                warmed = True
+                try:
+                    warm = await prewarm_cloud_nodes(await repo.get_runtime_config())
+                    _record_scale_errors("ICP备案节点预热：", (warm or {}).get("errors") or [])
+                except Exception as extra:  # noqa: BLE001 - prewarm is best effort
+                    detail = f"ICP备案节点预热失败：{extra}"
+                    if detail not in scale_errors_seen:
+                        scale_errors_seen.add(detail)
+                        errors.append(detail)
+        collector_task = asyncio.create_task(
+            _collect_icp_with_heartbeat(repo, spec, incoming)
+        )
+
+    async def feed(pending: list[str]) -> None:
+        for name in pending:
+            if name in seen:
                 continue
-        finally:
-            for task in (change_task, done_task):
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(change_task, done_task, return_exceptions=True)
+            seen.add(name)
+            await incoming.put(name)
+
+    try:
+        while True:
+            discovered = _prioritize_root_name(
+                await repo.entity_names_for_run(spec.id), spec.keyword
+            )
+            pending = [name for name in discovered if name not in seen]
+            ready_to_start = bool(pending) and (
+                producers_done.is_set() or len(discovered) >= max(1, ICP_STREAM_MIN_START)
+            )
+            if ready_to_start:
+                await start_collector(len(discovered))
+                await feed(pending)
+            if producers_done.is_set():
+                remaining = [name for name in pending if name not in seen]
+                if collector_task is None and remaining:
+                    await start_collector(len(discovered))
+                if remaining:
+                    await feed(remaining)
+                if collector_task is not None:
+                    await incoming.put(None)
+                    try:
+                        errors.extend(await collector_task)
+                    except LeaseLost:
+                        raise
+                    except Exception as extra:  # noqa: BLE001 - ICP is best effort
+                        errors.append(f"ICP备案：{extra}")
+                    collector_task = None
+                if not pool_released:
+                    pool_released = True
+                    if getattr(repo, "get_runtime_config", None) is not None:
+                        try:
+                            release_result = await release_icp_node_pool(repo, len(discovered))
+                            _record_scale_errors(
+                                "ICP备案节点自动缩容：",
+                                release_result.get("errors") if isinstance(release_result, dict) else [],
+                            )
+                        except Exception as extra:  # noqa: BLE001 - scaling is best effort
+                            detail = f"ICP备案节点自动缩容失败：{extra}"
+                            if detail not in scale_errors_seen:
+                                scale_errors_seen.add(detail)
+                                errors.append(detail)
+                return errors
+
+            entity_changed.clear()
+            change_task = asyncio.create_task(entity_changed.wait())
+            done_task = asyncio.create_task(producers_done.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {change_task, done_task},
+                    timeout=ICP_STREAM_POLL_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if done_task in done and producers_done.is_set():
+                    continue
+            finally:
+                for task in (change_task, done_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(change_task, done_task, return_exceptions=True)
+    finally:
+        if collector_task is not None and not collector_task.done():
+            try:
+                incoming.put_nowait(None)
+            except Exception:
+                pass
+            collector_task.cancel()
+            await asyncio.gather(collector_task, return_exceptions=True)
 
 
 async def collect_run(repo: Repository, providers: list, spec: RunSpec) -> list[str]:
@@ -260,7 +294,8 @@ async def _collect_one(
     if entity_changed is not None:
         entity_changed.set()
 
-    queue: list[tuple[Company, UUID, int]] = [(selected, root_id, 0)]
+    queue: asyncio.Queue[tuple[Company, UUID, int] | None] = asyncio.Queue()
+    await queue.put((selected, root_id, 0))
     queued: set[str] = {f"{provider_id}:{selected.external_id}"}
     completed: set[str] = set()
     counted: set[str] = set()
@@ -268,38 +303,54 @@ async def _collect_one(
     failed_company_retries = max(0, int(getattr(provider, "failed_company_retries", 0)))
     processed = 0
     errors: list[str] = []
-    while queue:
-        company, entity_id, level = queue.pop(0)
+    state_lock = asyncio.Lock()
+    workers = max(1, min(INVEST_CONCURRENCY, 16))
+
+    async def visit(company: Company, entity_id: UUID, level: int) -> None:
+        nonlocal processed
         visit_key = f"{provider_id}:{company.external_id}"
-        queued.discard(visit_key)
-        if visit_key in completed:
-            continue
-        if visit_key not in counted:
-            counted.add(visit_key)
-            processed += 1
-        await repo.heartbeat(spec.id, processed, lease_id=spec.lease_id)
+        async with state_lock:
+            queued.discard(visit_key)
+            if visit_key in completed:
+                return
+            if visit_key not in counted:
+                counted.add(visit_key)
+                processed += 1
+            current_processed = processed
+        await repo.heartbeat(spec.id, current_processed, lease_id=spec.lease_id)
 
         if "invest" not in spec.fields or level >= spec.depth:
-            completed.add(visit_key)
-            continue
+            async with state_lock:
+                completed.add(visit_key)
+            return
         try:
-            investments = await provider.all_pages(lambda page, current=company: provider.investments(current.external_id, page))
-        except ProviderError as exc:
-            retries = retry_counts.get(visit_key, 0)
-            if retries < failed_company_retries:
-                retry_counts[visit_key] = retries + 1
+            investments = await provider.all_pages(
+                lambda page, current=company: provider.investments(current.external_id, page)
+            )
+        except ProviderError as extra:
+            retry = False
+            retries = 0
+            async with state_lock:
+                retries = retry_counts.get(visit_key, 0)
+                if retries < failed_company_retries:
+                    retry_counts[visit_key] = retries + 1
+                    if visit_key not in queued:
+                        queued.add(visit_key)
+                        retry = True
+                else:
+                    completed.add(visit_key)
+                    retry_note = f"（失败企业已定向重试 {retries} 次）" if retries else ""
+                    errors.append(f"{source}：{company.name} {extra}{retry_note}")
+            if retry:
                 reset = getattr(provider, "reset_after_failure", None)
                 if reset is not None:
                     await reset()
-                if visit_key not in queued:
-                    queue.append((company, entity_id, level))
-                    queued.add(visit_key)
-                continue
+                await queue.put((company, entity_id, level))
+            return
+
+        async with state_lock:
             completed.add(visit_key)
-            retry_note = f"（失败企业已定向重试 {retries} 次）" if retries else ""
-            errors.append(f"{source}：{company.name} {exc}{retry_note}")
-            continue
-        completed.add(visit_key)
+
         for investment in investments:
             if investment.holding_percent is None or investment.holding_percent < spec.holding_percent:
                 continue
@@ -319,9 +370,28 @@ async def _collect_one(
             if entity_changed is not None:
                 entity_changed.set()
             child_key = f"{provider_id}:{child.external_id}"
-            if child_key not in completed and child_key not in queued:
-                queue.append((child, child_id, level + 1))
-                queued.add(child_key)
+            async with state_lock:
+                if child_key not in completed and child_key not in queued:
+                    queued.add(child_key)
+                    await queue.put((child, child_id, level + 1))
+
+    async def worker() -> None:
+        while True:
+            item = await queue.get()
+            try:
+                if item is None:
+                    return
+                await visit(*item)
+            finally:
+                queue.task_done()
+
+    tasks = [asyncio.create_task(worker()) for _ in range(workers)]
+    try:
+        await queue.join()
+    finally:
+        for _ in tasks:
+            await queue.put(None)
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     await repo.heartbeat(spec.id, processed, processed, lease_id=spec.lease_id)
     return errors

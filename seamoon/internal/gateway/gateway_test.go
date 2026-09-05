@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"encoding/base64"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -47,5 +49,37 @@ func TestCircuitBreakerRestoresEndpointAfterCooldown(t *testing.T) {
 	available := gateway.availableEndpoints([]string{endpoint}, 0, now.Add(endpointFailureCooldown+time.Second))
 	if len(available) != 1 || available[0] != endpoint {
 		t.Fatalf("available endpoints = %#v, want %q after cooldown", available, endpoint)
+	}
+}
+
+
+func TestStickyKeySelectsStableEndpoint(t *testing.T) {
+	gateway := New()
+	endpoints := []string{"wss://one.example/http", "wss://two.example/http", "wss://three.example/http"}
+	request, err := http.NewRequest(http.MethodConnect, "https://beian.miit.gov.cn/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("lane_0_0:lane_0_0")))
+	start := gateway.endpointStart(endpoints, request)
+	again := gateway.endpointStart(endpoints, request)
+	if start != again {
+		t.Fatalf("sticky start changed from %d to %d", start, again)
+	}
+	if start != 0 {
+		t.Fatalf("lane_0_0 should pin to endpoint 0, got %d", start)
+	}
+	request.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("lane_1_4:lane_1_4")))
+	if gateway.endpointStart(endpoints, request) != 1 {
+		t.Fatal("lane_1_4 should pin to endpoint 1")
+	}
+	other, err := http.NewRequest(http.MethodConnect, "https://beian.miit.gov.cn/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("lane_1_0:lane_1_0")))
+	otherStart := gateway.endpointStart(endpoints, other)
+	if otherStart < 0 || otherStart >= len(endpoints) {
+		t.Fatalf("other lane start %d out of range", otherStart)
 	}
 }

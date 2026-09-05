@@ -17,7 +17,7 @@ MAX_PAGES = 50
 # YMICP's own implementation documents 26 as the maximum reliable page size.
 # Larger values are silently normalized upstream and can destabilize pagination.
 PAGE_SIZE = 26
-ICP_PAGINATION_RECOVERY_PASSES = 2
+ICP_PAGINATION_RECOVERY_PASSES = 1
 # A positive upstream total with an empty page is a transient/route anomaly,
 # not a normal multi-page pagination case. Give it one alternate page session
 # before returning to the company-level retry loop; repeating three complete
@@ -31,14 +31,21 @@ ICP_BATCH_SIZE = 5
 # knob can still be lowered by an existing deployment or test.
 ICP_CONCURRENCY = 40
 ICP_DIRECT_REQUEST_GAP_SECONDS = 0.4
-ICP_BATCH_PAUSE_SECONDS = 12.0
-ICP_PAGE_TIMEOUT_SECONDS = 10
-ICP_COMPANY_TIMEOUT_SECONDS = 30
+# After five live queries the lane pauses independently, but only for the
+# remaining WAF window. Warm pages already take 3-4s, so five queries often
+# cover the 8s budget and the lane continues immediately. Fast bursts still
+# wait out the remainder instead of hammering 创宇盾.
+ICP_BATCH_PAUSE_SECONDS = 8.0
+# First page of a cold SeaMoon session must finish JSL + captcha + query.
+# 48-50s still 504s the handshake and starts a timeout/retry storm. 90s lets
+# the first request on a lane finish warm; later warm pages return in 3-4s.
+ICP_PAGE_TIMEOUT_SECONDS = 90
+ICP_WARM_PAGE_TIMEOUT_SECONDS = 20
+ICP_COMPANY_TIMEOUT_SECONDS = 80
 ICP_COMPANY_MAX_ATTEMPTS = max(1, settings.icp_company_max_attempts)
 ICP_COMPANY_RETRY_BACKOFF_SECONDS = max(0.0, settings.icp_company_retry_backoff_seconds)
-# In cloud mode this counts actual ICP page requests, not companies. Reaching
-# the limit starts a new YMICP page session, which makes YMICP open a fresh
-# HTTP-proxy TCP connection and therefore a fresh SeaMoon WebSocket tunnel.
+# Five queries share one warm YMICP/SeaMoon session (one egress IP). Rebuild
+# only happens after a WAF/transport failure.
 ICP_PROXY_REQUEST_LIMIT = 5
 # A WAF response should not discard the current page immediately. Retry it a
 # bounded number of times after the route generation has been rotated.
@@ -51,6 +58,11 @@ ICP_PROXY_WAF_RETRIES = 2
 # Keeping two page retries here multiplied a single bad company into 9 slow
 # requests before the final failure was reported.
 ICP_PROXY_ERROR_RETRIES = 1
+# Cold JSL/captcha on a still-warming lane should be retried on the same
+# session instead of burning the 80s company budget. One extra wait is
+# enough to pick up the shielded handshake; four 90s retries parked the
+# whole lane for minutes.
+ICP_PROXY_TIMEOUT_RETRIES = 2
 ICP_MAX_CLOUD_BATCH_SIZE = 40
 # Bump this whenever pagination, completeness, or record identity semantics
 # change. Old cache rows remain available for audit but can no longer suppress
@@ -77,33 +89,62 @@ class IcpPageError(RuntimeError):
 
 
 class _IcpCloudRotationScheduler:
-    """Count cloud page requests and gate the next logical tunnel generation.
+    """Pace cloud page requests on one shared SeaMoon gateway URL.
 
-    The backend can force YMICP to create a new HTTP-proxy connection by
-    changing the page-session key. This is a real tunnel/session rotation, but
-    a single cloud-function endpoint still cannot guarantee a different public
-    egress IP because the provider may reuse the same warm instance or NAT.
+    Five queries reuse one warm YMICP session / tunnel. After the fifth
+    request this scheduler waits ``pause_seconds`` so 创宇盾 can slide.
+    The session is only rebuilt when ``rotate()`` is called after a WAF
+    or transport failure.
     """
 
-    def __init__(self, request_limit: int) -> None:
+    def __init__(self, request_limit: int, pause_seconds: float = ICP_BATCH_PAUSE_SECONDS) -> None:
         self.request_limit = max(1, request_limit)
+        self.pause_seconds = max(0.0, float(pause_seconds))
         self.used = 0
         self.active = 0
         self.generation = 0
         self.rotation_pending = False
+        self.pause_until = 0.0
+        self.burst_started = 0.0
         self.condition = asyncio.Condition()
 
+    def _remaining_pause(self, now: float) -> float:
+        if self.pause_seconds <= 0 or self.burst_started <= 0:
+            return self.pause_seconds
+        return max(0.0, self.pause_seconds - (now - self.burst_started))
+
     async def acquire(self) -> int:
-        async with self.condition:
-            while self.rotation_pending or (self.used >= self.request_limit and self.active):
-                await self.condition.wait()
-            if self.used >= self.request_limit:
-                self.used = 0
-                self.generation += 1
-            generation = self.generation
-            self.used += 1
-            self.active += 1
-            return generation
+        while True:
+            delay = 0.0
+            async with self.condition:
+                now = asyncio.get_running_loop().time()
+                if self.rotation_pending:
+                    await self.condition.wait()
+                    continue
+                if self.pause_until > now:
+                    delay = self.pause_until - now
+                elif self.used >= self.request_limit:
+                    if self.active:
+                        await self.condition.wait()
+                        continue
+                    remaining = self._remaining_pause(now)
+                    self.used = 0
+                    self.burst_started = 0.0
+                    if remaining:
+                        self.pause_until = now + remaining
+                        delay = remaining
+                    else:
+                        self.pause_until = 0.0
+                        delay = 0.0
+                else:
+                    generation = self.generation
+                    if self.used == 0:
+                        self.burst_started = now
+                    self.used += 1
+                    self.active += 1
+                    return generation
+            if delay > 0:
+                await asyncio.sleep(delay)
 
     async def release(self) -> None:
         async with self.condition:
@@ -120,49 +161,98 @@ class _IcpCloudRotationScheduler:
             if self.generation == observed_generation:
                 self.used = 0
                 self.generation += 1
+                self.pause_until = 0.0
+                self.burst_started = 0.0
             self.rotation_pending = False
             self.condition.notify_all()
             return self.generation
 
 
 class _IcpProxyPoolScheduler:
-    """Round-robin HTTP proxy pool with an independent five-request budget per node."""
+    """Round-robin HTTP proxy pool with an independent five-request budget per node.
 
-    def __init__(self, routes: list[str], request_limit: int) -> None:
-        self.routes = list(dict.fromkeys(route for route in routes if route))
+    Duplicate URLs are allowed so one SeaMoon gateway can expose several
+    parallel YMICP sessions (one warm tunnel per ready cloud function).
+    Hitting the request limit starts an independent WAF pause on that slot;
+    other slots keep querying. ``rotate()`` is reserved for WAF or transport
+    failures that need a new tunnel. A company that already owns a slot waits
+    on that slot instead of jumping to another egress IP mid-pagination.
+    """
+
+    def __init__(
+        self,
+        routes: list[str],
+        request_limit: int,
+        pause_seconds: float = 0.0,
+    ) -> None:
+        self.routes = [route for route in routes if route]
         self.request_limit = max(1, request_limit)
+        self.pause_seconds = max(0.0, float(pause_seconds))
         self.used = [0 for _ in self.routes]
         self.generations = [0 for _ in self.routes]
+        self.cooldown_until = [0.0 for _ in self.routes]
+        self.burst_started = [0.0 for _ in self.routes]
         self.cursor = 0
         self.active = 0
         self.condition = asyncio.Condition()
 
+    def _ready(self, index: int, now: float) -> bool:
+        return self.used[index] < self.request_limit and self.cooldown_until[index] <= now
+
+    def _remaining_pause(self, index: int, now: float) -> float:
+        if self.pause_seconds <= 0 or self.burst_started[index] <= 0:
+            return self.pause_seconds
+        return max(0.0, self.pause_seconds - (now - self.burst_started[index]))
+
+    def _recycle_exhausted(self, now: float) -> None:
+        for index, used in enumerate(self.used):
+            if used >= self.request_limit and self.cooldown_until[index] <= now:
+                remaining = self._remaining_pause(index, now)
+                self.used[index] = 0
+                self.burst_started[index] = 0.0
+                self.cooldown_until[index] = now + remaining if remaining else 0.0
+
+    def _claim(self, index: int, now: float) -> tuple[str, int, int]:
+        if self.used[index] == 0:
+            self.burst_started[index] = now
+        self.used[index] += 1
+        self.active += 1
+        return self.routes[index], index, self.generations[index]
+
     async def acquire(self, preferred_index: int | None = None) -> tuple[str, int, int]:
         if not self.routes:
             raise IcpPageError("暂无可用 HTTP 代理")
-        async with self.condition:
-            while True:
-                if not all(used >= self.request_limit for used in self.used):
-                    break
-                if self.active == 0:
-                    self.used = [0 for _ in self.routes]
-                    break
-                await self.condition.wait()
-            candidates: list[int] = []
-            if preferred_index is not None and 0 <= preferred_index < len(self.routes):
-                candidates.append(preferred_index)
-            candidates.extend(
-                (self.cursor + offset) % len(self.routes)
-                for offset in range(len(self.routes))
-                if (self.cursor + offset) % len(self.routes) not in candidates
-            )
-            for index in candidates:
-                if self.used[index] < self.request_limit:
-                    self.cursor = (index + 1) % len(self.routes)
-                    self.used[index] += 1
-                    self.active += 1
-                    return self.routes[index], index, self.generations[index]
-            raise IcpPageError("暂无可用 HTTP 代理")
+        while True:
+            delay = 0.0
+            async with self.condition:
+                now = asyncio.get_running_loop().time()
+                self._recycle_exhausted(now)
+                if preferred_index is not None and 0 <= preferred_index < len(self.routes):
+                    if self._ready(preferred_index, now):
+                        return self._claim(preferred_index, now)
+                    wait_for = self.cooldown_until[preferred_index] - now
+                    if wait_for > 0:
+                        delay = wait_for
+                    else:
+                        await self.condition.wait()
+                        continue
+                if delay <= 0:
+                    for offset in range(len(self.routes)):
+                        index = (self.cursor + offset) % len(self.routes)
+                        if not self._ready(index, now):
+                            continue
+                        self.cursor = (index + 1) % len(self.routes)
+                        return self._claim(index, now)
+                    wait_for = min(
+                        (until - now for until in self.cooldown_until if until > now),
+                        default=None,
+                    )
+                    if wait_for is None:
+                        await self.condition.wait()
+                        continue
+                    delay = wait_for
+            if delay > 0:
+                await asyncio.sleep(delay)
 
     async def release(self) -> None:
         async with self.condition:
@@ -172,7 +262,9 @@ class _IcpProxyPoolScheduler:
     async def rotate(self, index: int, generation: int) -> None:
         async with self.condition:
             if 0 <= index < len(self.routes) and self.generations[index] == generation:
-                self.used[index] = self.request_limit
+                self.used[index] = 0
+                self.cooldown_until[index] = 0.0
+                self.burst_started[index] = 0.0
                 self.generations[index] += 1
             self.condition.notify_all()
 
@@ -496,12 +588,26 @@ async def _run_company_round(
 
 
 async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list[str]:
-    names = list(dict.fromkeys(_clean(name) for name in names if _clean(name)))
-    if not names:
+    cleaned = list(dict.fromkeys(_clean(item) for item in names if _clean(item)))
+    if not cleaned:
         return []
-    cache_hits, names = await _restore_icp_cache(repo, run_id, names)
-    await _record_icp_cache_stats(repo, run_id, len(cache_hits), len(names))
-    if not names or not settings.miit_api_url:
+    incoming: asyncio.Queue[str | None] = asyncio.Queue()
+    for name in cleaned:
+        incoming.put_nowait(name)
+    incoming.put_nowait(None)
+    return await _collect_icp_from_queue(repo, run_id, incoming)
+
+
+async def _collect_icp_from_queue(
+    repo: Repository,
+    run_id: UUID,
+    incoming: asyncio.Queue[str | None],
+) -> list[str]:
+    if not settings.miit_api_url:
+        while True:
+            item = await incoming.get()
+            if item is None:
+                return []
         return []
     get_runtime_config = getattr(repo, "get_runtime_config", None)
     runtime_config = await get_runtime_config() if get_runtime_config else {}
@@ -525,42 +631,51 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
         if item.get("enabled") and item.get("status") in {"ready", "deployed"}
         and item.get("endpoint")
     ]
+    cloud_slots = 0
     if using_cloud_proxy:
-        # One FC instance safely carries five logical ICP requests. The local
-        # gateway round-robins connections across ready nodes, so scale the
-        # logical batch and rotation budget with the pool instead of keeping a
-        # hidden five-request ceiling after adding regions.
-        node_count = max(1, len(ready_cloud_nodes))
-        batch_size = min(
-            ICP_MAX_CLOUD_BATCH_SIZE,
-            max(1, ICP_CONCURRENCY),
-            5 * node_count,
-        )
+        # Keep one in-flight company per ready function. Multiple companies
+        # sharing one gateway URL still need distinct YMICP session keys so
+        # each function keeps its own warm tunnel, JSL cookie and captcha.
+        node_count = max(1, len(ready_cloud_nodes) or len(route_proxies) or 1)
+        cloud_slots = min(ICP_MAX_CLOUD_BATCH_SIZE, max(1, ICP_CONCURRENCY), node_count)
+        batch_size = cloud_slots
     if using_manual_proxy:
         # A manual proxy is one fixed public exit. Run at most one active
         # company per ready node; sending five companies through one node only
         # makes their captcha/auth work contend and hit the page hard timeout.
         batch_size = min(batch_size, len(manual_routes))
-    # A single manual proxy is a fixed route: do not apply the cloud tunnel
-    # generation counter to it. Otherwise its pagination session would be
-    # replaced every five pages even though no new exit IP can be created.
-    cloud_scheduler = (
-        _IcpCloudRotationScheduler(
-            max(ICP_PROXY_REQUEST_LIMIT, batch_size)
+    # Cloud mode uses one shared gateway URL plus N logical slots. Each slot
+    # has its own YMICP session key so SeaMoon can keep N warm tunnels.
+    cloud_scheduler = None
+    if using_cloud_proxy and route_proxies:
+        cloud_routes = [route_proxies[0]] * max(1, cloud_slots)
+        proxy_pool_scheduler = _IcpProxyPoolScheduler(
+            cloud_routes,
+            ICP_PROXY_REQUEST_LIMIT,
+            pause_seconds=ICP_BATCH_PAUSE_SECONDS,
         )
-        if using_cloud_proxy and route_proxy
-        else None
-    )
-    proxy_pool_scheduler = _IcpProxyPoolScheduler(route_proxies, ICP_PROXY_REQUEST_LIMIT) if len(route_proxies) > 1 else None
+    elif len(route_proxies) > 1:
+        proxy_pool_scheduler = _IcpProxyPoolScheduler(
+            route_proxies,
+            ICP_PROXY_REQUEST_LIMIT,
+            pause_seconds=ICP_BATCH_PAUSE_SECONDS,
+        )
+    else:
+        proxy_pool_scheduler = None
     request_scheduler = _IcpRequestScheduler(batch_size, direct=not route_proxies)
 
     async def collect_company_once(name: str, client: httpx.AsyncClient) -> CompanyFailure | None:
         started = asyncio.get_running_loop().time()
+        budget_started: float | None = None
         attempted_pages = 0
         expected_total: int | None = None
         aggregate_rows: dict[tuple[str, ...], dict[str, Any]] = {}
         aggregate_chunks: list[list[Any]] = []
         last_incomplete_reason = ""
+
+        def remaining_budget() -> float:
+            origin = budget_started if budget_started is not None else asyncio.get_running_loop().time()
+            return ICP_COMPANY_TIMEOUT_SECONDS - (asyncio.get_running_loop().time() - origin)
 
         async def save_complete_result() -> None:
             complete_rows = list(aggregate_rows.values())
@@ -570,25 +685,50 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             await _store_icp_cache(repo, name, complete_rows, expected_total)
 
         try:
-            async with asyncio.timeout(ICP_COMPANY_TIMEOUT_SECONDS):
-                for pagination_pass in range(ICP_PAGINATION_RECOVERY_PASSES + 1):
-                    # Every pass gets a fresh upstream pagination context. All
-                    # pages inside the pass keep one YMICP/SeaMoon session. The
-                    # MIIT endpoint occasionally overlaps valid pages even in a
-                    # stable session, so bounded passes are unioned by record key
-                    # until the authoritative total is reached.
-                    session_key = uuid4().hex
-                    page = 1
-                    total_pages = 1
-                    pass_pages: int | None = None
-                    pass_total: int | None = None
-                    inconsistent = False
-
-                    page_proxy_retries = 0
-                    company_route_index: int | None = None
-                    while page <= min(total_pages, MAX_PAGES):
-                        elapsed = asyncio.get_running_loop().time() - started
-                        remaining = ICP_COMPANY_TIMEOUT_SECONDS - elapsed
+            for pagination_pass in range(ICP_PAGINATION_RECOVERY_PASSES + 1):
+                # Pages inside one pass keep one YMICP/SeaMoon session. The
+                # MIIT endpoint occasionally overlaps valid pages even in a
+                # stable session, so bounded passes are unioned by record key
+                # until the authoritative total is reached.
+                session_key = uuid4().hex
+                page = 1
+                total_pages = 1
+                pass_pages: int | None = None
+                pass_total: int | None = None
+                inconsistent = False
+                page_proxy_retries = 0
+                company_route_index: int | None = None
+                proxy_request_held = False
+                held_route_proxy = route_proxy
+                held_route_index: int | None = None
+                held_generation: int | None = None
+                while page <= min(total_pages, MAX_PAGES):
+                    fetch_options: dict[str, Any] = {
+                        "timeout_seconds": ICP_PAGE_TIMEOUT_SECONDS,
+                        "session_key": session_key,
+                    }
+                    request_generation: int | None = None
+                    request_route_proxy = route_proxy
+                    request_route_index: int | None = None
+                    proxy_request_claimed = False
+                    keep_proxy_claim = False
+                    try:
+                        if proxy_request_held:
+                            request_route_proxy = held_route_proxy
+                            request_route_index = held_route_index
+                            request_generation = held_generation
+                            proxy_request_claimed = True
+                        elif proxy_pool_scheduler is not None:
+                            request_route_proxy, request_route_index, request_generation = await proxy_pool_scheduler.acquire(company_route_index)
+                            company_route_index = request_route_index
+                            proxy_request_claimed = True
+                        elif cloud_scheduler is not None:
+                            request_generation = await cloud_scheduler.acquire()
+                            proxy_request_claimed = True
+                            request_route_proxy = route_proxy
+                        else:
+                            await request_scheduler.before_request()
+                        remaining = remaining_budget() if budget_started is not None else ICP_COMPANY_TIMEOUT_SECONDS
                         if remaining <= 0:
                             return _failure(
                                 name,
@@ -596,168 +736,174 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
                                 attempted_pages,
                                 f"单企业{route_label}查询总预算达到 {ICP_COMPANY_TIMEOUT_SECONDS:g} 秒",
                             )
-
-                        try:
-                            fetch_options: dict[str, Any] = {
-                                "timeout_seconds": min(ICP_PAGE_TIMEOUT_SECONDS, remaining),
-                                "session_key": session_key,
-                            }
-                            request_generation: int | None = None
-                            request_route_proxy = route_proxy
-                            request_route_index: int | None = None
-                            proxy_request_claimed = False
-                            try:
-                                if cloud_scheduler is not None:
-                                    request_generation = await cloud_scheduler.acquire()
-                                    proxy_request_claimed = True
-                                    request_route_proxy = route_proxy
-                                elif proxy_pool_scheduler is not None:
-                                    request_route_proxy, request_route_index, request_generation = await proxy_pool_scheduler.acquire(company_route_index)
-                                    company_route_index = request_route_index
-                                    proxy_request_claimed = True
-                                else:
-                                    await request_scheduler.before_request()
-                                if request_route_proxy:
-                                    fetch_options["route_proxy"] = request_route_proxy
-                                    if request_generation is not None:
-                                        # A changed session key makes YMICP
-                                        # discard the prior aiohttp page
-                                        # session and open a new HTTP-proxy
-                                        # tunnel for this request. A single
-                                        # manual route has no generation and
-                                        # must keep the original page session.
-                                        suffix = (
-                                            request_generation
-                                            if request_route_index is None
-                                            else f"{request_route_index}_{request_generation}"
-                                        )
-                                        fetch_options["session_key"] = f"{session_key}_{suffix}"
-                                attempted_pages += 1
-                                chunk = await _fetch_page(client, name, page, **fetch_options)
-                            finally:
-                                if proxy_request_claimed:
-                                    if cloud_scheduler is not None:
-                                        await cloud_scheduler.release()
-                                    elif proxy_pool_scheduler is not None:
-                                        await proxy_pool_scheduler.release()
-                        except IcpPageError as exc:
-                            if (
-                                (cloud_scheduler is not None or proxy_pool_scheduler is not None)
-                                and request_generation is not None
-                                and page_proxy_retries < (
-                                    ICP_PROXY_WAF_RETRIES
-                                    if "创宇盾" in str(exc)
-                                    else ICP_PROXY_ERROR_RETRIES
+                        if budget_started is None and not page_proxy_retries:
+                            page_timeout = ICP_PAGE_TIMEOUT_SECONDS
+                        elif budget_started is None:
+                            page_timeout = ICP_WARM_PAGE_TIMEOUT_SECONDS
+                        else:
+                            page_timeout = min(ICP_WARM_PAGE_TIMEOUT_SECONDS, remaining)
+                        fetch_options["timeout_seconds"] = page_timeout
+                        if request_route_proxy:
+                            fetch_options["route_proxy"] = request_route_proxy
+                            if request_generation is not None:
+                                # Stable per-lane key so five companies reuse
+                                # one warm YMICP/SeaMoon session. A generation
+                                # bump (WAF/transport rotate) is the only
+                                # thing that opens a new tunnel.
+                                suffix = (
+                                    f"{request_route_index}_{request_generation}"
+                                    if request_route_index is not None
+                                    else str(request_generation)
                                 )
-                            ):
-                                page_proxy_retries += 1
-                                if cloud_scheduler is not None:
-                                    await cloud_scheduler.rotate(request_generation)
-                                elif proxy_pool_scheduler is not None and request_route_index is not None:
-                                    await proxy_pool_scheduler.rotate(request_route_index, request_generation)
-                                    company_route_index = None
+                                fetch_options["session_key"] = f"lane_{suffix}"
+                        attempted_pages += 1
+                        chunk = await _fetch_page(client, name, page, **fetch_options)
+                        if budget_started is None:
+                            budget_started = asyncio.get_running_loop().time()
+                    except IcpPageError as exc:
+                        detail = str(exc)
+                        waf_hit = "创宇盾" in detail
+                        timeout_hit = "超时" in detail
+                        retry_limit = (
+                            ICP_PROXY_WAF_RETRIES
+                            if waf_hit
+                            else ICP_PROXY_TIMEOUT_RETRIES
+                            if timeout_hit
+                            else ICP_PROXY_ERROR_RETRIES
+                        )
+                        if (
+                            (cloud_scheduler is not None or proxy_pool_scheduler is not None)
+                            and request_generation is not None
+                            and page_proxy_retries < retry_limit
+                        ):
+                            page_proxy_retries += 1
+                            # Timeouts usually mean the current warm session is
+                            # still solving JSL/captcha. Rebuilding the tunnel
+                            # here forced another 12-34s cold start and made
+                            # generations climb to _10+. Keep the same lane.
+                            if timeout_hit:
+                                keep_proxy_claim = True
+                                proxy_request_held = True
+                                held_route_proxy = request_route_proxy
+                                held_route_index = request_route_index
+                                held_generation = request_generation
                                 continue
-                            if expected_total is not None and len(aggregate_rows) == expected_total:
-                                await save_complete_result()
-                                return None
-                            detail = str(exc) or "ICP 页面请求失败"
-                            if page_proxy_retries:
-                                action = "已重建隧道" if "创宇盾" in detail else "已切换代理"
-                                detail = f"{detail}（{action} {page_proxy_retries} 次）"
-                            return _failure(name, started, attempted_pages, detail)
+                            proxy_request_held = False
+                            if cloud_scheduler is not None:
+                                await cloud_scheduler.rotate(request_generation)
+                            elif proxy_pool_scheduler is not None and request_route_index is not None:
+                                await proxy_pool_scheduler.rotate(request_route_index, request_generation)
+                                company_route_index = None
+                            continue
+                        if expected_total is not None and len(aggregate_rows) == expected_total:
+                            await save_complete_result()
+                            return None
+                        detail = str(exc) or "ICP 页面请求失败"
+                        if page_proxy_retries:
+                            action = "已重建隧道" if "创宇盾" in detail else "已切换代理"
+                            detail = f"{detail}（{action} {page_proxy_retries} 次）"
+                        return _failure(name, started, attempted_pages, detail)
+                    finally:
+                        if proxy_request_claimed and not keep_proxy_claim:
+                            proxy_request_held = False
+                            if cloud_scheduler is not None:
+                                await cloud_scheduler.release()
+                            elif proxy_pool_scheduler is not None:
+                                await proxy_pool_scheduler.release()
 
-                        page_proxy_retries = 0
-                        reported_pages = max(1, int(chunk["pages"] or 1))
-                        reported_total = chunk.get("total")
-                        if reported_total is not None:
-                            reported_total = int(reported_total)
-                            if expected_total is None:
-                                expected_total = reported_total
-                            elif reported_total != expected_total:
-                                inconsistent = True
-                                last_incomplete_reason = (
-                                    f"不同分页返回的总数不一致（{expected_total} / {reported_total}）"
-                                )
-                                break
-                            if pass_total is None:
-                                pass_total = reported_total
-                            elif reported_total != pass_total:
-                                inconsistent = True
-                                last_incomplete_reason = (
-                                    f"同一次分页返回的总数不一致（{pass_total} / {reported_total}）"
-                                )
-                                break
-
-                        if pass_pages is None:
-                            pass_pages = reported_pages
-                            total_pages = reported_pages
-                            if total_pages > MAX_PAGES:
-                                return _failure(
-                                    name,
-                                    started,
-                                    attempted_pages,
-                                    f"上游报告 {total_pages} 页，超过安全上限 {MAX_PAGES} 页",
-                                )
-                        elif reported_pages != pass_pages:
+                    page_proxy_retries = 0
+                    proxy_request_held = False
+                    reported_pages = max(1, int(chunk["pages"] or 1))
+                    reported_total = chunk.get("total")
+                    if reported_total is not None:
+                        reported_total = int(reported_total)
+                        if expected_total is None:
+                            expected_total = reported_total
+                        elif reported_total != expected_total:
                             inconsistent = True
                             last_incomplete_reason = (
-                                f"同一次分页返回的页数不一致（{pass_pages} / {reported_pages}）"
+                                f"不同分页返回的总数不一致（{expected_total} / {reported_total}）"
+                            )
+                            break
+                        if pass_total is None:
+                            pass_total = reported_total
+                        elif reported_total != pass_total:
+                            inconsistent = True
+                            last_incomplete_reason = (
+                                f"同一次分页返回的总数不一致（{pass_total} / {reported_total}）"
                             )
                             break
 
-                        page_rows = chunk["rows"]
-                        aggregate_chunks.append(page_rows)
-                        for row in page_rows:
-                            if not isinstance(row, dict):
-                                continue
-                            key = _icp_row_key(row, name)
-                            if key is None:
-                                continue
-                            aggregate_rows.setdefault(key, row)
-
-                        if expected_total is not None:
-                            if len(aggregate_rows) == expected_total:
-                                await save_complete_result()
-                                return None
-                            if len(aggregate_rows) > expected_total:
-                                return _failure(
-                                    name,
-                                    started,
-                                    attempted_pages,
-                                    f"上游报告 {expected_total} 条，但分页合并得到 "
-                                    f"{len(aggregate_rows)} 条，结果不一致",
-                                )
-
-                        if page >= total_pages:
-                            break
-                        page += 1
-
-                    if not inconsistent and expected_total is None:
-                        await save_complete_result()
-                        return None
-
-                    if not last_incomplete_reason:
+                    if pass_pages is None:
+                        pass_pages = reported_pages
+                        total_pages = reported_pages
+                        if total_pages > MAX_PAGES:
+                            return _failure(
+                                name,
+                                started,
+                                attempted_pages,
+                                f"上游报告 {total_pages} 页，超过安全上限 {MAX_PAGES} 页",
+                            )
+                    elif reported_pages != pass_pages:
+                        inconsistent = True
                         last_incomplete_reason = (
-                            f"上游报告 {expected_total} 条，分页合并后仅获取 "
-                            f"{len(aggregate_rows)} 条"
+                            f"同一次分页返回的页数不一致（{pass_pages} / {reported_pages}）"
                         )
-                    recovery_passes = ICP_PAGINATION_RECOVERY_PASSES
-                    if expected_total and not aggregate_rows:
-                        recovery_passes = min(
-                            recovery_passes,
-                            ICP_EMPTY_RESULT_RECOVERY_PASSES,
-                        )
-                    if pagination_pass >= recovery_passes:
                         break
 
-                if expected_total is not None:
-                    detail = (
+                    page_rows = chunk["rows"]
+                    aggregate_chunks.append(page_rows)
+                    for row in page_rows:
+                        if not isinstance(row, dict):
+                            continue
+                        key = _icp_row_key(row, name)
+                        if key is None:
+                            continue
+                        aggregate_rows.setdefault(key, row)
+
+                    if expected_total is not None:
+                        if len(aggregate_rows) == expected_total:
+                            await save_complete_result()
+                            return None
+                        if len(aggregate_rows) > expected_total:
+                            return _failure(
+                                name,
+                                started,
+                                attempted_pages,
+                                f"上游报告 {expected_total} 条，但分页合并得到 "
+                                f"{len(aggregate_rows)} 条，结果不一致",
+                            )
+
+                    if page >= total_pages:
+                        break
+                    page += 1
+
+                if not inconsistent and expected_total is None:
+                    await save_complete_result()
+                    return None
+
+                if not last_incomplete_reason:
+                    last_incomplete_reason = (
                         f"上游报告 {expected_total} 条，分页合并后仅获取 "
-                        f"{len(aggregate_rows)} 条，结果不完整"
+                        f"{len(aggregate_rows)} 条"
                     )
-                else:
-                    detail = last_incomplete_reason or "分页结果不完整"
-                return _failure(name, started, attempted_pages, detail)
+                recovery_passes = ICP_PAGINATION_RECOVERY_PASSES
+                if expected_total and not aggregate_rows:
+                    recovery_passes = min(
+                        recovery_passes,
+                        ICP_EMPTY_RESULT_RECOVERY_PASSES,
+                    )
+                if pagination_pass >= recovery_passes:
+                    break
+
+            if expected_total is not None:
+                detail = (
+                    f"上游报告 {expected_total} 条，分页合并后仅获取 "
+                    f"{len(aggregate_rows)} 条，结果不完整"
+                )
+            else:
+                detail = last_incomplete_reason or "分页结果不完整"
+            return _failure(name, started, attempted_pages, detail)
         except TimeoutError:
             return _failure(
                 name,
@@ -775,49 +921,82 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
             follow_redirects=True,
             trust_env=False,
         ) as client:
-            # Cloud mode limits active companies to five. Each company's page
-            # pass has its own SeaMoon tunnel and session affinity; direct-mode
-            # WAF pacing is handled by the scheduler above.
-            # Retry in rounds so successful companies leave the queue while
-            # failed companies get a fresh session after a short cooldown.
-            pending = list(names)
+            # Cloud mode keeps one in-flight company per ready function. Each
+            # function reuses a warm YMICP session for five queries. A sliding
+            # 8s window per lane replaces a global pause. Direct-mode WAF
+            # pacing is handled by the scheduler above.
             last_failures: dict[str, CompanyFailure] = {}
-            attempt_counts: dict[str, int] = {name: 0 for name in names}
-            attempted_pages: dict[str, int] = {name: 0 for name in names}
-            elapsed_seconds: dict[str, float] = {name: 0.0 for name in names}
+            attempt_counts: dict[str, int] = {}
+            attempted_pages: dict[str, int] = {}
+            elapsed_seconds: dict[str, float] = {}
+            live_names: list[str] = []
+            seen_names: set[str] = set()
 
-            for attempt_index in range(ICP_COMPANY_MAX_ATTEMPTS):
-                # Keep at most ``batch_size`` companies active, but start the
-                # next pending company as soon as any slot is released. The old
-                # fixed-wave gather waited for the slowest 30-second timeout in
-                # each slice before using the freed fast slots, which made a
-                # 320-company batch look stalled for several minutes.
-                round_outcomes = await _run_company_round(
-                    pending,
-                    batch_size,
-                    lambda name: collect_company_once(name, client),
-                )
+            queue: asyncio.Queue[str | None] = asyncio.Queue()
 
-                retry_names: list[str] = []
-                for name, outcome in round_outcomes:
-                    attempt_counts[name] += 1
-                    if outcome is None:
-                        last_failures.pop(name, None)
+            async def worker() -> None:
+                while True:
+                    name = await queue.get()
+                    if name is None:
+                        queue.task_done()
+                        return
+                    try:
+                        outcome = await collect_company_once(name, client)
+                        attempt_counts[name] = attempt_counts.get(name, 0) + 1
+                        if outcome is None:
+                            last_failures.pop(name, None)
+                            continue
+                        attempted_pages[name] = attempted_pages.get(name, 0) + outcome.attempted_pages
+                        elapsed_seconds[name] = elapsed_seconds.get(name, 0.0) + outcome.elapsed_seconds
+                        last_failures[name] = outcome
+                        if attempt_counts[name] < ICP_COMPANY_MAX_ATTEMPTS:
+                            delay = ICP_COMPANY_RETRY_BACKOFF_SECONDS * attempt_counts[name]
+                            if delay:
+                                await asyncio.sleep(delay)
+                            await queue.put(name)
+                    finally:
+                        queue.task_done()
+
+            async def ingest() -> None:
+                sentinel = False
+                while not sentinel:
+                    item = await incoming.get()
+                    batch: list[str] = []
+                    while True:
+                        if item is None:
+                            sentinel = True
+                            break
+                        cleaned = _clean(item)
+                        if cleaned and cleaned not in seen_names:
+                            seen_names.add(cleaned)
+                            batch.append(cleaned)
+                        try:
+                            item = incoming.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                    if not batch:
                         continue
-                    attempted_pages[name] += outcome.attempted_pages
-                    elapsed_seconds[name] += outcome.elapsed_seconds
-                    last_failures[name] = outcome
-                    retry_names.append(name)
+                    cache_hits, misses = await _restore_icp_cache(repo, run_id, batch)
+                    await _record_icp_cache_stats(repo, run_id, len(cache_hits), len(misses))
+                    for name in misses:
+                        live_names.append(name)
+                        attempt_counts.setdefault(name, 0)
+                        attempted_pages.setdefault(name, 0)
+                        elapsed_seconds.setdefault(name, 0.0)
+                        await queue.put(name)
+                await queue.join()
+                for _ in workers:
+                    await queue.put(None)
 
-                pending = retry_names
-                if not pending or attempt_index + 1 >= ICP_COMPANY_MAX_ATTEMPTS:
-                    break
-                await asyncio.sleep(
-                    ICP_COMPANY_RETRY_BACKOFF_SECONDS * (attempt_index + 1)
-                )
+            workers = [
+                asyncio.create_task(worker())
+                for _ in range(max(1, batch_size))
+            ]
+            await ingest()
+            await asyncio.gather(*workers)
 
             failed: list[CompanyFailure] = []
-            for name in names:
+            for name in live_names:
                 last_failure = last_failures.get(name)
                 if last_failure is None:
                     continue
@@ -841,7 +1020,7 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
     if not failed:
         return []
 
-    ok = len(names) - len(failed)
+    ok = len(live_names) - len(failed)
     details = "；".join(
         f"{item.name}：企业尝试 {item.company_attempts} 次，"
         f"请求页面 {item.attempted_pages} 次，"
@@ -857,5 +1036,22 @@ async def _collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list
 
 async def collect_icp(repo: Repository, run_id: UUID, names: list[str]) -> list[str]:
     """Collect ICP records with one process-wide route schedule per loop."""
+    incoming: asyncio.Queue[str | None] = asyncio.Queue()
+    for name in names:
+        incoming.put_nowait(name)
+    incoming.put_nowait(None)
+    return await collect_icp_from_queue(repo, run_id, incoming)
+
+
+async def collect_icp_from_queue(
+    repo: Repository,
+    run_id: UUID,
+    incoming: asyncio.Queue[str | None],
+) -> list[str]:
+    """Collect ICP records from a rolling name queue.
+
+    The process-wide lock still serializes separate runs so they cannot reset
+    the shared WAF budget, but names from one run can be fed continuously.
+    """
     async with _collection_lock():
-        return await _collect_icp(repo, run_id, names)
+        return await _collect_icp_from_queue(repo, run_id, incoming)

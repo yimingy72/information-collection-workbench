@@ -397,6 +397,7 @@ async def run_cloud_operation(action: str, config: dict[str, Any]) -> dict[str, 
         raise ServerlessProxyError("SeaMoon 核心程序返回了无效结果")
     return {str(key): str(value) for key, value in result.items() if value is not None}
 
+
 _AUTO_SCALE_LOCK = asyncio.Lock()
 
 
@@ -423,6 +424,130 @@ def _auto_scale_regions() -> list[str]:
         if str(item).strip()
     }
     return list(dict.fromkeys(item for item in values if item and item not in excluded))
+
+
+def _replica_function_name(base: str, replica: int) -> str:
+    name = str(base or "asset-workbench-seamoon").strip() or "asset-workbench-seamoon"
+    if replica <= 1:
+        return name
+    return f"{name}-r{replica}"
+
+
+def _auto_scale_candidates(
+    nodes: list[dict[str, Any]],
+    provider: str,
+    base_function: str,
+    need: int,
+) -> list[dict[str, str]]:
+    """Choose unused regions first, then same-region replicas, then error retries.
+
+    Aliyun FC can already spawn multiple containers for one function. Extra
+    functions are only created when the platform-level node pool is short, and
+    they no longer require a brand-new region.
+    """
+    if need <= 0:
+        return []
+    regions = _auto_scale_regions()
+    existing_ids = {str(node.get("id")) for node in nodes}
+    ready_regions = {
+        str(node.get("region"))
+        for node in nodes
+        if node.get("enabled")
+        and node.get("status") == "ready"
+        and node.get("endpoint")
+        and str(node.get("region")) in regions
+    }
+    candidates: list[dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(region: str, function_name: str) -> bool:
+        node_id = f"{provider}:{region}:{function_name}"
+        if node_id in existing_ids or node_id in seen:
+            return False
+        seen.add(node_id)
+        candidates.append({"region": region, "function_name": function_name})
+        return True
+
+    for region in regions:
+        if len(candidates) >= need:
+            return candidates
+        add(region, _replica_function_name(base_function, 1))
+
+    replica = 2
+    while len(candidates) < need and replica <= 8:
+        ordered = [region for region in regions if region in ready_regions]
+        ordered.extend(region for region in regions if region not in ready_regions)
+        progressed = False
+        for region in ordered:
+            if len(candidates) >= need:
+                break
+            if add(region, _replica_function_name(base_function, replica)):
+                progressed = True
+        if not progressed:
+            break
+        replica += 1
+
+    if len(candidates) < need:
+        for node in nodes:
+            if len(candidates) >= need:
+                break
+            if node.get("status") != "error" or str(node.get("region")) not in regions:
+                continue
+            node_id = str(node.get("id") or "")
+            if not node_id or node_id in seen:
+                continue
+            seen.add(node_id)
+            candidates.append({
+                "region": str(node.get("region")),
+                "function_name": str(node.get("function_name") or base_function),
+            })
+    return candidates[:need]
+
+
+def _health_url(endpoint: str) -> str:
+    parsed = urlsplit(str(endpoint or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, "/_health", "", ""))
+
+
+async def prewarm_cloud_nodes(config: dict[str, Any]) -> dict[str, Any]:
+    """Wake ready FC instances before the first ICP page request.
+
+    Custom-container functions scale to zero. A 5-10s WebSocket handshake during
+    the first ICP page is enough to burn the company budget, so poke ``/_health``
+    on every ready endpoint first. Failures stay isolated; the query still runs.
+    """
+    row = _row(config)
+    if not row.get("enabled") or manual_proxy_urls(config):
+        return {"warmed": 0, "failed": 0, "errors": []}
+    nodes = [
+        node
+        for node in pool_nodes(row)
+        if node.get("enabled") and node.get("status") == "ready" and node.get("endpoint")
+    ]
+    if not nodes:
+        return {"warmed": 0, "failed": 0, "errors": []}
+
+    timeout = httpx.Timeout(20.0, connect=15.0, read=20.0, write=10.0, pool=5.0)
+    verify = not bool(row.get("insecure_skip_verify"))
+
+    async def ping(node: dict[str, Any]) -> str | None:
+        url = _health_url(str(node.get("endpoint") or ""))
+        if not url:
+            return f"{node.get('region') or node.get('id')}：函数地址无效"
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, trust_env=False, verify=verify) as client:
+                response = await client.get(url)
+            if response.status_code >= 500:
+                return f"{node.get('region') or node.get('id')}：HTTP {response.status_code}"
+            return None
+        except Exception as exc:  # noqa: BLE001 - prewarm must not block ICP
+            return f"{node.get('region') or node.get('id')}：{exc}"
+
+    details = await asyncio.gather(*(ping(node) for node in nodes))
+    errors = [item for item in details if item]
+    return {"warmed": len(nodes) - len(errors), "failed": len(errors), "errors": errors}
 
 
 async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
@@ -454,42 +579,31 @@ async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
         if len(ready) >= target:
             return {"target": target, "ready": len(ready), "deployed": 0, "errors": []}
 
-        existing_ids = {str(node.get("id")) for node in nodes}
         provider = str(row.get("provider") or "aliyun")
         function_name = str(row.get("function_name") or "asset-workbench-seamoon")
-        # An endpoint can be created successfully but fail its first probe
-        # while the FC trigger is still propagating. Keep that region in the
-        # candidate list so a later workload-size increase can retry it; the
-        # node remains disabled until a probe succeeds.
-        candidates = [
-            region for region in _auto_scale_regions()
-            if f"{provider}:{region}:{function_name}" not in existing_ids
-            or any(
-                str(node.get("id")) == f"{provider}:{region}:{function_name}"
-                and node.get("status") == "error"
-                for node in nodes
-            )
-        ]
         need = max(0, target - len(ready))
-        candidates = candidates[:need]
+        candidates = _auto_scale_candidates(nodes, provider, function_name, need)
         if not candidates:
             return {
                 "target": target,
                 "ready": len(ready),
                 "deployed": 0,
-                "errors": ["没有更多可用的云函数地域候选"],
+                "errors": ["没有更多可用的云函数节点候选"],
             }
 
         semaphore = asyncio.Semaphore(2)
         probe_lock = asyncio.Lock()
 
-        async def deploy_region(region: str) -> tuple[dict[str, Any] | None, str | None]:
+        async def deploy_candidate(candidate: dict[str, str]) -> tuple[dict[str, Any] | None, str | None]:
+            region = candidate["region"]
+            candidate_function = candidate["function_name"]
+            node: dict[str, Any] | None = None
             async with semaphore:
                 config = {
                     **row,
                     "provider": provider,
                     "region": region,
-                    "function_name": function_name,
+                    "function_name": candidate_function,
                     "image_uri": str(row.get("image_uri") or ""),
                     "access_key_id": str(row.get("access_key_id") or ""),
                     "access_key_secret": str(row.get("access_key_secret") or ""),
@@ -501,12 +615,12 @@ async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
                     if not endpoint:
                         raise ServerlessProxyError("云平台未返回函数地址")
                     node = {
-                        "id": f"{provider}:{region}:{function_name}",
+                        "id": f"{provider}:{region}:{candidate_function}",
                         "enabled": False,
                         "provider": provider,
                         "endpoint": endpoint,
                         "region": region,
-                        "function_name": function_name,
+                        "function_name": candidate_function,
                         "image_uri": config["image_uri"],
                         "access_key_id": config["access_key_id"],
                         "access_key_secret": config["access_key_secret"],
@@ -534,14 +648,14 @@ async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
                     node["status"] = "ready"
                     return node, None
                 except Exception as exc:  # noqa: BLE001 - preserve healthy pool
-                    if "node" in locals():
+                    if node is not None:
                         node["enabled"] = False
                         node["status"] = "error"
                         node["last_error"] = str(exc)
-                        return node, f"{region}：{exc}"
-                    return None, f"{region}：{exc}"
+                        return node, f"{region}/{candidate_function}：{exc}"
+                    return None, f"{region}/{candidate_function}：{exc}"
 
-        outcomes = await asyncio.gather(*(deploy_region(region) for region in candidates))
+        outcomes = await asyncio.gather(*(deploy_candidate(item) for item in candidates))
         errors = [error for _, error in outcomes if error]
         # Persist failed probes for observability and future repair attempts,
         # but only admit nodes that actually passed warm-up to the gateway.
