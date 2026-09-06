@@ -8,7 +8,7 @@ from app.providers.names import normalize_providers, provider_label
 from app.providers.riskbird import AnonymousRiskbird
 from app.providers.tianyancha import AnonymousTianyancha
 from app.runtime import SESSION_PROVIDERS, session_cookie, session_login_gaps
-from app.serverless_proxy import active_proxy_urls, manual_proxy_urls
+from app.serverless_proxy import active_proxy_urls
 from app.settings import settings
 
 
@@ -36,13 +36,11 @@ def build_providers(
             # When a verified proxy is configured, use it for the anonymous
             # Tianyancha endpoints as well; this avoids reusing the local
             # machine exit after the upstream starts returning login walls.
-            manual_routes = manual_proxy_urls(runtime)
-            proxy_routes = manual_routes or active_proxy_urls(runtime)
             providers.append(AnonymousTianyancha(
                 settings.tianyancha_base_url,
-                # Use every verified route, rotating on retry. Manual routes
-                # take precedence when the operator explicitly adds one.
-                proxy=proxy_routes,
+                # Follow the selected proxy pool. Cloud is default; HTTP
+                # proxies are used only when that pool is selected.
+                proxy=active_proxy_urls(runtime),
             ))
             continue
         cookie = session_cookie(runtime, provider_id)

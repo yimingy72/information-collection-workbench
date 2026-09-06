@@ -270,3 +270,33 @@ async def test_subdomain_result_count_reads_persisted_rows():
     repo = Repository(pool, None)
     assert await repo.subdomain_result_count(uuid4()) == 8
     assert "count(*) FROM subdomain_results" in pool.queries[0][0]
+
+
+
+@pytest.mark.asyncio
+async def test_list_history_unions_collection_and_subdomain_runs():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.list_history(20, 0, "tobacco", "succeeded", "")
+    query, args = pool.queries[0]
+    assert "UNION ALL" in query
+    assert "collection_runs" in query
+    assert "subdomain_runs" in query
+    assert args == (20, 0, "tobacco", "succeeded", "")
+
+
+@pytest.mark.asyncio
+async def test_delete_history_splits_collection_and_subdomain_ids():
+    from uuid import uuid4
+    pool = FakePool()
+    repo = Repository(pool, None)
+    collection_id = uuid4()
+    subdomain_id = uuid4()
+    await repo.delete_history([
+        ("collection", collection_id),
+        ("subdomain", subdomain_id),
+    ])
+    queries = "\n".join(query for query, _ in pool.queries)
+    assert "DELETE FROM collection_runs" in queries
+    assert "DELETE FROM subdomain_runs" in queries
+

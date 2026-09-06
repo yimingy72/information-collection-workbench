@@ -8,6 +8,7 @@ import {
   deleteRuns,
   getQuery,
   getSettings,
+  saveProxyPool,
   listRuns,
 } from './api'
 import { AppShell } from './components/AppShell'
@@ -28,7 +29,6 @@ import type {
   SettingsView,
 } from './types'
 import { PROVIDER_OPTIONS, SESSION_PROVIDERS } from './types'
-import { TABLE_PAGE_SIZE } from './pagination'
 import './styles.css'
 
 const terminalStatuses = new Set(['succeeded', 'partial', 'failed', 'cancelled'])
@@ -77,13 +77,6 @@ function Workbench({
 }) {
   const { message } = AntdApp.useApp()
   const [page, setPage] = useState(parseHash)
-  const [runs, setRuns] = useState<Run[]>([])
-  const [runTotal, setRunTotal] = useState(0)
-  const [runPage, setRunPage] = useState(1)
-  const [runPageSize, setRunPageSize] = useState(TABLE_PAGE_SIZE)
-  const [runKeyword, setRunKeyword] = useState('')
-  const [runStatus, setRunStatus] = useState('')
-  const [runsLoading, setRunsLoading] = useState(false)
   const [query, setQuery] = useState<QueryView | null>(null)
   const [querying, setQuerying] = useState(false)
   const [queryError, setQueryError] = useState<string | null>(null)
@@ -92,6 +85,7 @@ function Workbench({
   const loadedId = useRef<string | null>(null)
   const collectionEventSource = useRef<EventSource | null>(null)
   const [settings, setSettings] = useState<SettingsView | null>(null)
+  const [savingProxyPool, setSavingProxyPool] = useState(false)
 
   const refreshSettings = async () => {
     try {
@@ -132,20 +126,6 @@ function Workbench({
 
   const [recents, setRecents] = useState<Run[]>([])
 
-  const refreshRuns = async () => {
-    setRunsLoading(true)
-    try {
-      const data = await listRuns(runPage, runPageSize, runKeyword, runStatus)
-      setRuns(data.items)
-      setRunTotal(data.total)
-      setApiError(null)
-    } catch {
-      setApiError('无法连接工作台 API。')
-    } finally {
-      setRunsLoading(false)
-    }
-  }
-
   const refreshRecents = async () => {
     try {
       const data = await listRuns(1, 12)
@@ -168,11 +148,6 @@ function Workbench({
     void refreshRecents()
     void refreshSettings()
   }, [])
-
-  useEffect(() => {
-    if (page !== 'tasks') return
-    void refreshRuns()
-  }, [page, runPage, runPageSize, runKeyword, runStatus])
 
   useEffect(() => {
     collectionEventSource.current?.close()
@@ -272,6 +247,33 @@ function Workbench({
     (settings?.sessions ?? []).filter((item) => item.status === 'logged_in').map((item) => item.provider),
   )
 
+  const proxyPool = settings?.proxy_pool === 'manual' || settings?.proxy_pool === 'direct'
+    ? settings.proxy_pool
+    : 'cloud'
+
+  const onProxyPoolChange = async (value: 'cloud' | 'manual' | 'direct') => {
+    const cloudReady = Boolean(
+      settings?.serverless_proxy.status === 'ready'
+      || settings?.serverless_proxy.nodes.some((item) => item.status === 'ready' && item.endpoint),
+    )
+    if (value === 'cloud' && !cloudReady) {
+      message.warning('请先在基础配置中一键部署云函数')
+      return
+    }
+    if (value === 'manual' && !(settings?.manual_proxies.some((item) => item.enabled && item.status === 'ready'))) {
+      message.warning('请先在基础配置中添加并检测自定义代理')
+      return
+    }
+    setSavingProxyPool(true)
+    try {
+      setSettings(await saveProxyPool(value))
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '切换代理失败')
+    } finally {
+      setSavingProxyPool(false)
+    }
+  }
+
   const submit = async (values: CollectionValues) => {
     const missing = SESSION_PROVIDERS.filter((item) => values.providers.includes(item.value) && !loggedIn.has(item.value)).map((item) => item.label)
     if (missing.length) {
@@ -317,36 +319,7 @@ function Workbench({
       onOpenRun={(id) => navigate(id ? `subdomains/${id}` : 'subdomains')}
     />
   ) : page === 'tasks' ? (
-    <TasksPage
-      runs={runs}
-      total={runTotal}
-      page={runPage}
-      pageSize={runPageSize}
-      loading={runsLoading}
-      keyword={runKeyword}
-      status={runStatus}
-      onKeywordChange={(value) => {
-        setRunPage(1)
-        setRunKeyword(value)
-      }}
-      onStatusChange={(value) => {
-        setRunPage(1)
-        setRunStatus(value)
-      }}
-      onPageChange={(nextPage, nextSize) => {
-        if (nextSize !== runPageSize) {
-          setRunPage(1)
-          setRunPageSize(nextSize)
-          return
-        }
-        setRunPage(nextPage)
-      }}
-      onDelete={async (ids) => {
-        await deleteRuns(ids)
-        await refreshRuns()
-        await refreshRecents()
-      }}
-    />
+    <TasksPage />
   ) : (
     <CollectionPage
       form={form}
@@ -362,13 +335,15 @@ function Workbench({
         try {
           await deleteRuns([run.id])
           await refreshRecents()
-          if (page === 'tasks') await refreshRuns()
         } catch (error) {
           message.error(error instanceof Error ? error.message : '删除失败')
         }
       }}
       onCancel={cancelCurrentQuery}
       settings={settings}
+      proxyPool={proxyPool}
+      onProxyPoolChange={(value) => void onProxyPoolChange(value)}
+      savingProxyPool={savingProxyPool}
     />
   )
 

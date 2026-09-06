@@ -5,7 +5,6 @@ import {
   DatabaseOutlined,
   DeleteOutlined,
   LogoutOutlined,
-  PoweroffOutlined,
   QrcodeOutlined,
   RocketOutlined,
   SaveOutlined,
@@ -22,7 +21,6 @@ import {
   Segmented,
   Select,
   Space,
-  Switch,
   Table,
   Tag,
   Typography,
@@ -32,9 +30,7 @@ import {
   cancelQrLogin,
   clearSession,
   deleteServerlessProxyDeployment,
-  deleteServerlessProxyNode,
   deployServerlessProxy,
-  disableServerlessProxy,
   getSettings,
   pollQrLogin,
   saveServerlessProxy,
@@ -45,28 +41,42 @@ import { formatDate } from '../formatters'
 import type { CloudProvider, ServerlessProxyValues, SessionProviderId, SettingsView } from '../types'
 import { ProxySettingsPage } from './ProxySettingsPage'
 
-type SettingsSection = 'sources' | 'cloud' | 'manual'
+type SettingsSection = 'sources' | 'proxy'
 
+const DEFAULT_FUNCTION_NAME = 'asset-workbench-seamoon'
+const ALIYUN_DEFAULT_REGION = 'cn-hangzhou'
+const TENCENT_DEFAULT_REGION = 'ap-guangzhou'
 const ALIYUN_REGIONS = [
-  { value: 'cn-hangzhou', label: '华东 1（杭州）' },
-  { value: 'cn-shanghai', label: '华东 2（上海）' },
-  { value: 'cn-qingdao', label: '华北 1（青岛）' },
-  { value: 'cn-beijing', label: '华北 2（北京）' },
-  { value: 'cn-zhangjiakou', label: '华北 3（张家口）' },
-  { value: 'cn-huhehaote', label: '华北 5（呼和浩特）' },
-  { value: 'cn-shenzhen', label: '华南 1（深圳）' },
-  { value: 'cn-chengdu', label: '西南 1（成都）' },
-  { value: 'cn-hongkong', label: '中国香港' },
+  ALIYUN_DEFAULT_REGION,
+  'cn-shanghai',
+  'cn-qingdao',
+  'cn-beijing',
+  'cn-zhangjiakou',
+  'cn-huhehaote',
+  'cn-shenzhen',
+  'cn-chengdu',
+  'cn-hongkong',
+] as const
+const TENCENT_REGIONS = [
+  TENCENT_DEFAULT_REGION,
+  'ap-shanghai',
+  'ap-beijing',
+  'ap-chengdu',
+  'ap-nanjing',
+  'ap-hongkong',
 ] as const
 
-const TENCENT_REGIONS = [
-  { value: 'ap-guangzhou', label: '华南地区（广州）' },
-  { value: 'ap-shanghai', label: '华东地区（上海）' },
-  { value: 'ap-beijing', label: '华北地区（北京）' },
-  { value: 'ap-chengdu', label: '西南地区（成都）' },
-  { value: 'ap-nanjing', label: '华东地区（南京）' },
-  { value: 'ap-hongkong', label: '中国香港' },
-] as const
+const managedCloudTarget = (provider: CloudProvider, region?: string, functionName?: string) => {
+  const nextProvider: CloudProvider = provider === 'tencent' ? 'tencent' : 'aliyun'
+  const allowed = nextProvider === 'tencent' ? TENCENT_REGIONS : ALIYUN_REGIONS
+  const fallback = nextProvider === 'tencent' ? TENCENT_DEFAULT_REGION : ALIYUN_DEFAULT_REGION
+  const nextRegion = allowed.find((item) => item === region) ?? fallback
+  return {
+    provider: nextProvider,
+    region: nextRegion,
+    function_name: (functionName || '').trim() || DEFAULT_FUNCTION_NAME,
+  }
+}
 
 const sessionTag = (status: SettingsView['sessions'][number]['status']) => {
   if (status === 'logged_in') return <Tag color="success">已登录</Tag>
@@ -74,8 +84,8 @@ const sessionTag = (status: SettingsView['sessions'][number]['status']) => {
   return <Tag>未登录</Tag>
 }
 
-const proxyTag = (status?: string, enabled = false) => {
-  if (status === 'ready') return <Tag color={enabled ? 'success' : 'processing'}>{enabled ? '运行中' : '已验证'}</Tag>
+const proxyTag = (status?: string) => {
+  if (status === 'ready') return <Tag color="success">已就绪</Tag>
   if (status === 'deployed') return <Tag color="processing">已部署</Tag>
   if (status === 'deploying' || status === 'testing') return <Tag color="processing">处理中</Tag>
   if (status === 'error') return <Tag color="error">异常</Tag>
@@ -185,37 +195,21 @@ function QrLogin({ provider, onSuccess }: { provider: SessionProviderId; onSucce
 }
 
 const proxyFormValues = (settings: SettingsView): ServerlessProxyValues => {
-  const provider: CloudProvider = settings.serverless_proxy.provider === 'tencent' ? 'tencent' : 'aliyun'
-  const regions = provider === 'tencent' ? TENCENT_REGIONS : ALIYUN_REGIONS
-  const region = regions.some((item) => item.value === settings.serverless_proxy.region)
-    ? settings.serverless_proxy.region
-    : regions[0].value
-
+  const target = managedCloudTarget(
+    settings.serverless_proxy.provider === 'tencent' ? 'tencent' : 'aliyun',
+    settings.serverless_proxy.region,
+    settings.serverless_proxy.function_name,
+  )
   return {
     enabled: settings.serverless_proxy.enabled,
-    provider,
+    provider: target.provider,
     endpoint: settings.serverless_proxy.endpoint,
-    region,
-    function_name: settings.serverless_proxy.function_name,
+    region: target.region,
+    function_name: target.function_name,
     image_uri: settings.serverless_proxy.image_uri,
     access_key_id: settings.serverless_proxy.access_key_id,
     access_key_secret: undefined,
     insecure_skip_verify: settings.serverless_proxy.insecure_skip_verify,
-  }
-}
-
-const managedFields = (provider: CloudProvider) => {
-  if (provider === 'tencent') {
-    return {
-      keyLabel: 'SecretId',
-      secretLabel: 'SecretKey',
-      regions: TENCENT_REGIONS,
-    }
-  }
-  return {
-    keyLabel: 'AccessKey ID',
-    secretLabel: 'AccessKey Secret',
-    regions: ALIYUN_REGIONS,
   }
 }
 
@@ -230,7 +224,6 @@ export function SettingsPage() {
   const [savingProxy, setSavingProxy] = useState(false)
   const [deployingProxy, setDeployingProxy] = useState(false)
   const [testingProxy, setTestingProxy] = useState(false)
-  const [disablingProxy, setDisablingProxy] = useState(false)
   const [deletingProxy, setDeletingProxy] = useState(false)
 
   const applySettings = (next: SettingsView) => {
@@ -252,13 +245,25 @@ export function SettingsPage() {
     void refresh()
   }, [])
 
+  const cloudFormValues = async (overrides: Partial<ServerlessProxyValues> = {}) => {
+    const values = await proxyForm.validateFields()
+    const target = managedCloudTarget(values.provider, values.region, values.function_name)
+    proxyForm.setFieldsValue(target)
+    return {
+      ...values,
+      ...target,
+      ...overrides,
+      image_uri: '',
+    }
+  }
+
   const saveProxy = async (notify = true) => {
     setSavingProxy(true)
     try {
-      const values = { ...await proxyForm.validateFields(), image_uri: '' }
+      const values = await cloudFormValues()
       const next = await saveServerlessProxy(values)
       applySettings(next)
-      if (notify) message.success('配置已保存，当前查询路由未改变')
+      if (notify) message.success('云函数配置已保存')
       return true
     } catch (error) {
       if (error instanceof Error) message.error(error.message)
@@ -271,7 +276,7 @@ export function SettingsPage() {
   const onDeployProxy = async () => {
     setDeployingProxy(true)
     try {
-      const values = { ...await proxyForm.validateFields(), enabled: false, image_uri: '' }
+      const values = await cloudFormValues({ enabled: false })
       const result = await deployServerlessProxy(values)
       applySettings(result.settings)
       message.success(`云函数已部署、验证并启用，百度实测 ${result.test.latency_ms} ms`)
@@ -297,18 +302,6 @@ export function SettingsPage() {
     }
   }
 
-  const onDisableProxy = async () => {
-    setDisablingProxy(true)
-    try {
-      applySettings(await disableServerlessProxy())
-      message.success('云函数代理已停用，企业查询恢复直连')
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '停用代理失败')
-    } finally {
-      setDisablingProxy(false)
-    }
-  }
-
   const onDeleteProxy = async () => {
     setDeletingProxy(true)
     try {
@@ -316,18 +309,6 @@ export function SettingsPage() {
       message.success('云函数已删除')
     } catch (error) {
       message.error(error instanceof Error ? error.message : '云函数删除失败')
-    } finally {
-      setDeletingProxy(false)
-    }
-  }
-
-  const onDeleteProxyNode = async (nodeId: string) => {
-    setDeletingProxy(true)
-    try {
-      applySettings(await deleteServerlessProxyNode(nodeId))
-      message.success('云函数节点已删除')
-    } catch (error) {
-      message.error(error instanceof Error ? error.message : '删除云函数节点失败')
     } finally {
       setDeletingProxy(false)
     }
@@ -385,47 +366,6 @@ export function SettingsPage() {
   ]
 
   const proxy = settings?.serverless_proxy
-  const hasReadyManualProxy = Boolean(
-    settings?.manual_proxies.some((item) => item.enabled && item.status === 'ready'),
-  )
-  const routeLabel = hasReadyManualProxy ? 'HTTP代理' : proxy?.enabled ? '云函数代理' : '直连'
-  const routeColor = hasReadyManualProxy ? 'processing' : proxy?.enabled ? 'success' : 'default'
-  const managed = managedFields(provider)
-
-  const cloudNodeColumns: TableProps<NonNullable<SettingsView['serverless_proxy']['nodes']>[number]>['columns'] = [
-    { title: '地域', dataIndex: 'region', width: 150 },
-    { title: '函数', dataIndex: 'function_name', ellipsis: true },
-    {
-      title: '状态',
-      key: 'status',
-      width: 90,
-      render: (_: unknown, row) => proxyTag(row.status, row.enabled),
-    },
-    {
-      title: '延迟',
-      dataIndex: 'latency_ms',
-      width: 90,
-      render: (value: number | null | undefined) => value == null ? '-' : `${value} ms`,
-    },
-    {
-      title: '操作',
-      key: 'actions',
-      width: 76,
-      render: (_: unknown, row) => (
-        row.deployment_id ? (
-          <Popconfirm
-            title="删除这个云函数节点？"
-            description="只删除当前节点，其他区域节点继续工作。"
-            okText="删除"
-            cancelText="取消"
-            onConfirm={() => void onDeleteProxyNode(row.id)}
-          >
-            <Button type="link" danger size="small" icon={<DeleteOutlined />} loading={deletingProxy} />
-          </Popconfirm>
-        ) : null
-      ),
-    },
-  ]
 
   const dataSourceTab = (
     <Card title="数据源登录" size="small" loading={loading}>
@@ -440,16 +380,54 @@ export function SettingsPage() {
     </Card>
   )
 
+  const cloudActions = (
+    <Space size={8} wrap className="serverless-action-buttons">
+      <Button size="small" icon={<SaveOutlined />} loading={savingProxy} onClick={() => void saveProxy()}>
+        保存
+      </Button>
+      <Button
+        size="small"
+        type="primary"
+        icon={<RocketOutlined />}
+        loading={deployingProxy}
+        onClick={() => void onDeployProxy()}
+      >
+        一键部署
+      </Button>
+      <Button
+        size="small"
+        icon={<ApiOutlined />}
+        disabled={!proxy?.nodes?.length}
+        loading={testingProxy}
+        onClick={() => void onTestProxy()}
+      >
+        测试
+      </Button>
+      {proxy?.deployment_id && (
+        <Popconfirm
+          title="删除云函数？"
+          description="将从云平台删除该函数，平台同时关闭代理。"
+          okText="删除"
+          cancelText="取消"
+          onConfirm={() => void onDeleteProxy()}
+        >
+          <Button size="small" danger icon={<DeleteOutlined />} loading={deletingProxy}>删除</Button>
+        </Popconfirm>
+      )}
+    </Space>
+  )
+
   const cloudProxyTab = (
     <Card
       className="serverless-shell"
       title={(
         <Space>
           <CloudServerOutlined />
-          <span>SeaMoon 云函数代理（ICP / 爱企查）</span>
-          {proxyTag(proxy?.status, proxy?.enabled)}
+          <span>云函数代理</span>
+          {proxyTag(proxy?.status)}
         </Space>
       )}
+      extra={cloudActions}
       size="small"
       loading={loading}
     >
@@ -461,73 +439,22 @@ export function SettingsPage() {
         initialValues={{
           enabled: false,
           provider: 'aliyun',
-          region: 'cn-hangzhou',
-          function_name: 'asset-workbench-seamoon',
+          region: ALIYUN_DEFAULT_REGION,
+          function_name: DEFAULT_FUNCTION_NAME,
           insecure_skip_verify: false,
         }}
       >
-        <div className="serverless-action-bar serverless-action-bar-top" role="toolbar" aria-label="云函数操作">
-          <div className="serverless-action-meta">
-            <Space size={6} wrap>
-              <Typography.Text type="secondary">ICP / 爱企查查询路由</Typography.Text>
-              <Tag color={routeColor}>{routeLabel}</Tag>
-              <Typography.Text type="secondary" className="serverless-action-hint">
-                手动代理优先；无可用手动代理时才使用云函数
-              </Typography.Text>
-            </Space>
-          </div>
-          <Space size={4} wrap className="serverless-action-buttons">
-            <Button size="small" icon={<SaveOutlined />} loading={savingProxy} onClick={() => void saveProxy()}>
-              保存
-            </Button>
-            <Button
-              size="small"
-              type='primary'
-              icon={<RocketOutlined />}
-              loading={deployingProxy}
-              onClick={() => void onDeployProxy()}
-            >
-              一键部署
-            </Button>
-            <Button
-              size="small"
-              icon={<ApiOutlined />}
-              disabled={!proxy?.nodes?.length}
-              loading={testingProxy}
-              onClick={() => void onTestProxy()}
-            >
-              测试
-            </Button>
-            {proxy?.enabled && (
-              <Button
-                size="small"
-                icon={<PoweroffOutlined />}
-                loading={disablingProxy}
-                onClick={() => void onDisableProxy()}
-              >
-                停止
-              </Button>
-            )}
-            {proxy?.deployment_id && (
-              <Popconfirm
-                title="删除云函数？"
-                description="将从云平台删除该函数，平台同时关闭代理。"
-                okText="删除"
-                cancelText="取消"
-                onConfirm={() => void onDeleteProxy()}
-              >
-                <Button size="small" danger icon={<DeleteOutlined />} loading={deletingProxy}>删除</Button>
-              </Popconfirm>
-            )}
-          </Space>
-        </div>
-
-        <Card type="inner" size="small" title="1. 选择云平台" className="serverless-section-card serverless-setup-card">
+        <Form.Item name="region" hidden>
+          <Input />
+        </Form.Item>
+        <Form.Item name="function_name" hidden>
+          <Input />
+        </Form.Item>
+        <div className="serverless-proxy-grid">
           <Form.Item name="provider" label="云平台" rules={[{ required: true }]}>
             <Select
               onChange={(value: CloudProvider) => {
-                if (value === 'aliyun') proxyForm.setFieldValue('region', 'cn-hangzhou')
-                if (value === 'tencent') proxyForm.setFieldValue('region', 'ap-guangzhou')
+                proxyForm.setFieldsValue(managedCloudTarget(value, undefined, proxyForm.getFieldValue('function_name')))
               }}
               options={[
                 { value: 'aliyun', label: '阿里云函数计算 FC' },
@@ -535,58 +462,24 @@ export function SettingsPage() {
               ]}
             />
           </Form.Item>
-        </Card>
-
-        <Card type="inner" size="small" title="2. 填写云账户和函数参数" className="serverless-section-card">
-          <Typography.Text className="serverless-managed-note" type="secondary">
-            平台会自动创建并管理 SeaMoon 函数，无需填写函数地址或镜像；托管规格：0.1 vCPU / 128 MB / 512 MB / 单实例并发 6 / 最小实例 0。
-          </Typography.Text>
-          <div className="serverless-proxy-grid">
-            <Form.Item name="region" label="函数地域" rules={[{ required: true, message: '请输入地域' }]}>
-              <Select options={[...managed.regions]} />
-            </Form.Item>
-            <Form.Item name="function_name" label="函数名称" rules={[{ required: true, message: '请输入函数名称' }]}>
-              <Input placeholder="asset-workbench-seamoon" />
-            </Form.Item>
-            <Form.Item name="access_key_id" label={managed.keyLabel} extra="只用于调用云平台 API 创建或删除函数。">
-              <Input autoComplete="off" />
-            </Form.Item>
-            <Form.Item
-              name="access_key_secret"
-              label={managed.secretLabel}
-              extra={proxy?.has_access_key_secret ? '已保存密钥；留空表示保持不变。' : '首次自动部署时需要填写。'}
-            >
-              <Input.Password autoComplete="new-password" placeholder={proxy?.has_access_key_secret ? '已保存，留空不修改' : ''} />
-            </Form.Item>
-          </div>
-        </Card>
-
-        <Card type="inner" size="small" title={`3. 节点池（${proxy?.nodes?.length ?? 0}）`} className="serverless-section-card">
-          <Table
-            className="serverless-node-table"
-            rowKey="id"
-            size="small"
-            pagination={false}
-            dataSource={proxy?.nodes ?? []}
-            columns={cloudNodeColumns}
-            locale={{ emptyText: '尚未部署云函数节点' }}
-          />
-        </Card>
-
-        <Card type="inner" size="small" title="4. 验证状态" className="serverless-section-card">
-          <div className="serverless-route-summary">
-            <Typography.Text type="secondary">部署会自动验证并启用代理；测试只检查链路，不切换当前路由。</Typography.Text>
-            <Form.Item name="insecure_skip_verify" label="TLS 证书校验" valuePropName="checked" className="serverless-tls-item">
-              <Switch size="small" checkedChildren="跳过" unCheckedChildren="校验" />
-            </Form.Item>
-          </div>
-          {proxy?.last_error && <Alert className="proxy-error" type="error" showIcon title={proxy.last_error} />}
-        </Card>
+          <Form.Item name="access_key_id" label="AccessKey ID" rules={[{ required: true, message: '请输入 AccessKey ID' }]}>
+            <Input autoComplete="off" placeholder={provider === 'tencent' ? '腾讯云 SecretId' : '阿里云 AccessKey ID'} />
+          </Form.Item>
+          <Form.Item name="access_key_secret" label="AccessKey Secret">
+            <Input.Password autoComplete="new-password" placeholder={proxy?.has_access_key_secret ? '已保存，留空不修改' : (provider === 'tencent' ? '腾讯云 SecretKey' : '阿里云 AccessKey Secret')} />
+          </Form.Item>
+        </div>
+        {proxy?.last_error && <Alert className="proxy-error" type="error" showIcon title={proxy.last_error} />}
       </Form>
     </Card>
   )
 
-  const manualProxyTab = <ProxySettingsPage embedded />
+  const proxyPoolTab = (
+    <div className="proxy-pool-page">
+      {cloudProxyTab}
+      <ProxySettingsPage embedded />
+    </div>
+  )
 
   return (
     <div className="page settings-page">
@@ -596,14 +489,13 @@ export function SettingsPage() {
           value={settingsSection}
           options={[
             { value: 'sources', label: '数据源配置', icon: <DatabaseOutlined /> },
-            { value: 'cloud', label: '云函数配置', icon: <CloudServerOutlined /> },
-            { value: 'manual', label: '代理设置', icon: <ApiOutlined /> },
+            { value: 'proxy', label: '代理池配置', icon: <CloudServerOutlined /> },
           ]}
           onChange={(value) => setSettingsSection(value as SettingsSection)}
         />
       </div>
       <div className="settings-section-content">
-        {settingsSection === 'sources' ? dataSourceTab : settingsSection === 'cloud' ? cloudProxyTab : manualProxyTab}
+        {settingsSection === 'sources' ? dataSourceTab : proxyPoolTab}
       </div>
     </div>
   )

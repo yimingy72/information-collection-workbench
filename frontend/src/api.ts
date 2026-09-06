@@ -1,5 +1,7 @@
 import type {
   CollectionValues,
+  HistoryItem,
+  HistoryList,
   QrPoll,
   QrStart,
   QueryView,
@@ -48,6 +50,29 @@ export const api = async <T,>(path: string, init?: RequestInit): Promise<T> => {
   const body = await response.text()
   return (body ? JSON.parse(body) : undefined) as T
 }
+
+export const listHistory = (
+  page: number,
+  pageSize: number,
+  keyword = '',
+  status = '',
+  kind = '',
+) => {
+  const query = new URLSearchParams({
+    limit: String(pageSize),
+    offset: String((page - 1) * pageSize),
+  })
+  if (keyword.trim()) query.set('keyword', keyword.trim())
+  if (status.trim()) query.set('status', status.trim())
+  if (kind.trim()) query.set('kind', kind.trim())
+  return api<HistoryList>(`/api/v1/history?${query.toString()}`)
+}
+
+export const deleteHistory = (items: Array<Pick<HistoryItem, 'id' | 'kind'>>) =>
+  api<{ deleted: number }>('/api/v1/history/batch-delete', {
+    method: 'POST',
+    body: JSON.stringify({ items }),
+  })
 
 export const listRuns = (page: number, pageSize: number, keyword = '', status = '') => {
   const query = new URLSearchParams({
@@ -115,6 +140,12 @@ export const deleteRuns = (ids: string[]) =>
 
 
 export const getSettings = () => api<SettingsView>('/api/v1/settings')
+
+export const saveProxyPool = (proxyPool: 'cloud' | 'manual' | 'direct') =>
+  api<SettingsView>('/api/v1/settings/proxy-pool', {
+    method: 'PUT',
+    body: JSON.stringify({ proxy_pool: proxyPool }),
+  })
 
 export const saveServerlessProxy = (values: ServerlessProxyValues) =>
   api<SettingsView>('/api/v1/settings/serverless-proxy', {
@@ -225,7 +256,7 @@ export const deleteSubdomainRun = (runId: string) =>
 export const cancelSubdomainRun = (runId: string) =>
   api<SubdomainRun>(`/api/v1/subdomain-runs/${runId}/cancel`, { method: 'POST' })
 
-export const listIcpDomainRuns = (limit = 50) =>
+export const listIcpDomainRuns = (limit = 100) =>
   api<{ items: IcpDomainRun[] }>(`/api/v1/icp-domain-runs?limit=${limit}`)
 
 export const subdomainEventUrl = (runId: string, afterSeq = 0) =>

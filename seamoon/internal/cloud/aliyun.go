@@ -40,9 +40,16 @@ func aliyunImage(config Config) (string, error) {
 }
 
 func aliyunContainerConfig(image string) *fc.CustomContainerConfig {
+	// Official SeaMoon images start via ENTRYPOINT ["/app/entrypoint.sh"]
+	// which execs /app/seamoon. Some FC regions treat an omitted/empty
+	// Entrypoint as "no entrypoint", so Command[0]="server" is executed
+	// directly and the container dies with 502 (executable not in PATH).
 	return &fc.CustomContainerConfig{
 		Image: tea.String(image),
 		Port:  tea.Int32(9000),
+		Entrypoint: []*string{
+			tea.String("/app/seamoon"),
+		},
 		Command: []*string{
 			tea.String("server"), tea.String("-p"), tea.String("9000"), tea.String("-t"), tea.String("websocket"),
 		},

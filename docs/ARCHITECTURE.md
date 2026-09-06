@@ -32,13 +32,14 @@
 - 迁移 `026_collection_event_stream.sql` 为 `relationships` 和 `results` 增加单调递增的 `stream_seq`，分别建立 `(run_id, stream_seq)` 索引。
 - `GET /api/v1/collection-runs/{id}/events` 使用 SSE 批量发送新增投资关系、ICP 结果和任务摘要；每次最多读取1,000条增量，空闲时发送 keepalive。
 - `GET /api/v1/subdomain-runs/{id}/events` 使用 `subdomain_results.stream_seq` 作为变更游标；DNS 初次写入和后续 HTTP 丰富字段更新都会被推送，刷新页面可从快照后的游标继续接收。
+- `GET /api/v1/history` 合并 `collection_runs` 与 `subdomain_runs`，按创建时间倒序分页；`POST /api/v1/history/batch-delete` 按记录类型分别删除。历史查询页在当前页面打开详情，不再跳转到对应功能页。
 - 初始 `QueryResponse` 在读取完整快照前先捕获关系/结果游标。并发写入的数据可能重复出现在快照和增量中，但前端按稳定业务键合并，因此不会因竞态漏掉数据。
 - SSE 断开时浏览器自动重连；最终状态到达后重新读取一次完整查询结果，校准多数据源合并、错误信息和最终数量。
 - `POST /api/v1/collection-runs/{id}/cancel` 将排队或运行任务标记为 `cancelled` 并释放租约。ICP 心跳缩短到5秒，使运行协程及时发现租约失效并退出，同时保留已保存结果。
 
 ## 子域名并发与缓存
 
-- 多个主域名以最多 `ROOT_CONCURRENCY=3` 个根任务并发处理；总 DNS 并发和 HTTP 并发仍分别受 `DNS_CONCURRENCY`、`HTTP_CONCURRENCY` 限制，避免把单域名优化成全局洪峰。
+- 多个主域名以最多 `ROOT_CONCURRENCY=5` 个根任务并发处理；总 DNS 并发和 HTTP 并发仍分别受 `DNS_CONCURRENCY`、`HTTP_CONCURRENCY` 限制，避免把单域名优化成全局洪峰。纯字典命中的泛解析结果会跳过 HTTP 探测。
 - `subdomain_source_cache` 缓存被动来源；数据库结果使用 `(run_id, root_domain, hostname)` 去重。
 - 被动来源先走容器直连；遇到连接/超时、403、429 或 5xx 时，若已配置并验证手动代理或 SeaMoon 路由，则立即通过代理重试，不等待下一轮。DNS 解析和发现主机的 HTTP 探测不自动改走该兜底代理。
 - CertSpotter 的分页 `Link` 既支持绝对地址也支持相对地址，会先解析为完整 URL，避免第二页出现 `unknown url type`。
@@ -162,7 +163,7 @@ INVEST_CONCURRENCY              = 12
   -> POST /api/v1/subdomain-runs
   -> subdomain_runs 等待队列
   -> 独立 Subdomain Worker
-  -> 九类公开数据源（6 小时缓存、限速/错误分类）+ DNS 字典并行
+  -> 公开数据源（证书透明度、公开数据集、Wayback、DNS 记录、站点元数据、Common Crawl，6 小时缓存、限速/错误分类）+ DNS 字典并行
   -> 三点泛解析判断 -> DNS 验证 -> 安全重定向校验 -> 可选 HTTP 探测
   -> subdomain_results
   -> SSE /events 实时推送到前端
@@ -180,7 +181,7 @@ INVEST_CONCURRENCY              = 12
 
 ### 子域名并发与实时性
 
-- 九个公开来源并发执行，每个来源硬超时 20 秒；网络/超时/5xx 进行有限重试，429 按来源进入冷却，不使用代理轮换绕过配额；一个来源异常不会终止整条任务。
+- 公开来源并发执行，每个来源硬超时 20 秒；网络/超时/5xx 进行有限重试，短冷却会等待后继续，超过等待上限才跳过本轮；一个来源异常不会终止整条任务。
 - DNS 字典不等待被动来源结束即可开始验证，已解析结果先写数据库并通过 SSE 推送；被动来源按完成顺序增量合并，不再等待所有来源返回。
 - DNS 验证按 500 个候选分批建任务，实际并发由 `DNS_CONCURRENCY` 限制；HTTP 探测由独立信号量和较短的丰富超时限制，不会阻塞 DNS 结果落库。
 - 进度与租约心跳按批次/时间节流，避免为每个无效候选执行一次数据库更新。

@@ -7,6 +7,7 @@ import ipaddress
 import random
 import re
 import socket
+import ssl
 import string
 import time
 from dataclasses import dataclass
@@ -21,21 +22,24 @@ import tldextract
 from app.repository import Repository
 
 PASSIVE_TIMEOUT = 20.0
-PASSIVE_ATTEMPTS = 2
+PASSIVE_ATTEMPTS = 3
 SOURCE_COOLDOWN_SECONDS = 60.0
+SOURCE_COOLDOWN_WAIT_SECONDS = 8.0
 PROGRESS_INTERVAL_SECONDS = 0.4
 PROGRESS_BATCH_SIZE = 25
 INSPECTION_BATCH_SIZE = 500
-DNS_CONCURRENCY = 40
-HTTP_CONCURRENCY = 16
+DNS_CONCURRENCY = 64
+HTTP_CONCURRENCY = 20
 # Run a few root domains concurrently. DNS/HTTP semaphores below still cap
 # total outbound work, while preventing one large root from blocking all other
 # ICP-derived domains for the full duration of its scan.
-ROOT_CONCURRENCY = 3
-HTTP_PROBE_TIMEOUT = 8.0
+ROOT_CONCURRENCY = 5
+HTTP_PROBE_TIMEOUT = 5.0
+DNS_TIMEOUT = 2.5
 MAX_CANDIDATES_PER_DOMAIN = 10_000
-ALTDNS_CANDIDATE_LIMIT = 2_000
+ALTDNS_CANDIDATE_LIMIT = 400
 COMMON_CRAWL_RESULT_LIMIT = 1_000
+WAYBACK_RESULT_LIMIT = 2_000
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 HOST_REFERENCE_RE = re.compile(
     r"(?<![a-z0-9-])(?:https?://|//)?((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![a-z0-9-])",
@@ -363,7 +367,7 @@ async def collect_web_metadata(client: httpx.AsyncClient, domain: str) -> set[st
                     return _hosts_from_text(response.text, domain) | _hosts_from_text(
                         response.headers.get("location", ""), domain
                     )
-            except httpx.HTTPError:
+            except (httpx.HTTPError, ssl.SSLError, OSError):
                 continue
         return set()
 
@@ -408,12 +412,138 @@ async def collect_commoncrawl(client: httpx.AsyncClient, domain: str) -> set[str
     return found
 
 
+
+def _json_items(data: object) -> list[object]:
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for key in ("data", "passive_dns", "results", "subdomains", "records"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _hosts_from_payload(data: object, domain: str) -> set[str]:
+    found: set[str] = set()
+    if isinstance(data, str):
+        found.update(_hosts_from_text(data, domain))
+        return found
+    if isinstance(data, list):
+        for item in data:
+            found.update(_hosts_from_payload(item, domain))
+        return found
+    if isinstance(data, dict):
+        for key in ("hostname", "host", "domain", "rrname", "name", "value", "url"):
+            found.update(_hosts_from_payload(data.get(key), domain))
+        for value in data.values():
+            if isinstance(value, (list, dict, str)):
+                found.update(_hosts_from_payload(value, domain))
+        return found
+    return found
+
+
+async def collect_anubis(client: httpx.AsyncClient, domain: str) -> set[str]:
+    found: set[str] = set()
+    errors: list[Exception] = []
+    for url in (
+        f"https://jonlu.ca/anubis/subdomains/{domain}",
+        f"https://jldc.me/anubis/subdomains/{domain}",
+    ):
+        try:
+            async with asyncio.timeout(8.0):
+                response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, list):
+                for value in data:
+                    host = _candidate(str(value), domain)
+                    if host:
+                        found.add(host)
+            else:
+                found.update(_hosts_from_payload(data, domain))
+            if found:
+                return found
+        except Exception as exc:  # noqa: BLE001 - try the next public endpoint
+            errors.append(exc)
+            continue
+    if errors:
+        raise errors[-1]
+    return found
+
+
+async def collect_alienvault(client: httpx.AsyncClient, domain: str) -> set[str]:
+    found: set[str] = set()
+    for page in range(1, 4):
+        response = await client.get(
+            f"https://otx.alienvault.com/api/v1/indicators/domain/{domain}/passive_dns",
+            params={"limit": "100", "page": str(page)},
+        )
+        response.raise_for_status()
+        data = response.json()
+        records = data.get("passive_dns") if isinstance(data, dict) else None
+        if not isinstance(records, list) or not records:
+            break
+        page_found = 0
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            host = _candidate(str(item.get("hostname") or item.get("domain") or ""), domain)
+            if host:
+                found.add(host)
+                page_found += 1
+        if page_found == 0 or len(records) < 50:
+            break
+        if page < 3:
+            await asyncio.sleep(0.2)
+    return found
+
+
+async def collect_wayback(client: httpx.AsyncClient, domain: str) -> set[str]:
+    response = await client.get(
+        "https://web.archive.org/cdx/search/cdx",
+        params={
+            "url": f"*.{domain}/*",
+            "output": "json",
+            "fl": "original",
+            "collapse": "urlkey",
+            "limit": str(WAYBACK_RESULT_LIMIT),
+        },
+    )
+    response.raise_for_status()
+    data = response.json()
+    found: set[str] = set()
+    for item in data if isinstance(data, list) else []:
+        value = item[0] if isinstance(item, list) and item else item
+        found.update(_hosts_from_text(str(value), domain))
+    return found
+
+
+async def collect_threatminer(client: httpx.AsyncClient, domain: str) -> set[str]:
+    response = await client.get(
+        "https://api.threatminer.org/v2/domain.php",
+        params={"q": domain, "rt": "5"},
+    )
+    response.raise_for_status()
+    data = response.json()
+    found: set[str] = set()
+    for value in _json_items(data):
+        host = _candidate(str(value), domain)
+        if host:
+            found.add(host)
+    return found
+
+
 PASSIVE_SOURCES = (
     ("crt.sh", "collect_crtsh"),
     ("CertSpotter", "collect_certspotter"),
     ("HackerTarget", "collect_hackertarget"),
     ("urlscan.io", "collect_urlscan"),
     ("RapidDNS", "collect_rapiddns"),
+    ("Anubis", "collect_anubis"),
+    ("AlienVault", "collect_alienvault"),
+    ("Wayback", "collect_wayback"),
+    ("ThreatMiner", "collect_threatminer"),
     ("DNS记录", "collect_dns_records"),
     ("SRV记录", "collect_srv_records"),
     ("站点元数据", "collect_web_metadata"),
@@ -426,6 +556,10 @@ SOURCE_MIN_INTERVALS = {
     "HackerTarget": 1.0,
     "urlscan.io": 1.0,
     "RapidDNS": 0.5,
+    "Anubis": 0.8,
+    "AlienVault": 1.0,
+    "Wayback": 1.0,
+    "ThreatMiner": 1.0,
     "DNS记录": 0.15,
     "SRV记录": 0.15,
     "站点元数据": 0.5,
@@ -444,10 +578,13 @@ class _SourceThrottle:
             now = time.monotonic()
             cooldown_until = self._cooldown_until.get(name, 0.0)
             if cooldown_until > now:
-                remaining = max(1, int(cooldown_until - now))
-                return f"请求频率受限，已暂停约 {remaining} 秒"
-            wait = max(0.0, self._next_at.get(name, 0.0) - now)
-            self._next_at[name] = max(now, self._next_at.get(name, 0.0)) + SOURCE_MIN_INTERVALS.get(name, 0.25)
+                remaining = cooldown_until - now
+                if remaining > SOURCE_COOLDOWN_WAIT_SECONDS:
+                    return f"请求频率受限，已暂停约 {max(1, int(remaining))} 秒"
+                wait = remaining
+            else:
+                wait = max(0.0, self._next_at.get(name, 0.0) - now)
+            self._next_at[name] = max(now, self._next_at.get(name, 0.0), cooldown_until) + SOURCE_MIN_INTERVALS.get(name, 0.25)
         if wait:
             await asyncio.sleep(wait)
         return None
@@ -476,7 +613,10 @@ async def resolve_hostname(hostname: str) -> ResolvedHost | None:
         canonical = next((str(item[3]).rstrip(".") for item in answers if item[3]), "")
         return ResolvedHost(hostname=hostname, ips=ips, canonical_name=canonical)
 
-    return await asyncio.to_thread(lookup)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(lookup), timeout=DNS_TIMEOUT)
+    except asyncio.TimeoutError:
+        return None
 
 
 def _public_ips(ips: list[str]) -> bool:
@@ -571,11 +711,13 @@ def _source_error(exc: Exception) -> tuple[str, bool, float]:
         return f"上游返回 HTTP {code}", False, 0.0
     if isinstance(exc, (asyncio.TimeoutError, httpx.TimeoutException)):
         return "请求超时", True, 0.0
-    if isinstance(exc, httpx.RequestError):
+    if isinstance(exc, (httpx.RequestError, ssl.SSLError)):
         return "网络连接失败", True, 0.0
     if isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
         return "返回格式异常", False, 0.0
     detail = " ".join(str(exc).split())[:120] or type(exc).__name__
+    if "SSL" in type(exc).__name__ or "ssl" in detail.lower():
+        return "TLS 连接失败", True, 0.0
     return detail, True, 0.0
 
 
@@ -633,7 +775,7 @@ async def _call_source(
                 await SOURCE_THROTTLE.cool_down(name, cooldown)
             if not retryable or attempt >= PASSIVE_ATTEMPTS:
                 break
-            await asyncio.sleep(min(2.0, float(attempt)))
+            await asyncio.sleep(min(3.0, float(attempt)))
     return name, set(), f"{errors[-1]}（已重试 {len(errors)} 次）"
 
 
@@ -642,44 +784,40 @@ def generate_altdns_candidates(source_hosts: set[str], root: str) -> set[str]:
 
     This follows the useful, non-invasive part of OneForAll's Altdns stage:
     learn words from already discovered labels, then try adjacent numeric
-    versions and word combinations. It deliberately does not perform any
-    mutation or takeover action and is capped per root domain.
+    versions and a small set of word combinations. Combinatorial inserts from
+    the entire dictionary are intentionally avoided so a 70-domain ICP batch
+    cannot expand into hundreds of thousands of HTTP probes.
     """
     observed = sorted(host for host in source_hosts if host != root)
-    words = {word for word in COMMON_PREFIXES if 2 <= len(word) <= 24}
+    seed_words = [word for word in COMMON_PREFIXES if 2 <= len(word) <= 12][:24]
+    learned: set[str] = set()
     candidates: set[str] = set()
     for host in observed:
         labels = host[: -(len(root) + 1)].split(".")
         for label in labels:
             parts = [part for part in re.split(r"[-_]", label) if part]
-            words.update(part for part in parts if 2 <= len(part) <= 24)
+            learned.update(part for part in parts if 2 <= len(part) <= 24)
             for match in re.finditer(r"\d+", label):
                 value = match.group(0)
                 number = int(value)
                 for delta in (-2, -1, 1, 2):
-                    replacement = str(number + delta).zfill(len(value))
                     if number + delta >= 0:
+                        replacement = str(number + delta).zfill(len(value))
                         variant = label[:match.start()] + replacement + label[match.end():]
-                        candidates.add(f"{variant}.{root}")
-        for label_index, label in enumerate(labels):
-            if len(words) * max(1, len(labels)) > ALTDNS_CANDIDATE_LIMIT * 2:
-                word_iter = sorted(words)[:ALTDNS_CANDIDATE_LIMIT // max(1, len(labels))]
-            else:
-                word_iter = sorted(words)
-            for word in word_iter:
-                for variant in (f"{word}-{label}", f"{label}-{word}"):
-                    parts_copy = list(labels)
-                    parts_copy[label_index] = variant
-                    candidates.add(".".join(parts_copy + [root]))
-                if len(labels) < 3:
-                    parts_copy = list(labels)
-                    parts_copy.insert(label_index, word)
-                    candidates.add(".".join(parts_copy + [root]))
+                        candidates.add(f"{'.'.join([variant if item == label else item for item in labels])}.{root}" if len(labels) > 1 else f"{variant}.{root}")
+        if len(labels) == 1:
+            label = labels[0]
+            for word in seed_words:
+                candidates.add(f"{word}-{label}.{root}")
+                candidates.add(f"{label}-{word}.{root}")
                 if len(candidates) >= ALTDNS_CANDIDATE_LIMIT:
-                    return {
-                        candidate for candidate in sorted(candidates)[:ALTDNS_CANDIDATE_LIMIT]
-                        if _candidate(candidate, root)
-                    }
+                    break
+        if len(candidates) >= ALTDNS_CANDIDATE_LIMIT:
+            break
+    for word in sorted(learned)[:80]:
+        candidates.add(f"{word}.{root}")
+        if len(candidates) >= ALTDNS_CANDIDATE_LIMIT:
+            break
     return {
         candidate for candidate in sorted(candidates)[:ALTDNS_CANDIDATE_LIMIT]
         if _candidate(candidate, root)
@@ -704,7 +842,7 @@ async def collect_subdomains(
     """
     warnings: list[str] = []
     processed = 0
-    total = 0
+    total = len(domains)
     result_count = getattr(repo, "subdomain_result_count", None)
     discovered = await result_count(run_id) if result_count is not None else 0
     last_reported = 0
@@ -736,11 +874,6 @@ async def collect_subdomains(
             last_reported = processed
             last_report_at = now
 
-    async def increment_total(value: int) -> None:
-        nonlocal total
-        async with progress_lock:
-            total += value
-
     async def increment_processed() -> None:
         nonlocal processed
         async with progress_lock:
@@ -758,7 +891,11 @@ async def collect_subdomains(
         HTTP_PROBE_TIMEOUT, connect=3.0, read=HTTP_PROBE_TIMEOUT, write=5.0, pool=3.0
     )
     headers = {
-        "User-Agent": "information-collection-workbench/0.3 (+authorized-subdomain-enumeration)"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/html, text/plain, */*",
     }
     async with (
         httpx.AsyncClient(
@@ -836,7 +973,7 @@ async def collect_subdomains(
                     is_wildcard = bool(
                         wildcard_ips and set(resolved.ips).issubset(wildcard_ips)
                     )
-                    passive_sources = sources[host] - {"DNS字典"}
+                    passive_sources = sources[host] - {"DNS字典", "AltDNS"}
                     if is_wildcard and not passive_sources:
                         return
                     inserted = await repo.add_subdomain_result(
@@ -883,7 +1020,6 @@ async def collect_subdomains(
                             pending = pending[:remaining]
                         batch = pending[:INSPECTION_BATCH_SIZE]
                         pending = pending[INSPECTION_BATCH_SIZE:]
-                        await increment_total(len(batch))
                         await report_progress("resolving", force=True)
 
                         async def inspect(
@@ -897,6 +1033,14 @@ async def collect_subdomains(
                             await persist(resolved, HttpProbe(), wildcard_ips)
                             if not http_enabled:
                                 return hostname, resolved, HttpProbe()
+                            is_wildcard = bool(
+                                wildcard_ips and set(resolved.ips).issubset(wildcard_ips)
+                            )
+                            # Dictionary-only wildcard hits are not persisted.
+                            # Skip HTTP too: probing thousands of identical
+                            # wildcard answers dominates large ICP batches.
+                            if is_wildcard and not (sources.get(hostname, set()) - {"DNS字典", "AltDNS"}):
+                                return hostname, resolved, HttpProbe()
                             async with http_semaphore:
                                 probe = await probe_http(probe_client, resolved, root)
                             return hostname, resolved, probe
@@ -907,7 +1051,6 @@ async def collect_subdomains(
                             for task in asyncio.as_completed(tasks):
                                 host, resolved, probe = await task
                                 inspected[host] = (resolved, probe)
-                                await increment_processed()
                                 if resolved:
                                     if probe.url or probe.status is not None or probe.title:
                                         await persist(resolved, probe, wildcard_ips)
@@ -969,8 +1112,11 @@ async def collect_subdomains(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - isolate one root
-                detail = " ".join(str(exc).split())[:240] or type(exc).__name__
-                return [f"{root}：查询失败：{detail}"]
+                detail, _, _ = _source_error(exc)
+                return [f"{root} · 站点探测：{detail}"]
+            finally:
+                await increment_processed()
+                await report_progress("collecting", force=True)
 
         try:
             root_warnings = await asyncio.gather(

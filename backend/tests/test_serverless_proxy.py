@@ -41,13 +41,15 @@ def test_view_never_exposes_access_key_secret():
 
 
 def test_active_proxy_requires_enabled_endpoint():
-    assert active_proxy_url(config(endpoint="https://example.test")) == ""
+    assert active_proxy_url(config()) == ""
     active = config(enabled=True, endpoint="https://example.test")
     assert active_proxy_url(active) == settings.serverless_proxy_url
     assert miit_proxy_url(active) == settings.serverless_proxy_miit_url
+    # Query-page cloud selection uses ready endpoints even if settings enabled is off.
+    assert active_proxy_url(config(enabled=False, endpoint="https://example.test")) == settings.serverless_proxy_url
 
 
-def test_manual_routes_take_priority_over_cloud_route():
+def test_cloud_routes_take_priority_over_manual_pool():
     manual = "http://user:pass@manual.example:8080"
     active = config(
         enabled=True,
@@ -62,8 +64,10 @@ def test_manual_routes_take_priority_over_cloud_route():
             "status": "ready",
         }],
     )
-    assert active_proxy_url(active) == manual
-    assert miit_proxy_url(active) == manual
+    assert active_proxy_url(active) == settings.serverless_proxy_url
+    assert miit_proxy_url(active) == settings.serverless_proxy_miit_url
+    assert active_proxy_url({**active, "proxy_pool": "manual"}) == manual
+    assert miit_proxy_url({**active, "proxy_pool": "manual"}) == manual
 
 
 def test_gateway_endpoint_pool_excludes_disabled_or_failed_nodes():
@@ -158,7 +162,9 @@ async def test_active_route_does_not_require_seamoon_when_manual_proxy_is_ready(
     }
 
     await configure_gateway_for_active_route(runtime)
-    assert calls == []
+    assert calls  # cloud remains the default pool even if HTTP proxies exist
+    await configure_gateway_for_active_route({**runtime, "proxy_pool": "manual"})
+    assert len(calls) == 1
 
 
 def test_runtime_config_keeps_manual_routes_when_serverless_row_is_present():
@@ -175,8 +181,10 @@ def test_runtime_config_keeps_manual_routes_when_serverless_row_is_present():
             "status": "ready",
         }],
     }
-    assert active_proxy_url(runtime) == manual
-    assert miit_proxy_url(runtime) == manual
+    assert active_proxy_url(runtime) == settings.serverless_proxy_url
+    assert miit_proxy_url(runtime) == settings.serverless_proxy_miit_url
+    assert active_proxy_url({**runtime, "proxy_pool": "manual"}) == manual
+    assert miit_proxy_url({**runtime, "proxy_pool": "manual"}) == manual
 
 def test_enabled_config_requires_endpoint():
     with pytest.raises(ServerlessProxyError, match="函数地址"):
@@ -194,6 +202,32 @@ def test_managed_deploy_does_not_require_image(provider, region):
         access_key_secret="secret",
         region=region,
     ))
+
+
+def test_managed_cloud_target_fills_hidden_defaults():
+    from app.serverless_proxy import managed_cloud_target
+
+    assert managed_cloud_target("aliyun", "", "") == ("aliyun", "cn-hangzhou", "asset-workbench-seamoon")
+    assert managed_cloud_target("tencent", "", None) == ("tencent", "ap-guangzhou", "asset-workbench-seamoon")
+    assert managed_cloud_target("tencent", "cn-hangzhou", "keep-me") == ("tencent", "ap-guangzhou", "keep-me")
+    assert managed_cloud_target("aliyun", "cn-qingdao", "asset-workbench-seamoon") == (
+        "aliyun", "cn-qingdao", "asset-workbench-seamoon"
+    )
+
+
+def test_tencent_deploy_fills_default_region_and_function_name():
+    payload = config(
+        provider="tencent",
+        access_key_id="ak",
+        access_key_secret="secret",
+        region="",
+        function_name="",
+    )
+    validate_deploy_config(payload)
+    row = payload["serverless_proxy"]
+    assert row["provider"] == "tencent"
+    assert row["region"] == "ap-guangzhou"
+    assert row["function_name"] == "asset-workbench-seamoon"
 
 
 def test_custom_provider_cannot_be_auto_deployed():
@@ -421,6 +455,12 @@ def test_auto_scale_regions_excludes_configured_regions(monkeypatch):
     )
     monkeypatch.setattr(proxy.settings, "icp_auto_scale_excluded_regions", "cn-chengdu")
     assert proxy._auto_scale_regions() == ["cn-hangzhou", "cn-shanghai"]
+    monkeypatch.setattr(
+        proxy.settings,
+        "icp_auto_scale_tencent_regions",
+        "ap-guangzhou,ap-shanghai,ap-hongkong",
+    )
+    assert proxy._auto_scale_regions("tencent") == ["ap-guangzhou", "ap-shanghai", "ap-hongkong"]
 
 
 @pytest.mark.asyncio
@@ -497,3 +537,26 @@ async def test_release_icp_node_pool_removes_only_auto_managed_surplus(monkeypat
     assert result["removed"] == 3
     assert set(destroyed) == {"shanghai", "beijing", "shenzhen"}
     assert [node["region"] for node in repo.updated["nodes"]] == ["cn-hangzhou"]
+
+
+def test_selected_proxy_pool_defaults_to_cloud():
+    from app.serverless_proxy import selected_proxy_pool
+
+    runtime = config(
+        enabled=True,
+        endpoint="https://example.test",
+        manual_proxies=[{
+            "scheme": "http",
+            "host": "manual.example",
+            "port": 8080,
+            "username": "user",
+            "password": "pass",
+            "enabled": True,
+            "status": "ready",
+        }],
+    )
+    assert selected_proxy_pool(runtime) == "cloud"
+    assert selected_proxy_pool({**runtime, "proxy_pool": "manual"}) == "manual"
+    assert selected_proxy_pool({**runtime, "proxy_pool": "direct"}) == "none"
+    assert active_proxy_url({**runtime, "proxy_pool": "direct"}) == ""
+    assert miit_proxy_url({**runtime, "proxy_pool": "direct"}) == ""

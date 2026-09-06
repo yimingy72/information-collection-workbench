@@ -217,18 +217,11 @@ export function ProxySettingsPage({ embedded = false }: { embedded?: boolean }) 
         title={(
           <Space>
             <ApiOutlined />
-            <span>代理设置</span>
+            <span>HTTP 代理池</span>
           </Space>
         )}
         extra={<Button size="small" icon={<ReloadOutlined />} onClick={() => void refresh()} loading={loading}>刷新</Button>}
       >
-        <Alert
-          type="info"
-          showIcon
-          title="所有已启用且检测成功的手动代理会组成轮询池。手动代理池优先于云函数；没有可用手动代理时才使用已启用的云函数。"
-          description="查询页面不单独选择代理，代理路由在这里统一配置；同一查询不会混用手动代理和云函数。"
-          className="proxy-settings-note"
-        />
         <Form
           form={form}
           layout="inline"
@@ -242,7 +235,7 @@ export function ProxySettingsPage({ embedded = false }: { embedded?: boolean }) 
             rules={[{ required: true, message: '请输入代理地址' }]}
             className="manual-proxy-input"
           >
-            <Input placeholder="t18831534475414:密码@h515.kdltps.com:15818" allowClear />
+            <Input placeholder="http://用户名:密码@主机:端口" allowClear />
           </Form.Item>
           <Form.Item>
             <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={saving}>添加代理</Button>

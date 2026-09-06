@@ -9,6 +9,8 @@ export const PROVIDER_OPTIONS = [
 
 export type ProviderId = typeof PROVIDER_OPTIONS[number]['value']
 
+export type ProxyPool = 'cloud' | 'manual' | 'direct'
+
 export type CollectionValues = {
   keyword: string
   providers: ProviderId[]
@@ -39,6 +41,33 @@ export type Run = {
 
 export type RunList = {
   items: Run[]
+  total: number
+}
+
+export type HistoryKind = 'collection' | 'subdomain'
+
+export type HistoryItem = {
+  id: string
+  kind: HistoryKind
+  title: string
+  status: RunStatus
+  created_at: string
+  started_at?: string | null
+  finished_at?: string | null
+  summary: {
+    providers?: string[]
+    depth?: number
+    holding_percent?: number | string
+    progress?: number
+    total?: number | null
+    domains?: string[]
+    discovered?: number
+    phase?: string
+  }
+}
+
+export type HistoryList = {
+  items: HistoryItem[]
   total: number
 }
 
@@ -201,6 +230,7 @@ export type SettingsView = {
   sessions: ProviderSession[]
   serverless_proxy: ServerlessProxySettings
   manual_proxies: ManualProxy[]
+  proxy_pool: ProxyPool
 }
 
 export type LoginValues = {
@@ -229,6 +259,7 @@ export type SubdomainOptions = {
 
 export type SubdomainRun = {
   id: string
+  title?: string
   domains: string[]
   source_run_ids: string[]
   options: SubdomainOptions

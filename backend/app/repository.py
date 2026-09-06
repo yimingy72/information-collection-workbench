@@ -130,6 +130,101 @@ class Repository:
     async def get_run(self, run_id: UUID) -> asyncpg.Record | None:
         return await self.pool.fetchrow("SELECT * FROM collection_runs WHERE id=$1", run_id)
 
+    async def list_history(
+        self,
+        limit: int,
+        offset: int,
+        keyword: str = "",
+        status: str = "",
+        kind: str = "",
+    ) -> tuple[list[asyncpg.Record], int]:
+        keyword = " ".join(str(keyword or "").split())
+        status = str(status or "").strip()
+        kind = str(kind or "").strip()
+        rows = await self.pool.fetch(
+            """
+            WITH combined AS (
+              SELECT
+                id,
+                'collection'::text AS kind,
+                keyword AS title,
+                status,
+                created_at,
+                started_at,
+                finished_at,
+                jsonb_build_object(
+                  'providers', COALESCE(providers, '[]'::jsonb),
+                  'depth', depth,
+                  'holding_percent', holding_percent,
+                  'progress', progress,
+                  'total', total
+                ) AS summary
+              FROM collection_runs
+              UNION ALL
+              SELECT
+                id,
+                'subdomain'::text AS kind,
+                COALESCE(NULLIF(title, ''), domains->>0, '子域名查询') AS title,
+                status,
+                created_at,
+                started_at,
+                finished_at,
+                jsonb_build_object(
+                  'domains', COALESCE(domains, '[]'::jsonb),
+                  'discovered', discovered,
+                  'progress', progress,
+                  'total', total,
+                  'phase', phase
+                ) AS summary
+              FROM subdomain_runs
+            )
+            SELECT *
+              FROM combined
+             WHERE ($3 = '' OR title ILIKE '%' || $3 || '%'
+                    OR summary::text ILIKE '%' || $3 || '%')
+               AND ($4 = '' OR status = $4)
+               AND ($5 = '' OR kind = $5)
+             ORDER BY created_at DESC
+             LIMIT $1 OFFSET $2
+            """,
+            limit, offset, keyword, status, kind,
+        )
+        total = await self.pool.fetchval(
+            """
+            WITH combined AS (
+              SELECT id, 'collection'::text AS kind, keyword AS title, status,
+                     COALESCE(providers, '[]'::jsonb)::text AS haystack
+                FROM collection_runs
+              UNION ALL
+              SELECT id, 'subdomain'::text AS kind,
+                     COALESCE(NULLIF(title, ''), domains->>0, '子域名查询') AS title, status,
+                     (COALESCE(title,'') || ' ' || COALESCE(domains, '[]'::jsonb)::text) AS haystack
+                FROM subdomain_runs
+            )
+            SELECT count(*)
+              FROM combined
+             WHERE ($1 = '' OR title ILIKE '%' || $1 || '%' OR haystack ILIKE '%' || $1 || '%')
+               AND ($2 = '' OR status = $2)
+               AND ($3 = '' OR kind = $3)
+            """,
+            keyword, status, kind,
+        )
+        return rows, int(total or 0)
+
+    async def delete_history(self, items: list[tuple[str, UUID]]) -> int:
+        collection_ids = [item_id for kind, item_id in items if kind == "collection"]
+        subdomain_ids = [item_id for kind, item_id in items if kind == "subdomain"]
+        deleted = 0
+        if collection_ids:
+            deleted += await self.delete_runs(collection_ids)
+        if subdomain_ids:
+            result = await self.pool.execute(
+                "DELETE FROM subdomain_runs WHERE id = ANY($1::uuid[])",
+                subdomain_ids,
+            )
+            deleted += int(str(result).split()[-1])
+        return deleted
+
     async def claim_run(self, lease_seconds: int) -> asyncpg.Record | None:
         return await self.pool.fetchrow(
             """
@@ -456,15 +551,22 @@ class Repository:
         return int(str(result).split()[-1])
 
     async def create_subdomain_run(
-        self, domains: list[str], source_run_ids: list[UUID], options: dict[str, Any]
+        self,
+        domains: list[str],
+        source_run_ids: list[UUID],
+        options: dict[str, Any],
+        title: str = "",
     ) -> asyncpg.Record:
         return await self.pool.fetchrow(
             """
-            INSERT INTO subdomain_runs(domains, source_run_ids, options)
-            VALUES($1::jsonb, $2::jsonb, $3::jsonb)
+            INSERT INTO subdomain_runs(domains, source_run_ids, options, title)
+            VALUES($1::jsonb, $2::jsonb, $3::jsonb, $4)
             RETURNING *
             """,
-            json.dumps(domains), json.dumps([str(value) for value in source_run_ids]), json.dumps(options),
+            json.dumps(domains),
+            json.dumps([str(value) for value in source_run_ids]),
+            json.dumps(options),
+            title,
         )
 
     async def get_subdomain_run(self, run_id: UUID) -> asyncpg.Record | None:
@@ -652,7 +754,7 @@ class Repository:
         result = await self.pool.execute("DELETE FROM subdomain_runs WHERE id=$1", run_id)
         return int(str(result).split()[-1])
 
-    async def icp_domain_runs(self, limit: int = 50) -> list[asyncpg.Record]:
+    async def icp_domain_runs(self, limit: int = 100) -> list[asyncpg.Record]:
         return await self.pool.fetch(
             """
             SELECT cr.id, cr.keyword, cr.created_at,
@@ -688,10 +790,12 @@ class Repository:
             "SELECT * FROM serverless_proxy_settings WHERE id=1"
         )
         manual_proxies = await self.pool.fetch("SELECT * FROM manual_proxy_nodes ORDER BY created_at, id")
+        serverless = dict(serverless_proxy) if serverless_proxy else {}
         return {
             "sessions": {row["provider"]: dict(row) for row in sessions},
-            "serverless_proxy": dict(serverless_proxy) if serverless_proxy else {},
+            "serverless_proxy": serverless,
             "manual_proxies": [dict(row) for row in manual_proxies],
+            "proxy_pool": str(serverless.get("proxy_pool") or "cloud"),
         }
 
     async def update_serverless_proxy(self, config: dict[str, Any]) -> asyncpg.Record:
@@ -726,6 +830,20 @@ class Repository:
             config["function_name"], config["image_uri"], config["access_key_id"],
             config.get("access_key_secret"), config["insecure_skip_verify"],
             json.dumps(config["nodes"]) if "nodes" in config else None,
+        )
+
+    async def set_proxy_pool(self, proxy_pool: str) -> asyncpg.Record:
+        mode = str(proxy_pool or "cloud").strip().lower()
+        value = mode if mode in {"cloud", "manual", "direct"} else "cloud"
+        return await self.pool.fetchrow(
+            """
+            UPDATE serverless_proxy_settings
+               SET proxy_pool=$1,
+                   updated_at=now()
+             WHERE id=1
+            RETURNING *
+            """,
+            value,
         )
 
     async def set_serverless_proxy_status(

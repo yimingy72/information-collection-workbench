@@ -126,8 +126,13 @@ async def subdomain_worker_loop(repo: Repository) -> None:
                 dict(run["options"] or {}),
                 lease_id=lease_id,
             )
+            discovered = await repo.subdomain_result_count(run_id)
+            # Optional public sources failing (429/timeout/network) is expected.
+            # Keep those notes on the run, but only mark partial when nothing
+            # resolvable was found after every discovery method finished.
+            status = "succeeded" if discovered or not warnings else "partial"
             await repo.finish_subdomain_run(
-                run_id, "partial" if warnings else "succeeded", warnings, None,
+                run_id, status, warnings, None,
                 lease_id=lease_id,
             )
         except asyncio.CancelledError:

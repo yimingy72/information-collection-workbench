@@ -75,6 +75,16 @@ func TestManagedFunctionSizing(t *testing.T) {
 		*aliyun.CustomContainerConfig.Image != "image" {
 		t.Fatalf("expected Alibaba custom container image in create request: %#v", aliyun.CustomContainerConfig)
 	}
+	if len(aliyun.CustomContainerConfig.Entrypoint) != 1 ||
+		aliyun.CustomContainerConfig.Entrypoint[0] == nil ||
+		*aliyun.CustomContainerConfig.Entrypoint[0] != "/app/seamoon" {
+		t.Fatalf("expected Alibaba entrypoint /app/seamoon: %#v", aliyun.CustomContainerConfig.Entrypoint)
+	}
+	if len(aliyun.CustomContainerConfig.Command) < 1 ||
+		aliyun.CustomContainerConfig.Command[0] == nil ||
+		*aliyun.CustomContainerConfig.Command[0] != "server" {
+		t.Fatalf("expected Alibaba command to start with server: %#v", aliyun.CustomContainerConfig.Command)
+	}
 	if aliyun.Cpu == nil || *aliyun.Cpu != seaMoonCPU {
 		t.Fatalf("unexpected Alibaba CPU: %v", aliyun.Cpu)
 	}
@@ -127,5 +137,45 @@ func TestManagedFunctionSizing(t *testing.T) {
 	if config.InstanceConcurrencyConfig == nil || config.InstanceConcurrencyConfig.MaxConcurrency == nil ||
 		*config.InstanceConcurrencyConfig.MaxConcurrency != seaMoonTencentConcurrency {
 		t.Fatalf("unexpected Tencent update sizing: %#v", config.InstanceConcurrencyConfig)
+	}
+
+	created := tencentCreateFunctionRequest(Config{FunctionName: "test", Region: "ap-guangzhou"}, "image")
+	if created.Code == nil || created.Code.ImageConfig == nil {
+		t.Fatal("expected Tencent ImageConfig on create")
+	}
+	if created.Code.ImageConfig.Command == nil || *created.Code.ImageConfig.Command != "/app/seamoon" {
+		t.Fatalf("expected Tencent Command /app/seamoon: %#v", created.Code.ImageConfig.Command)
+	}
+	if created.Code.ImageConfig.Args == nil || *created.Code.ImageConfig.Args != "server -p 9000 -t websocket" {
+		t.Fatalf("expected Tencent Args server websocket: %#v", created.Code.ImageConfig.Args)
+	}
+	if created.Code.ImageConfig.ImageUri == nil || *created.Code.ImageConfig.ImageUri != "image" {
+		t.Fatalf("expected Tencent image uri: %#v", created.Code.ImageConfig.ImageUri)
+	}
+}
+
+func TestTencentImageUsesPresetWhenEmpty(t *testing.T) {
+	image, err := tencentImage(Config{Region: "ap-guangzhou"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image != tencentImages["ap-guangzhou"] {
+		t.Fatalf("unexpected Guangzhou image: %s", image)
+	}
+	if _, err := tencentImage(Config{Region: "ap-unknown"}); err == nil {
+		t.Fatal("expected unknown Tencent region to fail")
+	}
+}
+
+func TestTencentExtranetURLDecodesTrigger(t *testing.T) {
+	endpoint, err := tencentExtranetURL(`{"AuthType":"NONE","NetConfig":{"EnableExtranet":true,"ExtranetUrl":"https://example.scf.tencentcs.com"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if endpoint != "https://example.scf.tencentcs.com" {
+		t.Fatalf("unexpected endpoint: %q", endpoint)
+	}
+	if _, err := tencentExtranetURL(`{"AuthType":"NONE"}`); err == nil {
+		t.Fatal("expected missing extranet URL to fail")
 	}
 }

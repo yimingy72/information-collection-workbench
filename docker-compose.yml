@@ -31,6 +31,7 @@ services:
       ICP_AUTO_SCALE_MAX_NODES: ${ICP_AUTO_SCALE_MAX_NODES:-8}
       ICP_AUTO_SCALE_COMPANIES_PER_NODE: ${ICP_AUTO_SCALE_COMPANIES_PER_NODE:-160}
       ICP_AUTO_SCALE_REGIONS: ${ICP_AUTO_SCALE_REGIONS:-cn-hangzhou,cn-shanghai,cn-beijing,cn-shenzhen,cn-qingdao,cn-zhangjiakou,cn-huhehaote}
+      ICP_AUTO_SCALE_TENCENT_REGIONS: ${ICP_AUTO_SCALE_TENCENT_REGIONS:-ap-guangzhou,ap-shanghai,ap-beijing,ap-chengdu,ap-nanjing}
       ICP_AUTO_SCALE_EXCLUDED_REGIONS: ${ICP_AUTO_SCALE_EXCLUDED_REGIONS:-cn-chengdu}
       SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
       SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081
@@ -66,6 +67,7 @@ services:
       ICP_AUTO_SCALE_MAX_NODES: ${ICP_AUTO_SCALE_MAX_NODES:-8}
       ICP_AUTO_SCALE_COMPANIES_PER_NODE: ${ICP_AUTO_SCALE_COMPANIES_PER_NODE:-160}
       ICP_AUTO_SCALE_REGIONS: ${ICP_AUTO_SCALE_REGIONS:-cn-hangzhou,cn-shanghai,cn-beijing,cn-shenzhen,cn-qingdao,cn-zhangjiakou,cn-huhehaote}
+      ICP_AUTO_SCALE_TENCENT_REGIONS: ${ICP_AUTO_SCALE_TENCENT_REGIONS:-ap-guangzhou,ap-shanghai,ap-beijing,ap-chengdu,ap-nanjing}
       ICP_AUTO_SCALE_EXCLUDED_REGIONS: ${ICP_AUTO_SCALE_EXCLUDED_REGIONS:-cn-chengdu}
       SERVERLESS_PROXY_URL: http://seamoon-gateway:19080
       SERVERLESS_PROXY_ADMIN_URL: http://seamoon-gateway:19081

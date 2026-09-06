@@ -23,26 +23,6 @@ import { QueryResultsPanel } from '../components/QueryResultsPanel'
 import type { CollectionValues, ProviderId, QueryView, Run, SettingsView } from '../types'
 import { PROVIDER_OPTIONS } from '../types'
 
-function QueryRouteStatus({ settings }: { settings: SettingsView | null }) {
-  const manualCount = settings?.manual_proxies.filter(
-    (item) => item.enabled && item.status === 'ready',
-  ).length ?? 0
-  const cloud = settings?.serverless_proxy
-  const cloudCount = cloud?.nodes.filter((item) => item.enabled && item.status !== 'error').length ?? 0
-  const usingManual = manualCount > 0
-  const usingCloud = !usingManual && Boolean(cloud?.enabled)
-  const label = usingManual ? `手动 HTTP 代理（${manualCount} 个）` : usingCloud ? `云函数代理（${cloudCount || 1} 个节点）` : '未启用代理（直连）'
-  const color = usingManual ? 'processing' : usingCloud ? 'success' : 'default'
-
-  return (
-    <div className="query-route-status">
-      <Typography.Text type="secondary">查询代理</Typography.Text>
-      <Tag color={color}>{label}</Tag>
-      <Typography.Text type="secondary">代理统一在“基础配置”中管理，查询页面不单独选择代理。</Typography.Text>
-    </div>
-  )
-}
-
 function QueryDuration({
   startedAt,
   finishedAt,
@@ -157,6 +137,9 @@ export function CollectionPage({
   onForget,
   onCancel,
   settings,
+  proxyPool,
+  onProxyPoolChange,
+  savingProxyPool,
 }: {
   form: FormInstance<CollectionValues>
   loading: boolean
@@ -168,8 +151,16 @@ export function CollectionPage({
   onForget: (run: Run) => void
   onCancel: () => void
   settings: SettingsView | null
+  proxyPool: 'cloud' | 'manual' | 'direct'
+  onProxyPoolChange: (value: 'cloud' | 'manual' | 'direct') => void
+  savingProxyPool?: boolean
 }) {
   const { message } = App.useApp()
+  const cloudReady = Boolean(
+    settings?.serverless_proxy.status === 'ready'
+    || settings?.serverless_proxy.nodes.some((item) => item.status === 'ready' && item.endpoint),
+  )
+  const manualReady = (settings?.manual_proxies.filter((item) => item.enabled && item.status === 'ready').length ?? 0) > 0
 
   return (
     <div className="page page-split">
@@ -187,7 +178,7 @@ export function CollectionPage({
             if (first) message.warning(first)
           }}
         >
-          <Flex gap={16} wrap={false} align="flex-start" className="query-fields">
+          <Flex gap={16} wrap align="flex-start" className="query-fields">
             <Form.Item label="企业" className="query-company">
               <Flex vertical gap={6} className="query-company-field">
                 <Form.Item
@@ -235,6 +226,35 @@ export function CollectionPage({
                 <Space.Addon>%</Space.Addon>
               </Space.Compact>
             </Form.Item>
+            <Form.Item label="代理">
+              <Select
+                className="query-proxy"
+                value={proxyPool}
+                loading={savingProxyPool}
+                onChange={onProxyPoolChange}
+                popupMatchSelectWidth={false}
+                style={{ width: 148 }}
+                options={[
+                  {
+                    value: 'cloud',
+                    label: '云函数',
+                    disabled: !cloudReady,
+                    title: cloudReady ? '使用基础配置中已部署的云函数' : '请先在基础配置中一键部署云函数',
+                  },
+                  {
+                    value: 'manual',
+                    label: '自定义代理',
+                    disabled: !manualReady,
+                    title: manualReady ? '使用基础配置中已检测成功的 HTTP 代理' : '请先在基础配置中添加并检测自定义代理',
+                  },
+                  {
+                    value: 'direct',
+                    label: '直连',
+                    title: '不使用代理，直接访问目标网站',
+                  },
+                ]}
+              />
+            </Form.Item>
             <Form.Item>
               <Button type="primary" htmlType="submit" loading={loading} icon={<SearchOutlined />}>
                 查询
@@ -242,7 +262,6 @@ export function CollectionPage({
             </Form.Item>
           </Flex>
         </Form>
-        <QueryRouteStatus settings={settings} />
       </Card>
 
       <Card

@@ -1,5 +1,5 @@
-import { formatPercent, sourceTags } from './formatters'
-import type { QueryView } from './types'
+import { formatDate, formatPercent, sourceTags } from './formatters'
+import type { QueryView, SubdomainResult, SubdomainRun } from './types'
 
 type ExportValue = string | number
 
@@ -98,4 +98,30 @@ export function exportInvestments(query: QueryView) {
 
 export function exportIcp(query: QueryView) {
   exportQuery(query)
+}
+
+
+export function exportSubdomains(run: SubdomainRun, rows: SubdomainResult[]) {
+  const filename = run.domains.length > 1
+    ? `${run.domains[0]}等${run.domains.length}个主域名-子域名`
+    : `${run.domains[0] || '子域名'}-查询结果`
+  exportExcel(filename, [
+    {
+      name: '子域名',
+      headers: ['主域名', '子域名', 'IP', 'CNAME', 'HTTP状态', '访问地址', '标题', '来源', '泛解析', '发现时间'],
+      widths: [140, 220, 180, 160, 80, 220, 180, 180, 70, 160],
+      rows: rows.map((row) => [
+        row.root_domain,
+        row.hostname,
+        row.ips.join('、'),
+        row.canonical_name,
+        row.http_status ?? '',
+        row.http_url,
+        row.title,
+        row.sources.join('、'),
+        row.wildcard ? '是' : '',
+        formatDate(row.discovered_at),
+      ]),
+    },
+  ])
 }

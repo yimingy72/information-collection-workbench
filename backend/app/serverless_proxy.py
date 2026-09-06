@@ -13,10 +13,41 @@ from app.models import ServerlessProxyNodeView, ServerlessProxyTestResponse, Ser
 from app.settings import settings
 
 TEST_TARGET = "https://www.baidu.com/robots.txt"
+DEFAULT_FUNCTION_NAME = "asset-workbench-seamoon"
+ALIYUN_DEFAULT_REGION = "cn-hangzhou"
+TENCENT_DEFAULT_REGION = "ap-guangzhou"
+ALIYUN_MANAGED_REGIONS = {
+    "cn-hangzhou", "cn-shanghai", "cn-qingdao", "cn-beijing", "cn-zhangjiakou",
+    "cn-huhehaote", "cn-shenzhen", "cn-chengdu", "cn-hongkong",
+}
+TENCENT_MANAGED_REGIONS = {
+    "ap-guangzhou", "ap-shanghai", "ap-beijing", "ap-chengdu", "ap-nanjing", "ap-hongkong",
+}
 
 
 class ServerlessProxyError(RuntimeError):
     pass
+
+
+def managed_cloud_target(provider: str | None, region: str | None = None, function_name: str | None = None) -> tuple[str, str, str]:
+    raw = str(provider or "").strip().lower()
+    if raw == "tencent":
+        next_provider = "tencent"
+        allowed = TENCENT_MANAGED_REGIONS
+        fallback_region = TENCENT_DEFAULT_REGION
+    elif raw in {"", "aliyun"}:
+        next_provider = "aliyun"
+        allowed = ALIYUN_MANAGED_REGIONS
+        fallback_region = ALIYUN_DEFAULT_REGION
+    else:
+        next_provider = raw
+        allowed = set()
+        fallback_region = str(region or "").strip()
+    next_region = str(region or "").strip()
+    if next_region not in allowed:
+        next_region = fallback_region
+    next_name = str(function_name or "").strip() or DEFAULT_FUNCTION_NAME
+    return next_provider, next_region, next_name
 
 
 def _row(config: dict[str, Any]) -> dict[str, Any]:
@@ -36,17 +67,21 @@ def _json_nodes(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _node_id(row: dict[str, Any]) -> str:
-    return str(row.get("id") or f"{row.get('provider') or 'aliyun'}:{row.get('region') or 'cn-hangzhou'}:{row.get('function_name') or 'asset-workbench-seamoon'}")
+    provider = str(row.get("provider") or "aliyun")
+    region = str(row.get("region") or (TENCENT_DEFAULT_REGION if provider == "tencent" else ALIYUN_DEFAULT_REGION))
+    function_name = str(row.get("function_name") or DEFAULT_FUNCTION_NAME)
+    return str(row.get("id") or f"{provider}:{region}:{function_name}")
 
 
 def _normalise_node(row: dict[str, Any]) -> dict[str, Any]:
     node = dict(row)
     node["id"] = _node_id(node)
     node["enabled"] = bool(node.get("enabled"))
-    node["provider"] = str(node.get("provider") or "aliyun")
+    provider = str(node.get("provider") or "aliyun")
+    node["provider"] = provider
     node["endpoint"] = str(node.get("endpoint") or "").strip()
-    node["region"] = str(node.get("region") or "cn-hangzhou")
-    node["function_name"] = str(node.get("function_name") or "asset-workbench-seamoon")
+    node["region"] = str(node.get("region") or (TENCENT_DEFAULT_REGION if provider == "tencent" else ALIYUN_DEFAULT_REGION))
+    node["function_name"] = str(node.get("function_name") or DEFAULT_FUNCTION_NAME)
     node["image_uri"] = str(node.get("image_uri") or "")
     node["access_key_id"] = str(node.get("access_key_id") or "")
     node["access_key_secret"] = str(node.get("access_key_secret") or "")
@@ -136,15 +171,32 @@ def manual_proxy_urls(config: dict[str, Any]) -> list[str]:
     return urls
 
 
+def selected_proxy_pool(config: dict[str, Any]) -> str:
+    """Return the operator-selected ICP/Aiqicha proxy pool.
+
+    The query page is the only place that chooses among cloud, custom HTTP
+    proxies, or direct. Settings pages only store credentials and nodes.
+    Missing cloud/manual capacity falls through to unused instead of silently
+    substituting the other proxy pool.
+    """
+    mode = str(config.get("proxy_pool") or _row(config).get("proxy_pool") or "cloud").strip().lower()
+    if mode not in {"cloud", "manual", "direct"}:
+        mode = "cloud"
+    if mode == "direct":
+        return "none"
+    if mode == "manual":
+        return "manual" if manual_proxy_urls(config) else "none"
+    return "cloud" if _gateway_endpoints(config, force_enabled=True) else "none"
+
+
 def _manual_or_cloud_routes(config: dict[str, Any], cloud_route: str) -> list[str]:
-    # Manual routes are an explicit operator choice. Once at least one tested
-    # manual proxy is ready, use that pool exclusively; the cloud gateway is
-    # only the fallback when no manual route is available. This prevents one
-    # query from silently mixing direct HTTP proxies and SeaMoon tunnels.
-    manual = manual_proxy_urls(config)
-    if manual:
-        return manual
-    return [cloud_route] if _gateway_endpoints(config) else []
+    # Never mix SeaMoon tunnels and raw HTTP proxies in one query.
+    pool = selected_proxy_pool(config)
+    if pool == "cloud":
+        return [cloud_route] if cloud_route and _gateway_endpoints(config, force_enabled=True) else []
+    if pool == "manual":
+        return manual_proxy_urls(config)
+    return []
 
 
 def active_proxy_urls(config: dict[str, Any]) -> list[str]:
@@ -157,13 +209,13 @@ def miit_proxy_urls(config: dict[str, Any]) -> list[str]:
 
 def _gateway_endpoints(config: dict[str, Any], *, force_enabled: bool = False) -> list[str]:
     row = _row(config)
-    if not force_enabled and not bool(row.get("enabled")):
-        return []
     endpoints: list[str] = []
     for node in pool_nodes(row):
-        if not node["endpoint"] or (not force_enabled and not node["enabled"]):
+        if not node["endpoint"]:
             continue
         if node["status"] == "error" and not force_enabled:
+            continue
+        if not force_enabled and not node["enabled"] and node["status"] != "ready":
             continue
         if node["endpoint"] not in endpoints:
             endpoints.append(node["endpoint"])
@@ -240,14 +292,17 @@ def validate_saved_config(config: dict[str, Any]) -> None:
 
 
 def validate_deploy_config(config: dict[str, Any]) -> None:
-    row = _row(config)
-    provider = str(row.get("provider") or "")
+    row = config["serverless_proxy"] if isinstance(config.get("serverless_proxy"), dict) else config
+    provider, region, function_name = managed_cloud_target(
+        row.get("provider"), row.get("region"), row.get("function_name")
+    )
+    row["provider"] = provider
+    row["region"] = region
+    row["function_name"] = function_name
     if provider not in {"aliyun", "tencent"}:
         raise ServerlessProxyError("其他云仅支持接入已部署的函数地址")
     if not str(row.get("access_key_id") or "").strip() or not str(row.get("access_key_secret") or "").strip():
         raise ServerlessProxyError("部署云函数需要 AccessKey ID 和 AccessKey Secret")
-    if not str(row.get("region") or "").strip() or not str(row.get("function_name") or "").strip():
-        raise ServerlessProxyError("部署云函数需要地域和函数名称")
 
 
 async def configure_gateway(config: dict[str, Any], *, force_enabled: bool | None = None) -> None:
@@ -274,15 +329,14 @@ async def configure_gateway(config: dict[str, Any], *, force_enabled: bool | Non
 
 
 async def configure_gateway_for_active_route(config: dict[str, Any]) -> None:
-    """Configure SeaMoon only when the active query route is cloud-backed.
+    """Configure SeaMoon only when the query page selected the cloud route.
 
-    Ready manual proxies intentionally take exclusive precedence over the cloud
-    gateway. Do not make a query depend on a local SeaMoon admin socket that is
-    irrelevant to the selected route (and may be stopped in manual-only mode).
+    Settings pages no longer choose the query route. Direct and custom HTTP
+    proxies must not depend on the local SeaMoon admin socket.
     """
-    if manual_proxy_urls(config):
+    if selected_proxy_pool(config) != "cloud":
         return
-    await configure_gateway(config)
+    await configure_gateway(config, force_enabled=True)
 
 
 async def test_serverless_proxy(
@@ -416,8 +470,10 @@ def desired_icp_node_count(company_count: int) -> int:
     return min(max_nodes, max(1, (count + per_node - 1) // per_node))
 
 
-def _auto_scale_regions() -> list[str]:
-    values = [str(item).strip() for item in str(settings.icp_auto_scale_regions).split(",")]
+def _auto_scale_regions(provider: str | None = None) -> list[str]:
+    next_provider = str(provider or "aliyun").strip().lower()
+    source = settings.icp_auto_scale_tencent_regions if next_provider == "tencent" else settings.icp_auto_scale_regions
+    values = [str(item).strip() for item in str(source).split(",")]
     excluded = {
         str(item).strip()
         for item in str(settings.icp_auto_scale_excluded_regions).split(",")
@@ -447,7 +503,7 @@ def _auto_scale_candidates(
     """
     if need <= 0:
         return []
-    regions = _auto_scale_regions()
+    regions = _auto_scale_regions(provider)
     existing_ids = {str(node.get("id")) for node in nodes}
     ready_regions = {
         str(node.get("region"))
@@ -519,7 +575,7 @@ async def prewarm_cloud_nodes(config: dict[str, Any]) -> dict[str, Any]:
     on every ready endpoint first. Failures stay isolated; the query still runs.
     """
     row = _row(config)
-    if not row.get("enabled") or manual_proxy_urls(config):
+    if selected_proxy_pool(config) != "cloud":
         return {"warmed": 0, "failed": 0, "errors": []}
     nodes = [
         node
@@ -559,12 +615,13 @@ async def ensure_icp_node_pool(repo: Any, company_count: int) -> dict[str, Any]:
     """
     runtime = await repo.get_runtime_config()
     row = _row(runtime)
-    if not row.get("enabled") or str(row.get("provider") or "aliyun") != "aliyun":
+    provider = str(row.get("provider") or "aliyun")
+    if provider not in {"aliyun", "tencent"}:
         return {"target": 0, "ready": 0, "deployed": 0, "errors": []}
     # A ready manual proxy is an explicit single-route choice. Do not create
     # cloud resources that the current route policy will not use.
-    if manual_proxy_urls(runtime):
-        return {"target": 0, "ready": 0, "deployed": 0, "errors": ["手动代理优先，跳过云函数自动扩容"]}
+    if selected_proxy_pool(runtime) != "cloud":
+        return {"target": 0, "ready": 0, "deployed": 0, "errors": ["当前未使用云函数代理池，跳过自动扩容"]}
 
     async with _AUTO_SCALE_LOCK:
         runtime = await repo.get_runtime_config()
@@ -705,10 +762,11 @@ async def release_icp_node_pool(repo: Any, company_count: int = 0) -> dict[str, 
     """
     runtime = await repo.get_runtime_config()
     row = _row(runtime)
-    if not row.get("enabled") or str(row.get("provider") or "aliyun") != "aliyun":
+    provider = str(row.get("provider") or "aliyun")
+    if provider not in {"aliyun", "tencent"}:
         return {"target": 0, "ready": 0, "removed": 0, "errors": []}
-    if manual_proxy_urls(runtime):
-        return {"target": 0, "ready": 0, "removed": 0, "errors": ["手动代理优先，跳过云函数自动缩容"]}
+    if selected_proxy_pool(runtime) != "cloud":
+        return {"target": 0, "ready": 0, "removed": 0, "errors": ["当前未使用云函数代理池，跳过自动缩容"]}
 
     async with _AUTO_SCALE_LOCK:
         runtime = await repo.get_runtime_config()

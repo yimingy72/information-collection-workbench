@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import httpx
 
 from app.repository import Repository
-from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls, pool_nodes
+from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls, pool_nodes, selected_proxy_pool
 from app.settings import settings
 
 MAX_PAGES = 50
@@ -613,10 +613,9 @@ async def _collect_icp_from_queue(
     runtime_config = await get_runtime_config() if get_runtime_config else {}
     manual_routes = manual_proxy_urls(runtime_config)
     route_proxies = miit_proxy_urls(runtime_config)
-    using_manual_proxy = bool(manual_routes)
-    using_cloud_proxy = not using_manual_proxy and bool(
-        runtime_config.get("serverless_proxy", {}).get("enabled")
-    ) and bool(route_proxies)
+    pool = selected_proxy_pool(runtime_config)
+    using_manual_proxy = pool == "manual" and bool(manual_routes)
+    using_cloud_proxy = pool == "cloud" and bool(route_proxies)
     route_proxy = route_proxies[0] if len(route_proxies) == 1 else ""
     route_label = (
         "手动 HTTP 代理"
@@ -640,12 +639,10 @@ async def _collect_icp_from_queue(
         cloud_slots = min(ICP_MAX_CLOUD_BATCH_SIZE, max(1, ICP_CONCURRENCY), node_count)
         batch_size = cloud_slots
     if using_manual_proxy:
-        # A manual proxy is one fixed public exit. Run at most one active
-        # company per ready node; sending five companies through one node only
-        # makes their captcha/auth work contend and hit the page hard timeout.
-        batch_size = min(batch_size, len(manual_routes))
-    # Cloud mode uses one shared gateway URL plus N logical slots. Each slot
-    # has its own YMICP session key so SeaMoon can keep N warm tunnels.
+        # Fast HTTP proxies (e.g. 快代理) assign a new exit IP per request.
+        # Do not sticky-bind a company to one node or apply the cloud 5/8s
+        # tunnel budget; just keep in-flight companies within the pool size.
+        batch_size = min(ICP_MAX_CLOUD_BATCH_SIZE, max(1, len(manual_routes)))
     cloud_scheduler = None
     if using_cloud_proxy and route_proxies:
         cloud_routes = [route_proxies[0]] * max(1, cloud_slots)
@@ -654,11 +651,13 @@ async def _collect_icp_from_queue(
             ICP_PROXY_REQUEST_LIMIT,
             pause_seconds=ICP_BATCH_PAUSE_SECONDS,
         )
-    elif len(route_proxies) > 1:
+    elif using_manual_proxy and route_proxies:
+        # Rotate every request. request_limit=1 prevents sticky reuse; no
+        # WAF pause because the next request already has a different IP.
         proxy_pool_scheduler = _IcpProxyPoolScheduler(
             route_proxies,
-            ICP_PROXY_REQUEST_LIMIT,
-            pause_seconds=ICP_BATCH_PAUSE_SECONDS,
+            1,
+            pause_seconds=0.0,
         )
     else:
         proxy_pool_scheduler = None
@@ -719,8 +718,10 @@ async def _collect_icp_from_queue(
                             request_generation = held_generation
                             proxy_request_claimed = True
                         elif proxy_pool_scheduler is not None:
-                            request_route_proxy, request_route_index, request_generation = await proxy_pool_scheduler.acquire(company_route_index)
-                            company_route_index = request_route_index
+                            preferred = None if using_manual_proxy else company_route_index
+                            request_route_proxy, request_route_index, request_generation = await proxy_pool_scheduler.acquire(preferred)
+                            if not using_manual_proxy:
+                                company_route_index = request_route_index
                             proxy_request_claimed = True
                         elif cloud_scheduler is not None:
                             request_generation = await cloud_scheduler.acquire()
@@ -745,7 +746,12 @@ async def _collect_icp_from_queue(
                         fetch_options["timeout_seconds"] = page_timeout
                         if request_route_proxy:
                             fetch_options["route_proxy"] = request_route_proxy
-                            if request_generation is not None:
+                            if using_manual_proxy:
+                                # 快代理 assigns a new IP per request. Keep
+                                # YMICP sessions unique so cookies/captcha
+                                # from the previous IP are not reused.
+                                fetch_options["session_key"] = uuid4().hex
+                            elif request_generation is not None:
                                 # Stable per-lane key so five companies reuse
                                 # one warm YMICP/SeaMoon session. A generation
                                 # bump (WAF/transport rotate) is the only

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from uuid import uuid4
 
+import ssl
+
 import httpx
 import pytest
 
@@ -146,6 +148,8 @@ async def test_collection_streams_resolved_results_and_filters_dictionary_wildca
     assert all(item[1]["http_status"] == 200 for item in repo.results)
     assert repo.results[0][1]["sources"] == ["DNS字典", "crt.sh"]
     assert repo.progress[-1][0][4] == "completed"
+    assert repo.progress[-1][0][1] >= 1
+    assert repo.progress[-1][0][2] == 1
 
 
 @pytest.mark.asyncio
@@ -168,6 +172,7 @@ async def test_passive_source_failure_is_warning_not_fatal(monkeypatch):
     monkeypatch.setattr(subdomains, "collect_certspotter", empty)
     monkeypatch.setattr(subdomains, "collect_hackertarget", empty)
     monkeypatch.setattr(subdomains, "resolve_hostname", unresolved)
+    monkeypatch.setattr(subdomains, "PASSIVE_ATTEMPTS", 1)
 
     repo = FakeRepo()
     warnings = await subdomains.collect_subdomains(
@@ -440,11 +445,12 @@ async def test_rate_limited_source_is_not_retried_immediately(monkeypatch):
     async def limited(_client, _domain):
         nonlocal calls
         calls += 1
-        response = httpx.Response(429, headers={"retry-after": "1"})
+        response = httpx.Response(429, headers={"retry-after": "30"})
         request = httpx.Request("GET", "https://source.invalid")
         raise httpx.HTTPStatusError("rate limited", request=request, response=response)
 
     monkeypatch.setattr(subdomains, "SOURCE_COOLDOWN_SECONDS", 60.0)
+    monkeypatch.setattr(subdomains, "SOURCE_COOLDOWN_WAIT_SECONDS", 8.0)
     # Use a fresh throttle so this test is independent from other tests.
     throttle = subdomains._SourceThrottle()
     monkeypatch.setattr(subdomains, "SOURCE_THROTTLE", throttle)
@@ -561,3 +567,147 @@ async def test_passive_source_uses_proxy_fallback_after_direct_connect_failure()
     assert error == ""
     assert direct_calls == 1
     assert proxy_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_new_passive_sources_parse_and_filter_results():
+    def handler(request: httpx.Request) -> httpx.Response:
+        host = request.url.host
+        if host in {"jonlu.ca", "jldc.me"}:
+            return httpx.Response(200, json=["api.example.com", "outside.test"])
+        if host == "otx.alienvault.com":
+            return httpx.Response(200, json={"passive_dns": [
+                {"hostname": "cdn.example.com"},
+                {"hostname": "unrelated.test"},
+            ]})
+        if host == "web.archive.org":
+            return httpx.Response(200, json=[
+                ["original"],
+                ["https://mail.example.com/path"],
+                ["https://outside.test/"],
+            ])
+        if host == "api.threatminer.org":
+            return httpx.Response(200, json={"status": "ok", "data": ["vpn.example.com", "other.test"]})
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await subdomains.collect_anubis(client, "example.com") == {"api.example.com"}
+        assert await subdomains.collect_alienvault(client, "example.com") == {"cdn.example.com"}
+        assert await subdomains.collect_wayback(client, "example.com") == {"mail.example.com"}
+        assert await subdomains.collect_threatminer(client, "example.com") == {"vpn.example.com"}
+
+
+@pytest.mark.asyncio
+async def test_short_rate_limit_is_waited_instead_of_skipped(monkeypatch):
+    calls = 0
+
+    async def limited(_client, _domain):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            response = httpx.Response(429, headers={"retry-after": "1"})
+            request = httpx.Request("GET", "https://source.invalid")
+            raise httpx.HTTPStatusError("rate limited", request=request, response=response)
+        return {"api.example.com"}
+
+    monkeypatch.setattr(subdomains, "SOURCE_COOLDOWN_SECONDS", 1.0)
+    monkeypatch.setattr(subdomains, "SOURCE_COOLDOWN_WAIT_SECONDS", 2.0)
+    monkeypatch.setattr(subdomains, "PASSIVE_ATTEMPTS", 2)
+    throttle = subdomains._SourceThrottle()
+    monkeypatch.setattr(subdomains, "SOURCE_THROTTLE", throttle)
+    async def no_sleep(_seconds):
+        return None
+    monkeypatch.setattr(subdomains.asyncio, "sleep", no_sleep)
+    async with httpx.AsyncClient() as client:
+        first = await subdomains._call_source(FakeRepo(), "rate-source", limited, client, "example.com")
+        second = await subdomains._call_source(FakeRepo(), "rate-source", limited, client, "other.example.com")
+
+    assert first[1] == set()
+    assert "429" in first[2]
+    assert second[1] == {"api.example.com"}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_dictionary_wildcard_skips_http_probe(monkeypatch):
+    probes = []
+
+    async def resolve(hostname):
+        return ResolvedHost(hostname, ["203.0.113.10"])
+
+    async def probe(_client, resolved, _root=None):
+        probes.append(resolved.hostname)
+        return HttpProbe(f"https://{resolved.hostname}/", 200, "Wildcard")
+
+    monkeypatch.setattr(subdomains, "COMMON_PREFIXES", ("www",))
+    monkeypatch.setattr(subdomains, "PASSIVE_SOURCES", ())
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    monkeypatch.setattr(subdomains, "probe_http", probe)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", lambda _domain: __import__("asyncio").sleep(0, result={"203.0.113.10"}))
+
+    repo = FakeRepo()
+    await subdomains.collect_subdomains(
+        repo, uuid4(), ["example.com"],
+        {"passive": False, "brute_force": True, "deep_scan": False, "http_probe": True},
+        lease_id=uuid4(),
+    )
+
+    assert probes == []
+    assert repo.results == []
+
+
+
+@pytest.mark.asyncio
+async def test_optional_source_failure_keeps_discovered_hosts(monkeypatch):
+    async def broken(_client, _domain):
+        raise httpx.ConnectError("offline")
+
+    async def empty(_client, _domain):
+        return set()
+
+    async def resolve(hostname):
+        if hostname == "www.example.com":
+            return ResolvedHost(hostname, ["93.184.216.34"])
+        return None
+
+    monkeypatch.setattr(subdomains, "COMMON_PREFIXES", ("www",))
+    monkeypatch.setattr(subdomains, "PASSIVE_SOURCES", (("CertSpotter", "collect_certspotter"),))
+    monkeypatch.setattr(subdomains, "collect_certspotter", broken)
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    monkeypatch.setattr(subdomains, "PASSIVE_ATTEMPTS", 1)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", lambda _domain: __import__("asyncio").sleep(0, result=set()))
+    monkeypatch.setattr(subdomains, "generate_altdns_candidates", lambda *_args: set())
+
+    repo = FakeRepo()
+    warnings = await subdomains.collect_subdomains(
+        repo, uuid4(), ["example.com"],
+        {"passive": True, "brute_force": True, "deep_scan": False, "http_probe": False},
+        lease_id=uuid4(),
+    )
+
+    assert warnings and "CertSpotter" in warnings[0]
+    assert {item[1]["hostname"] for item in repo.results} == {"www.example.com"}
+
+
+
+def test_optional_source_notes_do_not_mark_successful_runs_partial():
+    def finish_status(discovered: int, warnings: list[str]) -> str:
+        return "succeeded" if discovered or not warnings else "partial"
+
+    assert finish_status(1, ["example.com · CertSpotter：网络连接失败"]) == "succeeded"
+    assert finish_status(0, ["example.com · CertSpotter：网络连接失败"]) == "partial"
+    assert finish_status(0, []) == "succeeded"
+
+
+
+@pytest.mark.asyncio
+async def test_web_metadata_ssl_error_is_not_fatal(monkeypatch):
+    async def resolve(_hostname):
+        return ResolvedHost("example.com", ["93.184.216.34"])
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        raise ssl.SSLError("tlsv13 alert certificate required")
+
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await subdomains.collect_web_metadata(client, "example.com") == set()

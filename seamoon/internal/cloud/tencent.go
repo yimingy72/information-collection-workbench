@@ -13,6 +13,7 @@ import (
 )
 
 const tencentNamespace = "seamoon"
+const tencentTriggerName = "http"
 
 type tencentTriggerDescription struct {
 	AuthType  string            `json:"AuthType,omitempty"`
@@ -30,6 +31,39 @@ func tencentClient(config Config) (*scf.Client, error) {
 	clientProfile := profile.NewClientProfile()
 	clientProfile.HttpProfile.Endpoint = "scf.tencentcloudapi.com"
 	return scf.NewClient(credential, config.Region, clientProfile)
+}
+
+func tencentErrorCode(err error) string {
+	var cloudError *tencentErrors.TencentCloudSDKError
+	if errors.As(err, &cloudError) {
+		return cloudError.Code
+	}
+	return ""
+}
+
+func tencentImage(config Config) (string, error) {
+	image := config.ImageURI
+	if image == "" {
+		image = tencentImages[config.Region]
+	}
+	if image == "" {
+		return "", fmt.Errorf("region %s has no SeaMoon preset image", config.Region)
+	}
+	return image, nil
+}
+
+func tencentImageConfig(image string) *scf.ImageConfig {
+	// Official SeaMoon images start via ENTRYPOINT ["/app/entrypoint.sh"]
+	// which execs /app/seamoon. Tencent SCF ImageConfig.Command replaces
+	// Entrypoint; Args replace CMD. Some regions execute Args[0] directly
+	// when Command is empty, so "server" is not found. Set both explicitly.
+	return &scf.ImageConfig{
+		ImageType: common.StringPtr("personal"),
+		ImageUri:  common.StringPtr(image),
+		Command:   common.StringPtr("/app/seamoon"),
+		Args:      common.StringPtr("server -p 9000 -t websocket"),
+		ImagePort: common.Int64Ptr(9000),
+	}
 }
 
 func tencentInstanceConcurrencyConfig() *scf.InstanceConcurrencyConfig {
@@ -57,28 +91,7 @@ func tencentFunctionConfigurationRequest(config Config) *scf.UpdateFunctionConfi
 	}
 }
 
-func deployTencent(config Config) (Result, error) {
-	image := config.ImageURI
-	if image == "" {
-		image = tencentImages[config.Region]
-	}
-	if image == "" {
-		return Result{}, fmt.Errorf("region %s has no SeaMoon preset image", config.Region)
-	}
-	client, err := tencentClient(config)
-	if err != nil {
-		return Result{}, err
-	}
-	namespace := scf.NewCreateNamespaceRequest()
-	namespace.Namespace = common.StringPtr(tencentNamespace)
-	namespace.Description = common.StringPtr("信息收集工作台 SeaMoon functions")
-	if _, err := client.CreateNamespace(namespace); err != nil {
-		cloudError, ok := err.(*tencentErrors.TencentCloudSDKError)
-		if !ok || cloudError.Code != scf.RESOURCEINUSE_NAMESPACE {
-			return Result{}, fmt.Errorf("create Tencent Cloud namespace: %w", err)
-		}
-	}
-
+func tencentCreateFunctionRequest(config Config, image string) *scf.CreateFunctionRequest {
 	request := scf.NewCreateFunctionRequest()
 	request.Namespace = common.StringPtr(tencentNamespace)
 	request.FunctionName = common.StringPtr(config.FunctionName)
@@ -89,34 +102,24 @@ func deployTencent(config Config) (Result, error) {
 	request.ProtocolParams = &scf.ProtocolParams{WSParams: &scf.WSParams{IdleTimeOut: common.Uint64Ptr(60)}}
 	request.Timeout = common.Int64Ptr(600)
 	request.AutoCreateClsTopic = common.StringPtr("FALSE")
-	request.Code = &scf.Code{ImageConfig: &scf.ImageConfig{
-		ImageType: common.StringPtr("personal"), ImageUri: common.StringPtr(image),
-		Args: common.StringPtr("server -p 9000 -t websocket"), ImagePort: common.Int64Ptr(9000),
-	}}
+	request.Code = &scf.Code{ImageConfig: tencentImageConfig(image)}
 	request.PublicNetConfig = &scf.PublicNetConfigIn{
 		PublicNetStatus: common.StringPtr("ENABLE"),
 		EipConfig:       &scf.EipConfigIn{EipStatus: common.StringPtr("DISABLE")},
 	}
 	request.InstanceConcurrencyConfig = tencentInstanceConcurrencyConfig()
-	if _, err := client.CreateFunction(request); err != nil {
-		cloudError, ok := err.(*tencentErrors.TencentCloudSDKError)
-		if !ok || cloudError.Code != scf.RESOURCEINUSE_FUNCTION {
-			return Result{}, fmt.Errorf("create Tencent Cloud function: %w", err)
-		}
-		if _, updateErr := client.UpdateFunctionConfiguration(tencentFunctionConfigurationRequest(config)); updateErr != nil {
-			return Result{}, fmt.Errorf("update existing Tencent Cloud function resources: %w", updateErr)
-		}
-	}
+	return request
+}
 
+func waitTencentFunctionActive(client *scf.Client, config Config) (string, error) {
 	deploymentID := ""
-	active := false
 	for attempt := 0; attempt < 30; attempt++ {
 		listRequest := scf.NewListFunctionsRequest()
 		listRequest.Namespace = common.StringPtr(tencentNamespace)
 		listRequest.SearchKey = common.StringPtr(config.FunctionName)
 		functions, err := client.ListFunctions(listRequest)
 		if err != nil {
-			return Result{}, fmt.Errorf("read Tencent Cloud function status: %w", err)
+			return "", fmt.Errorf("read Tencent Cloud function status: %w", err)
 		}
 		if functions.Response != nil {
 			for _, function := range functions.Response.Functions {
@@ -126,52 +129,137 @@ func deployTencent(config Config) (Result, error) {
 				if function.FunctionId != nil {
 					deploymentID = *function.FunctionId
 				}
-				if function.Status != nil && *function.Status == "Active" {
-					active = true
-					break
+				status := ""
+				if function.Status != nil {
+					status = *function.Status
 				}
-				if function.Status != nil && *function.Status != "Creating" {
+				switch status {
+				case "Active":
+					return deploymentID, nil
+				case "", "Creating", "Updating":
+					// Wait for the function or image update to finish.
+				default:
 					description := "unknown status"
 					if function.StatusDesc != nil {
 						description = *function.StatusDesc
 					}
-					return Result{}, fmt.Errorf("Tencent Cloud function status %s: %s", *function.Status, description)
+					return "", fmt.Errorf("Tencent Cloud function status %s: %s", status, description)
 				}
 			}
 		}
-		if active {
-			break
-		}
 		time.Sleep(2 * time.Second)
 	}
-	if !active {
-		return Result{}, errors.New("Tencent Cloud function did not become active within 60 seconds")
-	}
+	return "", errors.New("Tencent Cloud function did not become active within 60 seconds")
+}
 
-	triggerDescription, _ := json.Marshal(tencentTriggerDescription{
+func tencentExtranetURL(raw string) (string, error) {
+	var description tencentTriggerDescription
+	if err := json.Unmarshal([]byte(raw), &description); err != nil {
+		return "", fmt.Errorf("decode Tencent Cloud function URL: %w", err)
+	}
+	if description.NetConfig == nil || description.NetConfig.ExtranetURL == "" {
+		return "", errors.New("Tencent Cloud did not return an extranet URL")
+	}
+	return description.NetConfig.ExtranetURL, nil
+}
+
+func ensureTencentTrigger(client *scf.Client, config Config) (string, error) {
+	triggerDescription, err := json.Marshal(tencentTriggerDescription{
 		AuthType: "NONE", NetConfig: &tencentNetConfig{EnableIntranet: false, EnableExtranet: true},
 	})
+	if err != nil {
+		return "", fmt.Errorf("encode Tencent Cloud HTTP trigger: %w", err)
+	}
 	triggerRequest := scf.NewCreateTriggerRequest()
-	triggerRequest.TriggerName = common.StringPtr("http")
+	triggerRequest.TriggerName = common.StringPtr(tencentTriggerName)
 	triggerRequest.FunctionName = common.StringPtr(config.FunctionName)
 	triggerRequest.Type = common.StringPtr("http")
 	triggerRequest.TriggerDesc = common.StringPtr(string(triggerDescription))
 	triggerRequest.Namespace = common.StringPtr(tencentNamespace)
 	trigger, err := client.CreateTrigger(triggerRequest)
+	if err == nil {
+		if trigger.Response == nil || trigger.Response.TriggerInfo == nil || trigger.Response.TriggerInfo.TriggerDesc == nil {
+			return "", errors.New("Tencent Cloud did not return a function URL")
+		}
+		return tencentExtranetURL(*trigger.Response.TriggerInfo.TriggerDesc)
+	}
+	code := tencentErrorCode(err)
+	if code != scf.RESOURCEINUSE_TRIGGER && code != scf.RESOURCEINUSE_TRIGGERNAME {
+		return "", fmt.Errorf("create Tencent Cloud function URL: %w", err)
+	}
+
+	listRequest := scf.NewListTriggersRequest()
+	listRequest.FunctionName = common.StringPtr(config.FunctionName)
+	listRequest.Namespace = common.StringPtr(tencentNamespace)
+	listRequest.Limit = common.Uint64Ptr(20)
+	listed, listErr := client.ListTriggers(listRequest)
+	if listErr != nil {
+		return "", fmt.Errorf("read existing Tencent Cloud HTTP trigger: %w", listErr)
+	}
+	if listed.Response != nil {
+		for _, item := range listed.Response.Triggers {
+			if item == nil || item.TriggerDesc == nil {
+				continue
+			}
+			if item.Type != nil && *item.Type != "http" {
+				continue
+			}
+			if item.TriggerName != nil && *item.TriggerName != "" && *item.TriggerName != tencentTriggerName {
+				continue
+			}
+			endpoint, parseErr := tencentExtranetURL(*item.TriggerDesc)
+			if parseErr == nil {
+				return endpoint, nil
+			}
+		}
+	}
+	return "", errors.New("Tencent Cloud HTTP trigger already exists but no extranet URL was returned")
+}
+
+func deployTencent(config Config) (Result, error) {
+	image, err := tencentImage(config)
 	if err != nil {
-		return Result{}, fmt.Errorf("create Tencent Cloud function URL: %w", err)
+		return Result{}, err
 	}
-	if trigger.Response == nil || trigger.Response.TriggerInfo == nil || trigger.Response.TriggerInfo.TriggerDesc == nil {
-		return Result{}, errors.New("Tencent Cloud did not return a function URL")
+	client, err := tencentClient(config)
+	if err != nil {
+		return Result{}, err
 	}
-	var description tencentTriggerDescription
-	if err := json.Unmarshal([]byte(*trigger.Response.TriggerInfo.TriggerDesc), &description); err != nil {
-		return Result{}, fmt.Errorf("decode Tencent Cloud function URL: %w", err)
+	namespace := scf.NewCreateNamespaceRequest()
+	namespace.Namespace = common.StringPtr(tencentNamespace)
+	namespace.Description = common.StringPtr("信息收集工作台 SeaMoon functions")
+	if _, err := client.CreateNamespace(namespace); err != nil {
+		if tencentErrorCode(err) != scf.RESOURCEINUSE_NAMESPACE {
+			return Result{}, fmt.Errorf("create Tencent Cloud namespace: %w", err)
+		}
 	}
-	if description.NetConfig == nil || description.NetConfig.ExtranetURL == "" {
-		return Result{}, errors.New("Tencent Cloud did not return an extranet URL")
+
+	if _, err := client.CreateFunction(tencentCreateFunctionRequest(config, image)); err != nil {
+		code := tencentErrorCode(err)
+		if code != scf.RESOURCEINUSE_FUNCTION && code != scf.RESOURCEINUSE_FUNCTIONNAME {
+			return Result{}, fmt.Errorf("create Tencent Cloud function: %w", err)
+		}
+		if _, updateErr := client.UpdateFunctionConfiguration(tencentFunctionConfigurationRequest(config)); updateErr != nil {
+			return Result{}, fmt.Errorf("update existing Tencent Cloud function resources: %w", updateErr)
+		}
+		updateCode := scf.NewUpdateFunctionCodeRequest()
+		updateCode.Namespace = common.StringPtr(tencentNamespace)
+		updateCode.FunctionName = common.StringPtr(config.FunctionName)
+		updateCode.Code = &scf.Code{ImageConfig: tencentImageConfig(image)}
+		if _, updateErr := client.UpdateFunctionCode(updateCode); updateErr != nil {
+			return Result{}, fmt.Errorf("update existing Tencent Cloud function image: %w", updateErr)
+		}
 	}
-	return Result{Endpoint: description.NetConfig.ExtranetURL, DeploymentID: deploymentID, Message: "deployed"}, nil
+
+	deploymentID, err := waitTencentFunctionActive(client, config)
+	if err != nil {
+		return Result{}, err
+	}
+	endpoint, err := ensureTencentTrigger(client, config)
+	if err != nil {
+		return Result{}, err
+	}
+	return Result{Endpoint: endpoint, DeploymentID: deploymentID, Message: "deployed"}, nil
 }
 
 func destroyTencent(config Config) (Result, error) {

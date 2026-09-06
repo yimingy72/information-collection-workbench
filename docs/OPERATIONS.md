@@ -112,9 +112,15 @@ docker compose -p asset-workbench exec -T postgres \
 3. 是否出现验证码、非 JSON、HTTP 5xx、521 或创宇盾拦截。
 4. 云函数是否处于冷启动或触发器异常状态。
 5. 当前代码是否错误地对云函数应用了直连12秒冷却；现行版本不应这样做。
-6. 直连模式虽然保留单 IP 的 0.4 秒间隔和每 5 次 12 秒冷却，但独立企业会在节流器后并发 pipeline；如果 1 个 ready 手动代理存在，它会优先于云函数节点池，需停用后才能验证云函数多节点吞吐。
+6. 直连模式虽然保留单 IP 的 0.4 秒间隔和每 5 次 12 秒冷却，但独立企业会在节流器后并发 pipeline；云函数代理池是默认路由；只有在“代理池配置”中显式选择 HTTP 代理池后，才会改走手动代理。
 
 单次80秒预算耗尽后，该企业会进入后续企业级重试轮次。默认总计尝试2次，轮次间等待0.5秒；只有全部尝试均失败时，任务才记录该企业失败并标记为部分成功。
+
+### 青岛等地域 502 / `executable file not found`
+
+已部署节点如果仍是空 Entrypoint，即使当前 `/_health` 能通，也可能在冷启动后再次变成 502。重新部署会把 `Entrypoint=/app/seamoon` 写回函数。最小实例为 0 时，没有查询请求通常不会产生函数调用费；镜像仓库、日志、公网出网等仍可能产生少量费用。
+
+官方 SeaMoon 镜像的 ENTRYPOINT 是 `/app/entrypoint.sh`，实际二进制是 `/app/seamoon`。如果函数只配置 `Command: server -p 9000 -t websocket` 且 Entrypoint 为空，部分地域会把 `server` 当成可执行文件，容器起不来并返回 502。阿里云部署会显式设置 `Entrypoint=/app/seamoon`；腾讯云会设置 `Command=/app/seamoon`。已有异常节点需要重新部署后才会更新函数配置。腾讯云已存在的同名函数还会调用 `UpdateFunctionCode` 同步镜像和启动参数，已存在的 HTTP 触发器会复用公网地址而不是直接失败。
 
 ### ICP 自动扩容节点池
 
@@ -163,7 +169,7 @@ LIMIT 20;
 
 1. 确认运行的是最新 `seamoon-core`。
 2. 查看 API 的 `last_error` 和云平台请求 ID。
-3. 检查函数地域和函数名是否与平台配置一致。
+3. 检查云平台默认地域和函数名是否与控制台中的函数一致（阿里云默认 `cn-hangzhou`，腾讯云默认 `ap-guangzhou`，函数名均为 `asset-workbench-seamoon`）。
 
 ### `Either Code or CustomContainerConfig must be set`
 
@@ -267,7 +273,7 @@ POST /api/v1/collection-runs/{run_id}/cancel
 - 页面首次进入任务时先读取全部已保存结果，再从 `stream_seq` 游标建立 SSE；刷新浏览器不会把历史结果清空，也不会丢失进行中的任务。
 - DNS 结果和 HTTP 探测结果可能是同一主机的两次写入，前端按结果 `id` 合并，后一次会补全状态码、标题、访问地址和来源。
 - 任务列表默认展示最近 30 条记录，并每 3 秒刷新一次进行中的摘要；SSE 断线时浏览器自动重连，任务完成后重新读取最终快照。
-- 多主域名最多同时处理 3 个根域名；如需降低压力，调整 `backend/app/subdomains.py` 的 `ROOT_CONCURRENCY`，不要直接取消 DNS/HTTP 全局并发限制。
+- 多主域名默认同时处理 5 个根域名；如需降低压力，调整 `backend/app/subdomains.py` 的 `ROOT_CONCURRENCY`，不要直接取消 DNS/HTTP 全局并发限制。
 - 被动数据源采用“直连优先、已验证代理立即兜底”：连接失败、超时、403、429、5xx 等情况会立即尝试当前可用的手动代理或 SeaMoon 路由；代理兜底成功不会把该来源标记为失败。
 - CertSpotter 返回的相对分页链接会自动拼接到 `api.certspotter.com`，因此不会因 `Link: </v1/issuances?...>` 导致分页失败。
 

@@ -572,10 +572,12 @@ async def test_icp_direct_multi_page_saves_each_page_without_proxy_lookup(monkey
 
     assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
     page_timeout = miit.ICP_PAGE_TIMEOUT_SECONDS
-    assert [(item[0], item[1], item[2]) for item in fetch_calls] == [
-        ("测试企业", 1, page_timeout),
-        ("测试企业", 2, page_timeout),
+    assert [(item[0], item[1]) for item in fetch_calls] == [
+        ("测试企业", 1),
+        ("测试企业", 2),
     ]
+    assert fetch_calls[0][2] == page_timeout
+    assert fetch_calls[1][2] <= page_timeout
     assert fetch_calls[0][3]
     assert fetch_calls[0][3] == fetch_calls[1][3]
     assert len(saved_pages) == 2
@@ -896,7 +898,7 @@ def test_cloud_proxy_is_used_by_tianyancha_when_configured():
 
 
 @pytest.mark.asyncio
-async def test_icp_single_manual_proxy_keeps_one_pagination_session(monkeypatch):
+async def test_icp_single_manual_proxy_uses_fresh_session_per_page(monkeypatch):
     import app.miit as miit
 
     calls = []
@@ -905,6 +907,7 @@ async def test_icp_single_manual_proxy_keeps_one_pagination_session(monkeypatch)
     class Repo:
         async def get_runtime_config(self):
             return {
+                "proxy_pool": "manual",
                 "serverless_proxy": {
                     "enabled": True,
                     "endpoint": "https://cloud.example",
@@ -931,8 +934,8 @@ async def test_icp_single_manual_proxy_keeps_one_pagination_session(monkeypatch)
     assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
     assert len(calls) == 2
     assert all(call[2] == manual for call in calls)
-    assert calls[0][3] == calls[1][3]
-    assert not calls[0][3].endswith("_0")
+    assert calls[0][3] and calls[1][3]
+    assert calls[0][3] != calls[1][3]
 
 
 @pytest.mark.asyncio
@@ -946,6 +949,7 @@ async def test_icp_single_manual_proxy_runs_one_company_at_a_time(monkeypatch):
     class Repo:
         async def get_runtime_config(self):
             return {
+                "proxy_pool": "manual",
                 "manual_proxies": [{
                     "scheme": "http",
                     "host": "manual.example",
@@ -988,6 +992,7 @@ async def test_icp_manual_proxy_pool_parallelism_matches_ready_nodes(monkeypatch
     class Repo:
         async def get_runtime_config(self):
             return {
+                "proxy_pool": "manual",
                 "manual_proxies": [
                     {
                         "scheme": "http",
@@ -1024,6 +1029,46 @@ async def test_icp_manual_proxy_pool_parallelism_matches_ready_nodes(monkeypatch
         "http://manual1.example:8080",
     }
 
+
+
+@pytest.mark.asyncio
+async def test_icp_manual_proxy_rotates_every_request_without_waf_pause(monkeypatch):
+    import app.miit as miit
+
+    sleeps: list[float] = []
+    sessions: list[str] = []
+
+    class Repo:
+        async def get_runtime_config(self):
+            return {
+                "proxy_pool": "manual",
+                "manual_proxies": [{
+                    "scheme": "http",
+                    "host": "manual.example",
+                    "port": 8080,
+                    "username": "user",
+                    "password": "pass",
+                    "enabled": True,
+                    "status": "ready",
+                }],
+            }
+
+    async def fake_fetch(_client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""):
+        sessions.append(session_key)
+        return {"rows": [], "pages": 1, "total": 0}
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
+    monkeypatch.setattr(miit.asyncio, "sleep", fake_sleep)
+
+    assert await miit.collect_icp(
+        Repo(), uuid4(), [f"企业{i}" for i in range(6)]
+    ) == []
+    assert len(sessions) == 6
+    assert len(set(sessions)) == 6
+    assert not any(value >= 7.9 for value in sleeps)
 
 @pytest.mark.asyncio
 async def test_icp_cloud_scheduler_does_not_apply_direct_ip_cooldown(monkeypatch):

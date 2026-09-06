@@ -251,6 +251,10 @@ body,
   min-width: 360px;
 }
 
+.query-proxy {
+  width: 148px;
+}
+
 .query-providers .ant-select-selection-overflow {
   flex-wrap: nowrap;
 }
@@ -375,6 +379,36 @@ body,
   background: rgba(127, 127, 127, 0.08);
 }
 
+.proxy-pool-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.proxy-pool-switch {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+}
+
+.manual-proxy-form {
+  width: 100%;
+  flex-wrap: nowrap;
+}
+
+.manual-proxy-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: none;
+}
+
+.manual-proxy-input .ant-form-item-control,
+.manual-proxy-input .ant-form-item-control-input,
+.manual-proxy-input .ant-input-affix-wrapper,
+.manual-proxy-input .ant-input {
+  width: 100%;
+}
+
 .settings-section-content {
   flex: 1 1 auto;
   min-height: 0;
@@ -395,7 +429,7 @@ body,
 
 .serverless-proxy-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0 18px;
 }
 
@@ -441,12 +475,12 @@ body,
 
 /* Cloud-function settings stay dense while keeping the primary actions visible. */
 .serverless-shell > .ant-card-head {
-  min-height: 40px;
-  padding-inline: 12px;
+  min-height: 48px;
+  padding-inline: 16px;
 }
 
 .serverless-shell > .ant-card-body {
-  padding: 8px 10px 10px;
+  padding: 16px;
 }
 
 .serverless-compact-form {
@@ -528,8 +562,9 @@ body,
 
 .serverless-proxy-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  column-gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  column-gap: 16px;
+  row-gap: 0;
 }
 
 .serverless-span-full {
@@ -574,19 +609,18 @@ body,
   font-size: 12px;
 }
 
-.serverless-action-bar {
-  position: sticky;
-  top: 0;
-  z-index: 10;
+.serverless-shell > .ant-card-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: -8px -10px 8px;
-  padding: 7px 10px;
-  border-bottom: 1px solid var(--aw-border, #dce4e3);
-  background: var(--aw-surface, #fff);
-  box-shadow: 0 3px 10px rgba(22, 32, 32, 0.06);
+}
+
+.serverless-shell > .ant-card-extra {
+  margin-inline-start: 12px;
+}
+
+.serverless-action-buttons .ant-btn {
+  height: 28px;
+  padding-inline: 10px;
 }
 
 .serverless-action-meta {
@@ -607,34 +641,20 @@ body,
   justify-content: flex-end;
 }
 
-.serverless-action-bar .ant-btn {
-  height: 28px;
-  padding-inline: 8px;
-  font-size: 12px;
-}
-
-@media (prefers-color-scheme: dark) {
-  .serverless-action-bar {
-    background: #171c1c;
-    border-bottom-color: #2a3635;
-    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
-  }
-}
-
 @media (max-width: 760px) {
-  .serverless-action-bar {
-    align-items: stretch;
-    flex-direction: column;
-    gap: 6px;
+  .serverless-shell > .ant-card-head {
+    flex-wrap: wrap;
+    gap: 8px;
   }
 
-  .serverless-action-meta {
+  .serverless-shell > .ant-card-extra {
     width: 100%;
+    margin-inline-start: 0;
   }
 
   .serverless-action-buttons {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    display: flex;
+    flex-wrap: wrap;
     width: 100%;
   }
 
@@ -692,8 +712,8 @@ body,
 }
 
 .manual-proxy-input {
-  flex: 1 1 520px;
-  min-width: 260px;
+  flex: 1 1 auto;
+  min-width: 0;
   margin-bottom: 0;
 }
 
@@ -732,10 +752,17 @@ body,
 }
 
 /* Subdomain discovery */
+.subdomain-query-fields {
+  width: 100%;
+}
+
+.subdomain-mode-field {
+  flex: none;
+}
+
 .subdomain-domain-input {
   flex: 1 1 360px;
   min-width: 280px;
-  max-width: 620px;
 }
 
 .subdomain-icp-inputs {
@@ -743,22 +770,19 @@ body,
   min-width: 320px;
 }
 
-.subdomain-icp-run-select {
-  flex: 1 1 340px;
-  min-width: 260px;
-}
-
+.subdomain-icp-run-select,
 .subdomain-icp-domain-select {
-  flex: 1 1 260px;
-  min-width: 220px;
+  flex: 1 1 220px;
+  min-width: 180px;
 }
 
 .subdomain-options {
   min-height: 32px;
   display: inline-flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   white-space: nowrap;
+  flex: none;
 }
 
 .subdomain-history-select {
@@ -811,13 +835,7 @@ body,
 /* Keep a large passive-source warning from consuming the result table. The
    complete warning list is still available by scrolling this compact area. */
 .subdomain-warning-alert .ant-alert-description {
-  max-height: 64px;
-  overflow-y: auto;
   padding-inline-end: 4px;
-}
-
-.subdomain-warning-alert .ant-alert-description .ant-flex {
-  gap: 0 !important;
 }
 
 .subdomain-result-toolbar {

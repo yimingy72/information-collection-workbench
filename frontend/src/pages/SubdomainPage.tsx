@@ -18,7 +18,7 @@ import {
   Typography,
 } from 'antd'
 import type { TableProps } from 'antd'
-import { DeleteOutlined, DownloadOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons'
+import { DeleteOutlined, DownloadOutlined, PlayCircleOutlined, StopOutlined } from '@ant-design/icons'
 import {
   cancelSubdomainRun,
   createSubdomainRun,
@@ -31,6 +31,7 @@ import {
 } from '../api'
 import { StatusTag } from '../components/StatusTag'
 import { TableFrame } from '../components/TableFrame'
+import { exportSubdomains } from '../export'
 import { formatDate, formatDuration } from '../formatters'
 import { usePagedData } from '../pagination'
 import type { IcpDomainRun, SubdomainOptions, SubdomainResult, SubdomainRun } from '../types'
@@ -59,10 +60,14 @@ function parseDomains(value: string) {
 }
 
 
-function recentRunLabel(run: SubdomainRun) {
+function runTitle(run: SubdomainRun) {
+  if (run.title?.trim()) return run.title.trim()
   const first = run.domains[0] || '空任务'
-  const suffix = run.domains.length > 1 ? ` 等 ${run.domains.length} 个主域名` : ''
-  return `${first}${suffix} · ${formatDate(run.created_at)}`
+  return run.domains.length > 1 ? `${first} 等 ${run.domains.length} 个主域名` : first
+}
+
+function recentRunLabel(run: SubdomainRun) {
+  return `${runTitle(run)} · ${formatDate(run.created_at)}`
 }
 
 function progressStatus(status: SubdomainRun['status']) {
@@ -72,44 +77,22 @@ function progressStatus(status: SubdomainRun['status']) {
   return 'normal' as const
 }
 
-function readableWarning(value: string) {
-  const source = value.split('：', 1)[0]
-  if (/429|Too Many Requests/i.test(value)) return `${source}：请求频率受限（HTTP 429），其他来源已继续查询`
-  const withoutUrls = value
-    .replace(/For more information check:\s*https?:\/\/\S+/gi, '')
-    .replace(/https?:\/\/\S+/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-  return withoutUrls.length > 220 ? `${withoutUrls.slice(0, 217)}…` : withoutUrls
-}
-
-function exportResults(run: SubdomainRun, rows: SubdomainResult[]) {
-  const header = ['主域名', '子域名', 'IP', 'CNAME', 'HTTP状态', '访问地址', '标题', '来源', '发现时间']
-  const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`
-  const body = rows.map((row) => [
-    row.root_domain,
-    row.hostname,
-    row.ips.join('、'),
-    row.canonical_name,
-    row.http_status ?? '',
-    row.http_url,
-    row.title,
-    row.sources.join('、'),
-    formatDate(row.discovered_at),
-  ].map(escape).join(','))
-  const blob = new Blob([`\uFEFF${[header.map(escape).join(','), ...body].join('\r\n')}`], { type: 'text/csv;charset=utf-8' })
-  const link = document.createElement('a')
-  const url = URL.createObjectURL(blob)
-  const filename = run.domains.length > 1
-    ? `${run.domains[0]}等${run.domains.length}个主域名`
-    : run.domains[0] || '子域名'
-  link.href = url
-  link.download = `${filename}-查询结果.csv`
-  link.hidden = true
-  document.body.appendChild(link)
-  link.click()
-  link.remove()
-  window.setTimeout(() => URL.revokeObjectURL(url), 0)
+function QueryDuration({
+  startedAt,
+  finishedAt,
+  running,
+}: {
+  startedAt?: string | null
+  finishedAt?: string | null
+  running: boolean
+}) {
+  const [, setTick] = useState(0)
+  useEffect(() => {
+    if (!running) return
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [running])
+  return <>用时 {formatDuration(startedAt, finishedAt)}</>
 }
 
 export function SubdomainPage({
@@ -134,12 +117,10 @@ export function SubdomainPage({
   const [resultsVersion, setResultsVersion] = useState(0)
   const [loading, setLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
-  const [refreshKey, setRefreshKey] = useState(0)
   const [resultKeyword, setResultKeyword] = useState('')
   const deferredResultKeyword = useDeferredValue(resultKeyword)
   const [resultView, setResultView] = useState<'all' | 'web' | 'wildcard'>('all')
   const eventSourceRef = useRef<EventSource | null>(null)
-  const autoOpenedRef = useRef(false)
 
   const results = useMemo(() => [...resultsByIdRef.current.values()], [resultsVersion])
   const replaceResults = (items: SubdomainResult[]) => {
@@ -185,23 +166,30 @@ export function SubdomainPage({
     })
   }, [deferredResultKeyword, resultView, sortedResults])
   const paged = usePagedData(filteredResults, `${run?.id ?? ''}:${deferredResultKeyword}:${resultView}`)
-  const percent = run?.total
-    ? Math.min(100, Math.round((run.progress / run.total) * 100))
-    : run && terminalStatuses.has(run.status) ? 100 : 0
+  const percent = run && terminalStatuses.has(run.status)
+    ? 100
+    : run?.total
+      ? Math.min(99, Math.round((run.progress / run.total) * 100))
+      : 0
 
   const refreshRecent = async () => {
     const data = await listSubdomainRuns(1, 30)
-    setRecentRuns(data.items)
-    if (runId) {
-      const current = data.items.find((item) => item.id === runId)
-      if (current) setRun(current)
+    let items = data.items
+    if (runId && !items.some((item) => item.id === runId)) {
+      try {
+        const current = await getSubdomainRun(runId)
+        items = [current, ...items.filter((item) => item.id !== current.id)].slice(0, 30)
+      } catch {
+        // Keep the existing list if the opened run was deleted.
+      }
     }
-    return data.items
+    setRecentRuns(items)
+    return items
   }
 
   useEffect(() => {
     let cancelled = false
-    void listIcpDomainRuns()
+    void listIcpDomainRuns(100)
       .then((icp) => {
         if (!cancelled) setIcpRuns(icp.items)
       })
@@ -210,11 +198,6 @@ export function SubdomainPage({
       .then((recent) => {
         if (cancelled) return
         setRecentRuns(recent.items)
-        if (!runId && !autoOpenedRef.current && recent.items.length) {
-          autoOpenedRef.current = true
-          const active = recent.items.find((item) => !terminalStatuses.has(item.status))
-          onOpenRun((active ?? recent.items[0]).id)
-        }
       })
       .catch(() => message.error('无法加载子域名历史查询'))
     return () => {
@@ -299,7 +282,7 @@ export function SubdomainPage({
       eventSourceRef.current?.close()
       eventSourceRef.current = null
     }
-  }, [runId, refreshKey])
+  }, [runId])
 
   useEffect(() => () => {
     if (resultFlushRef.current !== null) window.clearTimeout(resultFlushRef.current)
@@ -326,7 +309,6 @@ export function SubdomainPage({
       replaceResults([])
       onOpenRun(created.id)
       await refreshRecent()
-      message.success(`已提交 ${created.domains.length} 个主域名`)
     } catch (error) {
       message.error(error instanceof Error ? error.message : '提交失败')
     } finally {
@@ -401,89 +383,82 @@ export function SubdomainPage({
 
   return (
     <div className="page page-split subdomain-page">
-      <Card className="page-head subdomain-query-card" size="small" styles={{ body: { padding: 12 } }}>
-        <Flex vertical gap={10} className="subdomain-query-stack">
-          <Flex gap={10} align="flex-start" className="subdomain-source-row">
+      <Card className="page-head subdomain-query-card" size="small">
+        <Flex gap={16} wrap={false} align="flex-start" className="query-fields subdomain-query-fields">
+          <div className="subdomain-mode-field">
             <Segmented
-              className="subdomain-mode-switch"
               value={mode}
               onChange={(value) => setMode(value as 'manual' | 'icp')}
-              options={[{ label: '输入域名', value: 'manual' }, { label: '选择 ICP 结果', value: 'icp' }]}
+              options={[{ label: '输入域名', value: 'manual' }, { label: 'ICP 结果', value: 'icp' }]}
             />
-            {mode === 'manual' ? (
-              <Input.TextArea
-                className="subdomain-domain-input"
-                value={manualValue}
-                autoSize={{ minRows: 1, maxRows: 3 }}
-                placeholder="输入一个或多个域名，支持换行、空格或逗号分隔"
-                onChange={(event) => setManualValue(event.target.value)}
+          </div>
+          {mode === 'manual' ? (
+            <Input
+              className="subdomain-domain-input"
+              value={manualValue}
+              allowClear
+              placeholder="输入域名，多个用空格、逗号或换行分隔"
+              onChange={(event) => setManualValue(event.target.value)}
+              onPressEnter={() => void submit()}
+            />
+          ) : (
+            <Flex className="subdomain-icp-inputs" gap={8} wrap="nowrap">
+              <Select
+                className="subdomain-icp-run-select"
+                mode="multiple"
+                maxTagCount="responsive"
+                value={selectedIcpRunIds}
+                placeholder="选择 ICP 查询记录"
+                options={icpRuns.map((item) => ({
+                  value: item.id,
+                  label: `${item.keyword} · ${item.domains.length} 个域名 · ${formatDate(item.created_at)}`,
+                }))}
+                onChange={setSelectedIcpRunIds}
               />
-            ) : (
-              <Flex className="subdomain-icp-inputs" gap={8} wrap="wrap">
-                <Select
-                  className="subdomain-icp-run-select"
-                  mode="multiple"
-                  maxTagCount="responsive"
-                  value={selectedIcpRunIds}
-                  placeholder="选择 ICP 查询记录"
-                  options={icpRuns.map((item) => ({
-                    value: item.id,
-                    label: `${item.keyword} · ${item.domains.length} 个域名 · ${formatDate(item.created_at)}`,
-                  }))}
-                  onChange={setSelectedIcpRunIds}
-                />
-                <Select
-                  className="subdomain-icp-domain-select"
-                  mode="multiple"
-                  maxTagCount="responsive"
-                  value={selectedIcpDomains}
-                  placeholder="选择要查询的备案域名"
-                  options={availableIcpDomains.map((domain) => ({ value: domain, label: domain }))}
-                  onChange={setSelectedIcpDomains}
-                />
-              </Flex>
-            )}
-          </Flex>
-          <Flex justify="space-between" align="center" gap={12} wrap="wrap" className="subdomain-option-row">
-            <Checkbox.Group
-              className="subdomain-options"
-              value={Object.entries(options).filter(([, enabled]) => enabled).map(([key]) => key)}
-              options={[
-                { label: '被动数据源', value: 'passive' },
-                { label: 'DNS 字典', value: 'brute_force' },
-                { label: '智能变体', value: 'deep_scan', disabled: !options.brute_force },
-                { label: 'HTTP 探测', value: 'http_probe' },
-              ]}
-              onChange={(values) => setOptions({
-                passive: values.includes('passive'),
-                brute_force: values.includes('brute_force'),
-                deep_scan: values.includes('brute_force') && values.includes('deep_scan'),
-                http_probe: values.includes('http_probe'),
-              })}
-            />
-            <Space size={12}>
-              <Typography.Text type="secondary">
-                {mode === 'manual' ? parseDomains(manualValue).length : selectedIcpDomains.length} 个主域名
-              </Typography.Text>
-              <Button type="primary" icon={<PlayCircleOutlined />} loading={submitting} onClick={() => void submit()}>
-                开始查询
-              </Button>
-            </Space>
-          </Flex>
+              <Select
+                className="subdomain-icp-domain-select"
+                mode="multiple"
+                maxTagCount="responsive"
+                value={selectedIcpDomains}
+                placeholder="选择备案域名"
+                options={availableIcpDomains.map((domain) => ({ value: domain, label: domain }))}
+                onChange={setSelectedIcpDomains}
+              />
+            </Flex>
+          )}
+          <Checkbox.Group
+            className="subdomain-options"
+            value={Object.entries(options).filter(([, enabled]) => enabled).map(([key]) => key)}
+            options={[
+              { label: '被动源', value: 'passive' },
+              { label: '字典', value: 'brute_force' },
+              { label: '变体', value: 'deep_scan', disabled: !options.brute_force },
+              { label: 'HTTP', value: 'http_probe' },
+            ]}
+            onChange={(values) => setOptions({
+              passive: values.includes('passive'),
+              brute_force: values.includes('brute_force'),
+              deep_scan: values.includes('brute_force') && values.includes('deep_scan'),
+              http_probe: values.includes('http_probe'),
+            })}
+          />
+          <Button type="primary" icon={<PlayCircleOutlined />} loading={submitting} onClick={() => void submit()}>
+            查询
+          </Button>
         </Flex>
       </Card>
 
       <Card
         className="fill-card subdomain-results-card"
         styles={{ body: { paddingTop: 12 } }}
-        title={<Space><span>实时查询结果</span>{run ? <StatusTag status={run.status} /> : null}</Space>}
+        title={run ? <Space size={8}><span>{runTitle(run)}</span><StatusTag status={run.status} /></Space> : '子域名查询'}
         extra={(
           <Space className="subdomain-card-actions" wrap size={8}>
             <Select
               className="subdomain-history-select"
               allowClear
               showSearch={{ optionFilterProp: 'label' }}
-              placeholder={`查询记录（${recentRuns.length}）`}
+              placeholder="最近查询"
               value={run?.id}
               options={recentRuns.map((item) => ({
                 value: item.id,
@@ -508,23 +483,12 @@ export function SubdomainPage({
               }}
               onChange={(value) => onOpenRun(value)}
             />
-            {hasActiveRecent ? <Tag color="processing">进行中 {recentRuns.filter((item) => !terminalStatuses.has(item.status)).length}</Tag> : null}
-            <Button
-              icon={<ReloadOutlined />}
-              onClick={() => {
-                setRefreshKey((value) => value + 1)
-                void refreshRecent().catch(() => message.error('刷新查询记录失败'))
-              }}
-              disabled={!runId}
-            >
-              刷新
-            </Button>
             {!run || terminalStatuses.has(run.status) ? null : (
               <Button danger icon={<StopOutlined />} onClick={() => void stopCurrent()}>
                 停止
               </Button>
             )}
-            <Button icon={<DownloadOutlined />} disabled={!run || !results.length} onClick={() => run && exportResults(run, sortedResults)}>导出 CSV</Button>
+            <Button icon={<DownloadOutlined />} disabled={!run || !results.length} onClick={() => run && exportSubdomains(run, sortedResults)}>导出 Excel</Button>
             <Button danger icon={<DeleteOutlined />} disabled={!run} onClick={removeCurrent}>删除</Button>
           </Space>
         )}
@@ -535,36 +499,23 @@ export function SubdomainPage({
           <Flex vertical gap={12} className="fill-body">
             <Flex className="subdomain-summary" align="center" gap={20} wrap="wrap">
               <Statistic style={{ minWidth: 84 }} styles={{ header: { paddingBottom: 0 }, content: { fontSize: 20 } }} title="主域名" value={run.domains.length} />
-              <Statistic style={{ minWidth: 84 }} styles={{ header: { paddingBottom: 0 }, content: { fontSize: 20 } }} title="候选" value={run.total ?? 0} />
-              <Statistic style={{ minWidth: 84 }} styles={{ header: { paddingBottom: 0 }, content: { fontSize: 20 } }} title="已处理" value={run.progress} />
-              <Statistic style={{ minWidth: 84 }} styles={{ header: { paddingBottom: 0 }, content: { fontSize: 20 } }} title="有效子域名" value={run.discovered} />
+              <Statistic style={{ minWidth: 84 }} styles={{ header: { paddingBottom: 0 }, content: { fontSize: 20 } }} title="已发现" value={run.discovered} />
+              <Statistic style={{ minWidth: 84 }} styles={{ header: { paddingBottom: 0 }, content: { fontSize: 20 } }} title="网站可访问" value={resultCounts.web} />
               <div className="subdomain-progress-wrap">
                 <Flex justify="space-between" gap={12}>
-                  <Typography.Text>{phaseLabels[run.phase] ?? run.phase}</Typography.Text>
-                  <Typography.Text type="secondary">用时 {formatDuration(run.started_at, run.finished_at)}</Typography.Text>
+                  <Typography.Text>{terminalStatuses.has(run.status) ? '查询完成' : (phaseLabels[run.phase] ?? run.phase)}</Typography.Text>
+                  <Typography.Text type="secondary">
+                    <QueryDuration
+                      startedAt={run.started_at}
+                      finishedAt={run.finished_at}
+                      running={!terminalStatuses.has(run.status)}
+                    />
+                  </Typography.Text>
                 </Flex>
                 <Progress percent={percent} status={progressStatus(run.status)} />
               </div>
             </Flex>
             {run.error ? <Alert type="error" showIcon title={run.error} /> : null}
-            {run.warnings.length ? (
-              <Alert
-                className="subdomain-warning-alert"
-                type="warning"
-                showIcon
-                title={`部分数据源未完成（${run.warnings.length}）`}
-                description={(
-                  <Flex vertical gap={2}>
-                    {run.warnings.slice(0, 4).map((warning) => (
-                      <Typography.Text key={warning}>{readableWarning(warning)}</Typography.Text>
-                    ))}
-                    {run.warnings.length > 4 ? (
-                      <Typography.Text type="secondary">另有 {run.warnings.length - 4} 条，可在刷新后重试未命中的来源</Typography.Text>
-                    ) : null}
-                  </Flex>
-                )}
-              />
-            ) : null}
             <Flex className="subdomain-result-toolbar" align="center" justify="space-between" gap={10} wrap="wrap">
               <Input.Search
                 className="subdomain-result-search"
@@ -581,7 +532,7 @@ export function SubdomainPage({
                   onChange={(value) => setResultView(value as 'all' | 'web' | 'wildcard')}
                   options={[
                     { label: `全部 ${resultCounts.all}`, value: 'all' },
-                    { label: `有响应 ${resultCounts.web}`, value: 'web' },
+                    { label: `网站可访问 ${resultCounts.web}`, value: 'web' },
                     { label: `泛解析 ${resultCounts.wildcard}`, value: 'wildcard' },
                   ]}
                 />

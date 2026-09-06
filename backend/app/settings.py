@@ -18,6 +18,9 @@ class Settings(BaseSettings):
         "cn-hangzhou,cn-shanghai,cn-beijing,cn-shenzhen,"
         "cn-qingdao,cn-zhangjiakou,cn-huhehaote"
     )
+    icp_auto_scale_tencent_regions: str = (
+        "ap-guangzhou,ap-shanghai,ap-beijing,ap-chengdu,ap-nanjing"
+    )
     # Chengdu has repeatedly failed WebSocket warm-up; keep it excluded even
     # if an old deployment injects it into the candidate-region list.
     icp_auto_scale_excluded_regions: str = "cn-chengdu"

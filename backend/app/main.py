@@ -22,8 +22,11 @@ from app.collector import RunSpec, collect_run
 from app.models import (
     CollectionRequest,
     IcpDomainRun,
+    HistoryListResponse,
+    HistoryItem,
     IcpDomainRunListResponse,
     IcpRow,
+    ProxyPoolRequest,
     ManualProxyRequest,
     ManualProxyTestResponse,
     ManualProxyView,
@@ -63,6 +66,7 @@ from app.serverless_proxy import (
     pool_nodes,
     remove_pool_node,
     run_cloud_operation,
+    managed_cloud_target,
     serverless_proxy_view,
     upsert_pool_node,
     test_serverless_proxy,
@@ -76,6 +80,15 @@ logger = logging.getLogger(__name__)
 
 class DeleteRunsRequest(BaseModel):
     ids: list[UUID] = Field(min_length=1)
+
+
+class HistoryDeleteItem(BaseModel):
+    id: UUID
+    kind: str
+
+
+class DeleteHistoryRequest(BaseModel):
+    items: list[HistoryDeleteItem] = Field(min_length=1)
 
 
 
@@ -145,10 +158,14 @@ def settings_view(config: dict) -> SettingsResponse:
                 updated_at=row.get("updated_at"),
             )
         )
+    pool = str(config.get("proxy_pool") or "cloud").strip().lower()
+    if pool not in {"cloud", "manual", "direct"}:
+        pool = "cloud"
     return SettingsResponse(
         sessions=sessions,
         serverless_proxy=serverless_proxy_view(config),
         manual_proxies=[_manual_proxy_view(row) for row in config.get("manual_proxies") or []],
+        proxy_pool=pool,  # type: ignore[arg-type]
     )
 
 
@@ -225,9 +242,14 @@ def relationship_item(row: asyncpg.Record) -> RelationshipItem:
 
 
 def subdomain_run_summary(row: asyncpg.Record) -> SubdomainRunSummary:
+    title = str(row["title"] if "title" in row.keys() else "").strip()
+    domains = list(row["domains"] or [])
+    if not title:
+        title = domains[0] if domains else "子域名查询"
     return SubdomainRunSummary(
         id=row["id"],
-        domains=list(row["domains"] or []),
+        title=title,
+        domains=domains,
         source_run_ids=list(row["source_run_ids"] or []),
         options=dict(row["options"] or {}),
         status=row["status"],
@@ -434,6 +456,46 @@ async def get_query(run_id: UUID) -> QueryResponse:
     return await query_view(run_id)
 
 
+@app.get("/api/v1/history", response_model=HistoryListResponse)
+async def list_history(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    keyword: str = Query("", max_length=200),
+    status: str = Query("", max_length=32),
+    kind: str = Query("", max_length=32),
+) -> HistoryListResponse:
+    if kind and kind not in {"collection", "subdomain"}:
+        raise HTTPException(400, "kind 仅支持 collection 或 subdomain")
+    rows, total = await current_repo().list_history(limit, offset, keyword, status, kind)
+    return HistoryListResponse(
+        items=[
+            HistoryItem(
+                id=row["id"],
+                kind=row["kind"],
+                title=row["title"],
+                status=row["status"],
+                created_at=row["created_at"],
+                started_at=row["started_at"],
+                finished_at=row["finished_at"],
+                summary=dict(row["summary"] or {}),
+            )
+            for row in rows
+        ],
+        total=total,
+    )
+
+
+@app.post("/api/v1/history/batch-delete")
+async def delete_history(request: DeleteHistoryRequest) -> dict[str, int]:
+    items: list[tuple[str, UUID]] = []
+    for item in request.items:
+        if item.kind not in {"collection", "subdomain"}:
+            raise HTTPException(400, "kind 仅支持 collection 或 subdomain")
+        items.append((item.kind, item.id))
+    deleted = await current_repo().delete_history(items)
+    return {"deleted": deleted}
+
+
 @app.get("/api/v1/collection-runs", response_model=RunListResponse)
 async def list_runs(
     limit: int = Query(50, ge=1, le=200),
@@ -604,8 +666,27 @@ async def create_subdomain_run(request: SubdomainRunRequest) -> SubdomainRunSumm
         raise HTTPException(400, str(exc)) from exc
     if len(domains) > 200:
         raise HTTPException(400, "单次最多查询 200 个主域名")
+    title = ""
+    if request.source_run_ids:
+        source_runs = [
+            await store.get_run(run_id)
+            for run_id in request.source_run_ids
+        ]
+        keywords = []
+        for source in source_runs:
+            if source is None:
+                continue
+            keyword = str(source["keyword"] or "").strip()
+            if keyword and keyword not in keywords:
+                keywords.append(keyword)
+        if len(keywords) == 1:
+            title = f"{keywords[0]} {len(domains)} 个主域名"
+        elif keywords:
+            title = f"{keywords[0]} 等 {len(keywords)} 家企业 {len(domains)} 个主域名"
+    if not title:
+        title = domains[0] if len(domains) == 1 else f"{domains[0]} 等 {len(domains)} 个主域名"
     row = await store.create_subdomain_run(
-        domains, request.source_run_ids, request.options.model_dump()
+        domains, request.source_run_ids, request.options.model_dump(), title=title
     )
     return subdomain_run_summary(row)
 
@@ -708,7 +789,7 @@ async def delete_subdomain_run(run_id: UUID) -> dict[str, int]:
 
 
 @app.get("/api/v1/icp-domain-runs", response_model=IcpDomainRunListResponse)
-async def list_icp_domain_runs(limit: int = Query(50, ge=1, le=100)) -> IcpDomainRunListResponse:
+async def list_icp_domain_runs(limit: int = Query(100, ge=1, le=200)) -> IcpDomainRunListResponse:
     items: list[IcpDomainRun] = []
     for row in await current_repo().icp_domain_runs(limit):
         domains: list[str] = []
@@ -827,10 +908,29 @@ async def _serverless_proxy_payload(
     request: ServerlessProxyRequest,
 ) -> dict:
     payload = request.model_dump()
+    provider, region, function_name = managed_cloud_target(
+        payload.get("provider"), payload.get("region"), payload.get("function_name")
+    )
+    payload["provider"] = provider
+    payload["region"] = region
+    payload["function_name"] = function_name
     current = (await store.get_runtime_config()).get("serverless_proxy") or {}
     if current.get("provider") != payload["provider"] and payload.get("access_key_secret") is None:
         payload["access_key_secret"] = ""
     return payload
+
+
+@app.put("/api/v1/settings/proxy-pool", response_model=SettingsResponse)
+async def save_proxy_pool(request: ProxyPoolRequest) -> SettingsResponse:
+    store = current_repo()
+    await store.set_proxy_pool(request.proxy_pool)
+    config = await store.get_runtime_config()
+    try:
+        await configure_gateway_for_active_route(config)
+    except ServerlessProxyError as exc:
+        await store.set_serverless_proxy_status("error", str(exc))
+        raise HTTPException(502, str(exc)) from exc
+    return settings_view(await store.get_runtime_config())
 
 
 @app.put("/api/v1/settings/serverless-proxy", response_model=SettingsResponse)

@@ -84,6 +84,22 @@ class RunListResponse(BaseModel):
     total: int
 
 
+class HistoryItem(BaseModel):
+    id: UUID
+    kind: Literal["collection", "subdomain"]
+    title: str
+    status: str
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    summary: dict = Field(default_factory=dict)
+
+
+class HistoryListResponse(BaseModel):
+    items: list[HistoryItem]
+    total: int
+
+
 class RunDetail(RunSummary):
     request: CollectionRequest
 
@@ -194,6 +210,7 @@ class SubdomainRunRequest(BaseModel):
 
 class SubdomainRunSummary(BaseModel):
     id: UUID
+    title: str = ""
     domains: list[str]
     source_run_ids: list[UUID]
     options: SubdomainOptions
@@ -321,6 +338,13 @@ class SettingsResponse(BaseModel):
     sessions: list[ProviderSessionView]
     serverless_proxy: ServerlessProxyView
     manual_proxies: list[ManualProxyView] = Field(default_factory=list)
+    proxy_pool: Literal["cloud", "manual", "direct"] = "cloud"
+
+
+class ProxyPoolRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    proxy_pool: Literal["cloud", "manual", "direct"] = "cloud"
 
 
 class ManualProxyRequest(BaseModel):

@@ -29,3 +29,6 @@ htmlcov/
 # Python bytecode (all packages and scripts)
 __pycache__/
 *.py[cod]
+
+# Local frontend build used by Dockerfile.local
+.frontend-dist-local/
