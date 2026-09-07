@@ -10,6 +10,11 @@ import pytest
 import app.subdomains as subdomains
 from app.subdomains import HttpProbe, ResolvedHost
 
+@pytest.fixture(autouse=True)
+def fresh_source_throttle(monkeypatch):
+    monkeypatch.setattr(subdomains, "SOURCE_THROTTLE", subdomains._SourceThrottle())
+
+
 
 def test_normalize_domains_accepts_urls_idn_and_deduplicates():
     assert subdomains.normalize_domains([
@@ -266,7 +271,6 @@ async def test_http_probe_does_not_follow_redirect_to_private_address():
 def test_subdomain_options_require_a_discovery_method():
     from pydantic import ValidationError
     from app.models import SubdomainOptions
-
     with pytest.raises(ValidationError, match="至少启用一项"):
         SubdomainOptions(passive=False, brute_force=False, http_probe=True)
 
@@ -711,3 +715,30 @@ async def test_web_metadata_ssl_error_is_not_fatal(monkeypatch):
     monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         assert await subdomains.collect_web_metadata(client, "example.com") == set()
+
+
+@pytest.mark.asyncio
+async def test_same_source_is_serialized_across_roots(monkeypatch):
+    active = 0
+    maximum = 0
+    throttle = subdomains._SourceThrottle()
+    monkeypatch.setattr(subdomains, "SOURCE_THROTTLE", throttle)
+    monkeypatch.setattr(subdomains, "SOURCE_MIN_INTERVALS", {"CertSpotter": 0.0})
+
+    async def collect(_client, _domain):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await __import__("asyncio").sleep(0.05)
+        active -= 1
+        return {"api.example.com"}
+
+    async with httpx.AsyncClient() as client:
+        first, second = await __import__("asyncio").gather(
+            subdomains._call_source(FakeRepo(), "CertSpotter", collect, client, "a.example"),
+            subdomains._call_source(FakeRepo(), "CertSpotter", collect, client, "b.example"),
+        )
+
+    assert maximum == 1
+    assert first[1] == {"api.example.com"}
+    assert second[1] == {"api.example.com"}

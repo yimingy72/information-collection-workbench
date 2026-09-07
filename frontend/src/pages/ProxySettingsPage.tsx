@@ -224,7 +224,7 @@ export function ProxySettingsPage({ embedded = false }: { embedded?: boolean }) 
       >
         <Form
           form={form}
-          layout="inline"
+          layout="horizontal"
           size="small"
           className="manual-proxy-form"
           onFinish={(values) => void addProxy(values)}
@@ -235,10 +235,10 @@ export function ProxySettingsPage({ embedded = false }: { embedded?: boolean }) 
             rules={[{ required: true, message: '请输入代理地址' }]}
             className="manual-proxy-input"
           >
-            <Input placeholder="http://用户名:密码@主机:端口" allowClear />
-          </Form.Item>
-          <Form.Item>
-            <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={saving}>添加代理</Button>
+            <Space.Compact className="manual-proxy-compact">
+              <Input placeholder="http://用户名:密码@主机:端口" allowClear />
+              <Button type="primary" htmlType="submit" icon={<PlusOutlined />} loading={saving}>添加代理</Button>
+            </Space.Compact>
           </Form.Item>
         </Form>
         {error && <Alert type="error" showIcon title={error} className="proxy-settings-error" />}

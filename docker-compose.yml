@@ -19,6 +19,8 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
+      DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-2}
+      DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-20}
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
       MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
       ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
@@ -55,6 +57,8 @@ services:
     command: ["python", "-m", "app.worker"]
     environment:
       DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
+      DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-2}
+      DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-20}
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
       MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
       ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}

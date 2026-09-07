@@ -17,14 +17,15 @@ from app.serverless_proxy import ensure_icp_node_pool, prewarm_cloud_nodes, rele
 
 
 ICP_HEARTBEAT_SECONDS = 5
-ICP_STREAM_POLL_SECONDS = 0.25
+ICP_STREAM_POLL_SECONDS = 0.4
 # Feed ICP as soon as a handful of names exist. The collector now owns a
 # rolling queue instead of waiting for 200 names to finish before the next
 # wave can start.
-ICP_STREAM_MIN_START = 8
+ICP_STREAM_MIN_START = 1
 # Traverse investment companies concurrently. The previous BFS visited one
 # company at a time, so a 1500-node tree paid full RTT for every node.
-INVEST_CONCURRENCY = 16
+INVEST_CONCURRENCY = 20
+INVEST_HEARTBEAT_EVERY = 8
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,8 @@ async def _collect_icp_as_entities_are_discovered(
     warmed = False
     incoming: asyncio.Queue[str | None] = asyncio.Queue()
     collector_task: asyncio.Task[list[str]] | None = None
+    name_rel_cursor = 0
+    name_res_cursor = 0
 
     def _record_scale_errors(prefix: str, values) -> None:
         for scale_error in map(str, values or []):
@@ -160,20 +163,32 @@ async def _collect_icp_as_entities_are_discovered(
 
     try:
         while True:
-            discovered = _prioritize_root_name(
-                await repo.entity_names_for_run(spec.id), spec.keyword
-            )
-            pending = [name for name in discovered if name not in seen]
+            since = getattr(repo, "entity_names_since", None)
+            if since is not None:
+                new_names, name_rel_cursor, name_res_cursor = await since(
+                    spec.id, name_rel_cursor, name_res_cursor
+                )
+                pending = [
+                    name for name in _prioritize_root_name(new_names, spec.keyword)
+                    if name and name not in seen
+                ]
+                discovered_count = len(seen) + len(pending)
+            else:
+                discovered = _prioritize_root_name(
+                    await repo.entity_names_for_run(spec.id), spec.keyword
+                )
+                pending = [name for name in discovered if name not in seen]
+                discovered_count = len(discovered)
             ready_to_start = bool(pending) and (
-                producers_done.is_set() or len(discovered) >= max(1, ICP_STREAM_MIN_START)
+                producers_done.is_set() or discovered_count >= max(1, ICP_STREAM_MIN_START)
             )
             if ready_to_start:
-                await start_collector(len(discovered))
+                await start_collector(discovered_count)
                 await feed(pending)
             if producers_done.is_set():
                 remaining = [name for name in pending if name not in seen]
                 if collector_task is None and remaining:
-                    await start_collector(len(discovered))
+                    await start_collector(discovered_count)
                 if remaining:
                     await feed(remaining)
                 if collector_task is not None:
@@ -189,7 +204,7 @@ async def _collect_icp_as_entities_are_discovered(
                     pool_released = True
                     if getattr(repo, "get_runtime_config", None) is not None:
                         try:
-                            release_result = await release_icp_node_pool(repo, len(discovered))
+                            release_result = await release_icp_node_pool(repo, max(len(seen), discovered_count))
                             _record_scale_errors(
                                 "ICP备案节点自动缩容：",
                                 release_result.get("errors") if isinstance(release_result, dict) else [],
@@ -227,7 +242,12 @@ async def _collect_icp_as_entities_are_discovered(
             await asyncio.gather(collector_task, return_exceptions=True)
 
 
-async def collect_run(repo: Repository, providers: list, spec: RunSpec) -> list[str]:
+async def collect_run(
+    repo: Repository,
+    providers: list,
+    spec: RunSpec,
+    provider_lock: asyncio.Lock | None = None,
+) -> list[str]:
     errors: list[str] = []
 
     async def run_provider(provider) -> list[str]:
@@ -243,19 +263,33 @@ async def collect_run(repo: Repository, providers: list, spec: RunSpec) -> list[
     # waiting for all investment levels to finish first.
     producers_done = asyncio.Event()
     entity_changed = asyncio.Event()
-    icp_task = asyncio.create_task(
-        _collect_icp_as_entities_are_discovered(
-            repo, spec, producers_done, entity_changed
+    icp_task: asyncio.Task[list[str]] | None = None
+
+    async def run_providers() -> list[list[str]]:
+        nonlocal icp_task
+        # Start ICP only after this run owns the provider lock. Otherwise a
+        # second worker can take the ICP collection lock while waiting for
+        # providers, and deadlock with the first worker.
+        icp_task = asyncio.create_task(
+            _collect_icp_as_entities_are_discovered(
+                repo, spec, producers_done, entity_changed
+            )
         )
-    )
-    try:
-        provider_results = await asyncio.gather(
+        return await asyncio.gather(
             *(run_provider(provider) for provider in providers)
         )
+
+    try:
+        if provider_lock is not None:
+            async with provider_lock:
+                provider_results = await run_providers()
+        else:
+            provider_results = await run_providers()
     except BaseException:
         producers_done.set()
-        icp_task.cancel()
-        await asyncio.gather(icp_task, return_exceptions=True)
+        if icp_task is not None:
+            icp_task.cancel()
+            await asyncio.gather(icp_task, return_exceptions=True)
         raise
     finally:
         producers_done.set()
@@ -264,7 +298,8 @@ async def collect_run(repo: Repository, providers: list, spec: RunSpec) -> list[
         errors.extend(item)
 
     try:
-        errors.extend(await icp_task)
+        if icp_task is not None:
+            errors.extend(await icp_task)
     except LeaseLost:
         raise
     except Exception as exc:  # noqa: BLE001 - ICP is best effort
@@ -304,11 +339,12 @@ async def _collect_one(
     processed = 0
     errors: list[str] = []
     state_lock = asyncio.Lock()
-    workers = max(1, min(INVEST_CONCURRENCY, 16))
+    workers = max(1, min(INVEST_CONCURRENCY, 24))
 
     async def visit(company: Company, entity_id: UUID, level: int) -> None:
         nonlocal processed
         visit_key = f"{provider_id}:{company.external_id}"
+        should_beat = False
         async with state_lock:
             queued.discard(visit_key)
             if visit_key in completed:
@@ -317,7 +353,9 @@ async def _collect_one(
                 counted.add(visit_key)
                 processed += 1
             current_processed = processed
-        await repo.heartbeat(spec.id, current_processed, lease_id=spec.lease_id)
+            should_beat = current_processed == 1 or current_processed % INVEST_HEARTBEAT_EVERY == 0
+        if should_beat:
+            await repo.heartbeat(spec.id, current_processed, lease_id=spec.lease_id)
 
         if "invest" not in spec.fields or level >= spec.depth:
             async with state_lock:
@@ -351,26 +389,57 @@ async def _collect_one(
         async with state_lock:
             completed.add(visit_key)
 
-        for investment in investments:
-            if investment.holding_percent is None or investment.holding_percent < spec.holding_percent:
-                continue
+        kept = [
+            investment for investment in investments
+            if investment.holding_percent is not None and investment.holding_percent >= spec.holding_percent
+        ]
+        if not kept:
+            return
+        upsert_entities = getattr(repo, "upsert_entities", None)
+        if upsert_entities is not None:
+            child_ids = await upsert_entities([
+                (provider_id, investment.external_id, investment.name, investment.payload)
+                for investment in kept
+            ])
+        else:
+            child_ids = [
+                await repo.upsert_entity(provider_id, investment.external_id, investment.name, investment.payload)
+                for investment in kept
+            ]
+        result_rows = []
+        relationship_rows = []
+        queued_children: list[tuple[Company, UUID]] = []
+        for investment, child_id in zip(kept, child_ids, strict=True):
             child = Company(investment.external_id, investment.name, investment.payload)
-            child_id = await repo.upsert_entity(provider_id, child.external_id, child.name, child.payload)
             ref = f"{child.name} {level + 1}级投资 {investment.holding_percent:.2f}% - {company.name}"
-            await repo.add_result(
+            result_rows.append((
                 spec.id, child_id, "invest",
                 {"name": investment.name, "holding_percent": investment.holding_percent, "source": source},
                 _url(provider, INVEST_URL),
                 investment.payload,
-            )
-            await repo.add_relationship(
+            ))
+            relationship_rows.append((
                 spec.id, entity_id, child_id, "invest", investment.holding_percent, level + 1,
                 ref, _url(provider, INVEST_URL), {**investment.payload, "source": source},
-            )
-            if entity_changed is not None:
-                entity_changed.set()
-            child_key = f"{provider_id}:{child.external_id}"
-            async with state_lock:
+            ))
+            queued_children.append((child, child_id))
+        add_results = getattr(repo, "add_results", None)
+        if add_results is not None:
+            await add_results(result_rows)
+        else:
+            for row in result_rows:
+                await repo.add_result(*row)
+        add_relationships = getattr(repo, "add_relationships", None)
+        if add_relationships is not None:
+            await add_relationships(relationship_rows)
+        else:
+            for row in relationship_rows:
+                await repo.add_relationship(*row)
+        if entity_changed is not None and queued_children:
+            entity_changed.set()
+        async with state_lock:
+            for child, child_id in queued_children:
+                child_key = f"{provider_id}:{child.external_id}"
                 if child_key not in completed and child_key not in queued:
                     queued.add(child_key)
                     await queue.put((child, child_id, level + 1))

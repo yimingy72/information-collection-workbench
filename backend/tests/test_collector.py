@@ -106,3 +106,50 @@ async def test_icp_consumer_feeds_later_names_into_one_collector(monkeypatch):
     assert errors == []
     assert len(seen_queues) == 1
     assert fed == names
+
+
+@pytest.mark.asyncio
+async def test_icp_consumer_uses_incremental_name_cursor(monkeypatch):
+    run_id = uuid4()
+    calls = []
+    fed = []
+
+    class Repo:
+        async def entity_names_since(self, _run_id, rel_cursor, res_cursor):
+            calls.append((rel_cursor, res_cursor))
+            await __import__("asyncio").sleep(0)
+            if rel_cursor == 0 and res_cursor == 0:
+                return ["根企业", "子企业1"], 3, 1
+            return ["子企业2"], 5, 2
+
+        async def entity_names_for_run(self, _run_id):
+            raise AssertionError("incremental discovery should not rescan all names")
+
+        async def touch_run(self, *_args, **_kwargs):
+            return None
+
+    producers_done = __import__("asyncio").Event()
+    entity_changed = __import__("asyncio").Event()
+
+    async def fake_collect(_repo, _run_id, queue):
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            fed.append(item)
+            if item == "子企业1":
+                producers_done.set()
+        return []
+
+    monkeypatch.setattr(collector, "collect_icp_from_queue", fake_collect)
+    monkeypatch.setattr(collector, "ICP_STREAM_MIN_START", 1)
+    errors = await collector._collect_icp_as_entities_are_discovered(
+        Repo(),
+        collector.RunSpec(id=run_id, keyword="根企业", depth=3, holding_percent=51, fields=["invest"]),
+        producers_done,
+        entity_changed,
+    )
+    assert errors == []
+    assert "根企业" in fed
+    assert "子企业1" in fed
+    assert calls[0] == (0, 0)

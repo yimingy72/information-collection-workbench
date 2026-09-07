@@ -149,5 +149,52 @@ async def test_all_pages_uses_reported_total_when_page_is_capped():
     provider.client = httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(handler))
     rows = await provider.all_pages(lambda page: provider.investments("1", page))
     assert len(rows) == 52
-    assert seen == [1, 2, 3]
+    assert seen[0] == 1
+    assert set(seen) == {1, 2, 3}
+    await provider.close()
+
+
+
+@pytest.mark.asyncio
+async def test_all_pages_fetches_known_pages_concurrently():
+    started = {2: __import__("asyncio").Event(), 3: __import__("asyncio").Event()}
+    overlap = False
+    calls = []
+
+    async def fetch(page: int):
+        nonlocal overlap
+        calls.append(page)
+        if page == 1:
+            return [object()] * 20, 52
+        started[page].set()
+        other = 3 if page == 2 else 2
+        await __import__("asyncio").wait_for(started[other].wait(), timeout=1)
+        overlap = True
+        count = 20 if page == 2 else 12
+        return [object()] * count, 52
+
+    provider = AnonymousTianyancha("https://example.test")
+    rows = await provider.all_pages(fetch)
+    assert len(rows) == 52
+    assert overlap
+    assert set(calls) == {1, 2, 3}
+    await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_all_pages_retries_only_the_failed_page():
+    calls = []
+
+    async def fetch(page: int):
+        calls.append(page)
+        if page == 1:
+            return [object()] * 20, 40
+        if page == 2 and calls.count(2) == 1:
+            raise tianyancha.ProviderError("page 2 failed")
+        return [object()] * 20, 40
+
+    provider = AnonymousTianyancha("https://example.test")
+    rows = await provider.all_pages(fetch)
+    assert len(rows) == 40
+    assert calls == [1, 2, 2]
     await provider.close()

@@ -304,7 +304,7 @@ def frontend_dir() -> Path:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global pool, repo
-    pool = await create_pool(settings.database_url, min_size=1, max_size=10)
+    pool = await create_pool(settings.database_url, min_size=settings.database_pool_min_size, max_size=settings.database_pool_max_size)
     repo = Repository(pool, Path(__file__).parent.parent / "migrations")
     await repo.migrate()
     try:
@@ -405,12 +405,16 @@ async def query_view(run_id: UUID, extra_errors: list[str] | None = None) -> Que
     # point may appear in both the snapshot and the event stream, which the
     # frontend safely deduplicates. Capturing them afterwards could skip a row
     # committed between the snapshot queries and the cursor query.
-    relationship_cursor, result_cursor = await current_repo().collection_event_cursors(run_id)
-    # Historical/query detail pages must not silently truncate investments at
-    # 1000 rows. The results endpoint remains paginated, while this view is the
+    store = current_repo()
+    relationship_cursor, result_cursor = await store.collection_event_cursors(run_id)
+    # Historical/query detail pages must not silently truncate investments or
+    # ICP rows. The results endpoint remains paginated; this view is the
     # complete payload used by the detail screen and export action.
-    _, rels, _, _ = await current_repo().results(run_id, None, 0, 0, None, 0)
-    icp_rows, _, _, _ = await current_repo().results(run_id, "icp", 10000, 0, 0, 0)
+    if getattr(store, "all_collection_rows", None) is not None:
+        rels, icp_rows = await store.all_collection_rows(run_id)
+    else:
+        _, rels, _, _ = await store.results(run_id, None, 0, 0, None, 0)
+        icp_rows, _, _, _ = await store.results(run_id, "icp", 0, 0, 0, 0)
     investments = _merge_investments([
         InvestmentRow(
             parent_name=item["parent_name"], child_name=item["child_name"],

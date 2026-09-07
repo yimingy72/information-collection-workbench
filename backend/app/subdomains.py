@@ -214,8 +214,9 @@ async def collect_certspotter(client: httpx.AsyncClient, domain: str) -> set[str
         params = None
         if not next_url:
             break
-        if page < 2:
-            await asyncio.sleep(0.35)
+        delay = SOURCE_MIN_INTERVALS.get("CertSpotter", 0.35)
+        if page < 2 and delay:
+            await asyncio.sleep(min(0.35, delay))
     return found
 
 
@@ -551,43 +552,85 @@ PASSIVE_SOURCES = (
 )
 
 SOURCE_MIN_INTERVALS = {
-    "crt.sh": 0.5,
-    "CertSpotter": 2.0,
-    "HackerTarget": 1.0,
-    "urlscan.io": 1.0,
-    "RapidDNS": 0.5,
-    "Anubis": 0.8,
-    "AlienVault": 1.0,
-    "Wayback": 1.0,
-    "ThreatMiner": 1.0,
+    "crt.sh": 0.8,
+    "CertSpotter": 3.0,
+    "HackerTarget": 1.5,
+    "urlscan.io": 1.2,
+    "RapidDNS": 0.8,
+    "Anubis": 1.0,
+    "AlienVault": 1.2,
+    "Wayback": 1.2,
+    "ThreatMiner": 1.2,
     "DNS记录": 0.15,
     "SRV记录": 0.15,
     "站点元数据": 0.5,
-    "Common Crawl": 1.0,
+    "Common Crawl": 1.2,
 }
 
 
 class _SourceThrottle:
+    """Serialize one public source across every root domain in the process.
+
+    Five ICP-derived roots used to fire CertSpotter at the same instant and
+    immediately 429. A per-source lock plus a shared cooldown keeps the
+    public APIs paced without blocking unrelated sources.
+    """
+
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._next_at: dict[str, float] = {}
         self._cooldown_until: dict[str, float] = {}
+        self._inflight: dict[str, asyncio.Lock] = {}
+
+    def _source_lock(self, name: str) -> asyncio.Lock:
+        lock = self._inflight.get(name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._inflight[name] = lock
+        return lock
+
+    async def acquire(self, name: str) -> str | None:
+        source_lock = self._source_lock(name)
+        await source_lock.acquire()
+        wait = 0.0
+        try:
+            async with self._lock:
+                now = time.monotonic()
+                cooldown_until = self._cooldown_until.get(name, 0.0)
+                if cooldown_until > now:
+                    remaining = cooldown_until - now
+                    if remaining > SOURCE_COOLDOWN_WAIT_SECONDS:
+                        return f"请求频率受限，已暂停约 {max(1, int(remaining))} 秒"
+                    wait = remaining
+                else:
+                    wait = max(0.0, self._next_at.get(name, 0.0) - now)
+                self._next_at[name] = (
+                    max(now, self._next_at.get(name, 0.0), cooldown_until)
+                    + SOURCE_MIN_INTERVALS.get(name, 0.25)
+                )
+        except BaseException:
+            source_lock.release()
+            raise
+        if wait:
+            try:
+                await asyncio.sleep(wait)
+            except BaseException:
+                source_lock.release()
+                raise
+        return None
+
+    async def release(self, name: str) -> None:
+        lock = self._inflight.get(name)
+        if lock is not None and lock.locked():
+            try:
+                lock.release()
+            except RuntimeError:
+                return
 
     async def reserve(self, name: str) -> str | None:
-        async with self._lock:
-            now = time.monotonic()
-            cooldown_until = self._cooldown_until.get(name, 0.0)
-            if cooldown_until > now:
-                remaining = cooldown_until - now
-                if remaining > SOURCE_COOLDOWN_WAIT_SECONDS:
-                    return f"请求频率受限，已暂停约 {max(1, int(remaining))} 秒"
-                wait = remaining
-            else:
-                wait = max(0.0, self._next_at.get(name, 0.0) - now)
-            self._next_at[name] = max(now, self._next_at.get(name, 0.0), cooldown_until) + SOURCE_MIN_INTERVALS.get(name, 0.25)
-        if wait:
-            await asyncio.sleep(wait)
-        return None
+        skipped = await self.acquire(name)
+        await self.release(name)
+        return skipped
 
     async def cool_down(self, name: str, seconds: float) -> None:
         async with self._lock:
@@ -735,8 +778,9 @@ async def _call_source(
         return name, set(cached), ""
     errors: list[str] = []
     for attempt in range(1, PASSIVE_ATTEMPTS + 1):
-        throttled = await SOURCE_THROTTLE.reserve(name)
+        throttled = await SOURCE_THROTTLE.acquire(name)
         if throttled:
+            await SOURCE_THROTTLE.release(name)
             return name, set(), throttled
         try:
             async with asyncio.timeout(PASSIVE_TIMEOUT):
@@ -775,7 +819,11 @@ async def _call_source(
                 await SOURCE_THROTTLE.cool_down(name, cooldown)
             if not retryable or attempt >= PASSIVE_ATTEMPTS:
                 break
-            await asyncio.sleep(min(3.0, float(attempt)))
+            # Retry immediately on a fresh connection / proxy. Source-level
+            # spacing is already enforced by acquire(); a second sleep here
+            # stacked 1s+2s onto every timeout and made large batches crawl.
+        finally:
+            await SOURCE_THROTTLE.release(name)
     return name, set(), f"{errors[-1]}（已重试 {len(errors)} 次）"
 
 

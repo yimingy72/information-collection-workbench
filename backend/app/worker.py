@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 async def wait_for_db() -> asyncpg.Pool:
     for attempt in range(30):
         try:
-            return await create_pool(settings.database_url, min_size=1, max_size=10)
+            return await create_pool(settings.database_url, min_size=settings.database_pool_min_size, max_size=settings.database_pool_max_size)
         except OSError:
             if attempt == 29:
                 raise
@@ -30,7 +30,7 @@ async def wait_for_db() -> asyncpg.Pool:
 
 
 async def _collect_run_with_heartbeat(
-    repo: Repository, spec: RunSpec, providers: list,
+    repo: Repository, spec: RunSpec, providers: list, provider_lock: asyncio.Lock | None = None,
 ) -> list[str]:
     """Keep a run lease alive across provider discovery and ICP collection.
 
@@ -46,7 +46,7 @@ async def _collect_run_with_heartbeat(
             await asyncio.sleep(interval)
             await repo.touch_run(spec.id, lease_id=spec.lease_id)
 
-    collect_task = asyncio.create_task(collect_run(repo, providers, spec))
+    collect_task = asyncio.create_task(collect_run(repo, providers, spec, provider_lock))
     heartbeat_task = asyncio.create_task(keepalive())
     try:
         done, _ = await asyncio.wait(
@@ -87,9 +87,8 @@ async def worker_loop(repo: Repository, provider_lock: asyncio.Lock) -> None:
             if not providers:
                 await repo.finish(spec.id, "failed", "；".join(login_errors) or "请先登录对应数据源", lease_id=spec.lease_id)
                 continue
-            async with provider_lock:
-                errors = list(login_errors)
-                errors.extend(await _collect_run_with_heartbeat(repo, spec, providers))
+            errors = list(login_errors)
+            errors.extend(await _collect_run_with_heartbeat(repo, spec, providers, provider_lock))
             status = "partial" if errors else "succeeded"
             await repo.finish(spec.id, status, "；".join(errors) if errors else None, lease_id=spec.lease_id)
         except asyncio.CancelledError:

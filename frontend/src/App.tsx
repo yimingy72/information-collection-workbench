@@ -45,27 +45,35 @@ const investmentKey = (row: InvestmentRow) =>
   [row.parent_name, row.child_name, row.depth, row.holding_percent ?? ''].join('\u0000')
 
 const mergeInvestments = (current: InvestmentRow[], incoming: InvestmentRow[]) => {
+  if (!incoming.length) return current
   const rows = new Map(current.map((item) => [investmentKey(item), item]))
+  let changed = false
   incoming.forEach((item) => {
     const key = investmentKey(item)
     const existing = rows.get(key)
-    rows.set(
-      key,
-      existing
-        ? { ...existing, source: sourceTags(`${existing.source}、${item.source}`).join('、') }
-        : item,
-    )
+    if (!existing) {
+      rows.set(key, item)
+      changed = true
+      return
+    }
+    const source = sourceTags(`${existing.source}、${item.source}`).join('、')
+    if (source !== existing.source) {
+      rows.set(key, { ...existing, source })
+      changed = true
+    }
   })
-  return [...rows.values()]
+  return changed ? [...rows.values()] : current
 }
 
 const icpKey = (row: IcpRow) =>
   [row.unit_name, row.main_licence, row.service_licence, row.domain].join('\u0000')
 
 const mergeIcpRecords = (current: IcpRow[], incoming: IcpRow[]) => {
+  if (!incoming.length) return current
   const rows = new Map(current.map((item) => [icpKey(item), item]))
+  const before = rows.size
   incoming.forEach((item) => rows.set(icpKey(item), item))
-  return [...rows.values()]
+  return rows.size === before ? current : [...rows.values()]
 }
 
 function Workbench({
@@ -211,7 +219,18 @@ function Workbench({
         void getQuery(id)
           .then((finalView) => {
             if (cancelled) return
-            setQuery(finalView)
+            setQuery((current) => {
+              if (!current || current.run.id !== id) return finalView
+              return {
+                ...finalView,
+                investments: current.investments.length >= finalView.investments.length
+                  ? current.investments
+                  : finalView.investments,
+                icp_records: current.icp_records.length >= finalView.icp_records.length
+                  ? current.icp_records
+                  : finalView.icp_records,
+              }
+            })
             if (finalView.source_errors.length && finalView.run.status !== 'cancelled') {
               message.warning('部分数据源未返回结果')
             }

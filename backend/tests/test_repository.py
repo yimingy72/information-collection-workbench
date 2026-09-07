@@ -16,10 +16,18 @@ class FakePool:
 
     async def fetchrow(self, query, *args):
         self.queries.append((query, args))
+        if "INSERT INTO entities" in query:
+            return {"id": uuid4(), "provider": args[0] if args else "", "external_id": args[1] if len(args) > 1 else ""}
         return {"id": uuid4()}
 
     async def fetch(self, query, *args):
         self.queries.append((query, args))
+        if "INSERT INTO entities" in query and len(args) >= 2:
+            providers, external_ids = args[0], args[1]
+            return [
+                {"provider": provider, "external_id": external_id, "id": uuid4()}
+                for provider, external_id in zip(providers, external_ids)
+            ]
         return []
 
     async def fetchval(self, query, *args):
@@ -68,6 +76,36 @@ async def test_entity_upsert_does_not_overwrite_name():
     await repo.upsert_entity("tianyancha-anonymous", "1", "old", {"id": "1"})
     query, _ = pool.queries[0]
     assert "DO UPDATE SET name = entities.name" in query
+
+
+@pytest.mark.asyncio
+async def test_upsert_entities_batches_unique_rows():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    await repo.upsert_entities([
+        ("tianyancha", "1", "A", {"id": "1"}),
+        ("tianyancha", "2", "B", {"id": "2"}),
+        ("tianyancha", "1", "A-dup", {"id": "1"}),
+    ])
+    query, args = pool.queries[0]
+    assert "UNNEST" in query
+    assert args[1] == ["1", "2"]
+
+
+@pytest.mark.asyncio
+async def test_add_results_batches_rows():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    run_id = uuid4()
+    entity_a, entity_b = uuid4(), uuid4()
+    await repo.add_results([
+        (run_id, entity_a, "icp", {"domain": "a.com"}, "https://example", {"raw": 1}),
+        (run_id, entity_b, "icp", {"domain": "b.com"}, "https://example", {"raw": 2}),
+    ])
+    query, args = pool.queries[0]
+    assert "INSERT INTO results" in query
+    assert "UNNEST" in query
+    assert args[2] == ["icp", "icp"]
 
 
 @pytest.mark.asyncio
@@ -300,3 +338,17 @@ async def test_delete_history_splits_collection_and_subdomain_ids():
     assert "DELETE FROM collection_runs" in queries
     assert "DELETE FROM subdomain_runs" in queries
 
+
+
+@pytest.mark.asyncio
+async def test_all_collection_rows_returns_complete_snapshot():
+    run_id = uuid4()
+    pool = FakePool()
+    repo = Repository(pool, None)
+    rels, icp_rows = await repo.all_collection_rows(run_id)
+    queries = [query for query, _args in pool.queries]
+    assert any("FROM relationships rel" in query for query in queries)
+    assert any("r.category='icp'" in query.replace(" ", "") or "r.category='icp'" in query for query in queries)
+    assert not any("LIMIT" in query and "OFFSET" in query for query in queries)
+    assert rels == []
+    assert icp_rows == []

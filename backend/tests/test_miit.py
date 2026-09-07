@@ -184,3 +184,42 @@ async def test_company_round_reuses_slot_without_waiting_for_slowest_company():
     assert not task.done()
     release_slow.set()
     assert await task == [("slow", None), ("fast", None), ("next", None)]
+
+
+@pytest.mark.asyncio
+async def test_cache_restore_writes_multiple_companies_in_one_batch(monkeypatch):
+    first = icp_row("a.example.com", "京ICP备1号")
+    second = icp_row("b.example.com", "京ICP备2号")
+    second["unitName"] = "另一家公司"
+    second["mainId"] = "main-2"
+    repo = CacheRepo(
+        {
+            "示例公司": {
+                "company_name": "示例公司",
+                "rows": [first],
+                "reported_total": 1,
+                "saved_total": 1,
+                "complete": True,
+                "query_version": miit.ICP_CACHE_VERSION,
+            },
+            "另一家公司": {
+                "company_name": "另一家公司",
+                "rows": [second],
+                "reported_total": 1,
+                "saved_total": 1,
+                "complete": True,
+                "query_version": miit.ICP_CACHE_VERSION,
+            },
+        }
+    )
+    writes = []
+
+    async def capture(repo, run_id, companies):
+        writes.append(companies)
+
+    monkeypatch.setattr(miit, "_save_icp_pages", capture)
+    monkeypatch.setattr(miit, "_fetch_page", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应实时查询")))
+    errors = await miit._collect_icp(repo, uuid4(), ["示例公司", "另一家公司"])
+    assert errors == []
+    assert len(writes) == 1
+    assert [name for name, _rows in writes[0]] == ["示例公司", "另一家公司"]

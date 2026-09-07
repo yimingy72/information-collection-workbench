@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     worker_lease_seconds: int = 120
     worker_concurrency: int = 2
     subdomain_worker_concurrency: int = 2
+    database_pool_min_size: int = 2
+    database_pool_max_size: int = 20
     serverless_proxy_url: str = "http://127.0.0.1:19080"
     serverless_proxy_admin_url: str = "http://127.0.0.1:19081"
     serverless_proxy_miit_url: str = "http://seamoon-gateway:19080"

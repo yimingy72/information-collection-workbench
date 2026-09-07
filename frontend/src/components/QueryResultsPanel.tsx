@@ -77,8 +77,9 @@ export function QueryResultsPanel({ query, loading = false }: { query: QueryView
             columns={icpColumns}
             dataSource={icpPage.data}
             loading={loading}
-            scroll={{ x: 1150 }}
+            scroll={{ x: 1150, y: 'calc(100vh - 360px)' }}
             pagination={false}
+            virtual
             locale={{
               emptyText: (
                 <Empty
@@ -95,8 +96,9 @@ export function QueryResultsPanel({ query, loading = false }: { query: QueryView
             columns={investmentColumns}
             dataSource={investPage.data}
             loading={loading}
-            scroll={{ x: 720 }}
+            scroll={{ x: 720, y: 'calc(100vh - 360px)' }}
             pagination={false}
+            virtual
             locale={{
               emptyText: (
                 <Empty

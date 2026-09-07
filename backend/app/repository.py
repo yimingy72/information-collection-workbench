@@ -308,44 +308,144 @@ class Repository:
         )
 
     async def upsert_entity(self, provider: str, external_id: str, name: str, payload: dict) -> UUID:
-        row = await self.pool.fetchrow(
+        ids = await self.upsert_entities([(provider, external_id, name, payload)])
+        return ids[0]
+
+    async def upsert_entities(
+        self, rows: list[tuple[str, str, str, dict[str, Any]]],
+    ) -> list[UUID]:
+        if not rows:
+            return []
+        unique: list[tuple[str, str, str, dict[str, Any]]] = []
+        seen: set[tuple[str, str]] = set()
+        for provider, external_id, name, payload in rows:
+            key = (provider, external_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append((provider, external_id, name, payload))
+        if len(unique) == 1:
+            provider, external_id, name, payload = unique[0]
+            row = await self.pool.fetchrow(
+                """
+                INSERT INTO entities(provider, external_id, name, payload)
+                VALUES($1,$2,$3,$4::jsonb)
+                ON CONFLICT(provider, external_id) DO UPDATE SET name = entities.name
+                RETURNING id
+                """,
+                provider, external_id, name, json.dumps(payload),
+            )
+            mapping = {(provider, external_id): row["id"]}
+            return [mapping[(item[0], item[1])] for item in rows]
+        records = await self.pool.fetch(
             """
             INSERT INTO entities(provider, external_id, name, payload)
-            VALUES($1,$2,$3,$4::jsonb)
+            SELECT provider, external_id, name, payload::jsonb
+              FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[])
+                AS t(provider, external_id, name, payload)
             ON CONFLICT(provider, external_id) DO UPDATE SET name = entities.name
-            RETURNING id
+            RETURNING provider, external_id, id
             """,
-            provider, external_id, name, json.dumps(payload),
+            [item[0] for item in unique],
+            [item[1] for item in unique],
+            [item[2] for item in unique],
+            [json.dumps(item[3]) for item in unique],
         )
-        return row["id"]
+        mapping = {(row["provider"], row["external_id"]): row["id"] for row in records}
+        return [mapping[(provider, external_id)] for provider, external_id, _, _ in rows]
 
     async def add_relationship(
         self, run_id: UUID, parent_id: UUID, child_id: UUID, relation_type: str,
         holding_percent: float | None, depth: int, reference: str,
         source_url: str, raw_payload: dict,
     ) -> None:
+        await self.add_relationships([(
+            run_id, parent_id, child_id, relation_type, holding_percent, depth,
+            reference, source_url, raw_payload,
+        )])
+
+    async def add_relationships(
+        self,
+        rows: list[tuple[UUID, UUID, UUID, str, float | None, int, str, str, dict[str, Any]]],
+    ) -> None:
+        if not rows:
+            return
+        if len(rows) == 1:
+            run_id, parent_id, child_id, relation_type, holding_percent, depth, reference, source_url, raw_payload = rows[0]
+            await self.pool.execute(
+                """
+                INSERT INTO relationships(run_id,parent_entity_id,child_entity_id,relation_type,holding_percent,
+                                          depth,reference,source_url,raw_payload)
+                VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+                ON CONFLICT DO NOTHING
+                """,
+                run_id, parent_id, child_id, relation_type, holding_percent, depth, reference,
+                source_url, json.dumps(raw_payload),
+            )
+            return
         await self.pool.execute(
             """
             INSERT INTO relationships(run_id,parent_entity_id,child_entity_id,relation_type,holding_percent,
                                       depth,reference,source_url,raw_payload)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb)
+            SELECT run_id, parent_id, child_id, relation_type, holding_percent, depth,
+                   reference, source_url, raw_payload::jsonb
+              FROM UNNEST(
+                    $1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::numeric[],
+                    $6::int[], $7::text[], $8::text[], $9::text[]
+              ) AS t(run_id, parent_id, child_id, relation_type, holding_percent, depth,
+                     reference, source_url, raw_payload)
             ON CONFLICT DO NOTHING
             """,
-            run_id, parent_id, child_id, relation_type, holding_percent, depth, reference,
-            source_url, json.dumps(raw_payload),
+            [item[0] for item in rows],
+            [item[1] for item in rows],
+            [item[2] for item in rows],
+            [item[3] for item in rows],
+            [item[4] for item in rows],
+            [item[5] for item in rows],
+            [item[6] for item in rows],
+            [item[7] for item in rows],
+            [json.dumps(item[8]) for item in rows],
         )
 
     async def add_result(
         self, run_id: UUID, entity_id: UUID, category: str, payload: dict,
         source_url: str, raw_payload: dict | None = None,
     ) -> None:
-        raw = json.dumps(raw_payload if raw_payload is not None else payload)
+        await self.add_results([(
+            run_id, entity_id, category, payload, source_url,
+            raw_payload if raw_payload is not None else payload,
+        )])
+
+    async def add_results(
+        self,
+        rows: list[tuple[UUID, UUID, str, dict[str, Any], str, dict[str, Any]]],
+    ) -> None:
+        if not rows:
+            return
+        if len(rows) == 1:
+            run_id, entity_id, category, payload, source_url, raw_payload = rows[0]
+            await self.pool.execute(
+                """
+                INSERT INTO results(run_id,entity_id,category,payload,source_url,raw_payload)
+                VALUES($1,$2,$3,$4::jsonb,$5,$6::jsonb) ON CONFLICT DO NOTHING
+                """,
+                run_id, entity_id, category, json.dumps(payload), source_url, json.dumps(raw_payload),
+            )
+            return
         await self.pool.execute(
             """
             INSERT INTO results(run_id,entity_id,category,payload,source_url,raw_payload)
-            VALUES($1,$2,$3,$4::jsonb,$5,$6::jsonb) ON CONFLICT DO NOTHING
+            SELECT run_id, entity_id, category, payload::jsonb, source_url, raw_payload::jsonb
+              FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $4::text[], $5::text[], $6::text[])
+                AS t(run_id, entity_id, category, payload, source_url, raw_payload)
+            ON CONFLICT DO NOTHING
             """,
-            run_id, entity_id, category, json.dumps(payload), source_url, raw,
+            [item[0] for item in rows],
+            [item[1] for item in rows],
+            [item[2] for item in rows],
+            [json.dumps(item[3]) for item in rows],
+            [item[4] for item in rows],
+            [json.dumps(item[5]) for item in rows],
         )
 
     async def get_icp_company_caches(
@@ -418,20 +518,65 @@ class Repository:
             max(0, int(live_queries)),
         )
 
+    async def all_collection_rows(
+        self, run_id: UUID,
+    ) -> tuple[list[asyncpg.Record], list[asyncpg.Record]]:
+        """Return the complete investment + ICP snapshot for a run.
+
+        Query detail and export used to load relationships unbounded and ICP
+        with a hard 10,000-row LIMIT. Tobacco-scale tasks then either truncated
+        ICP or issued two overlapping scans. One pair of full-table reads keeps
+        completeness without the artificial cap.
+        """
+        rels = await self.pool.fetch(
+            """
+            SELECT rel.id,rel.parent_entity_id,p.name parent_name,rel.child_entity_id,c.name child_name,
+                   rel.relation_type,rel.holding_percent,rel.depth,rel.reference,rel.source_url,rel.captured_at,
+                   rel.raw_payload
+              FROM relationships rel
+              JOIN entities p ON p.id=rel.parent_entity_id
+              JOIN entities c ON c.id=rel.child_entity_id
+             WHERE rel.run_id=$1
+             ORDER BY rel.depth,rel.id
+            """,
+            run_id,
+        )
+        icp_rows = await self.pool.fetch(
+            """
+            SELECT r.id,r.category,r.entity_id,e.name entity_name,r.payload,r.source_url,r.captured_at
+              FROM results r JOIN entities e ON e.id=r.entity_id
+             WHERE r.run_id=$1 AND r.category='icp'
+             ORDER BY r.captured_at,r.id
+            """,
+            run_id,
+        )
+        return rels, icp_rows
+
     async def results(
         self, run_id: UUID, category: str | None, limit: int, offset: int,
         relationship_limit: int | None = 200, relationship_offset: int = 0,
     ) -> tuple[list, list, int, int]:
         if category:
-            rows = await self.pool.fetch(
-                """
-                SELECT r.id,r.category,r.entity_id,e.name entity_name,r.payload,r.source_url,r.captured_at
-                  FROM results r JOIN entities e ON e.id=r.entity_id
-                 WHERE r.run_id=$1 AND r.category=$2
-                 ORDER BY r.captured_at,r.id LIMIT $3 OFFSET $4
-                """,
-                run_id, category, limit, offset,
-            )
+            if limit and limit > 0:
+                rows = await self.pool.fetch(
+                    """
+                    SELECT r.id,r.category,r.entity_id,e.name entity_name,r.payload,r.source_url,r.captured_at
+                      FROM results r JOIN entities e ON e.id=r.entity_id
+                     WHERE r.run_id=$1 AND r.category=$2
+                     ORDER BY r.captured_at,r.id LIMIT $3 OFFSET $4
+                    """,
+                    run_id, category, limit, offset,
+                )
+            else:
+                rows = await self.pool.fetch(
+                    """
+                    SELECT r.id,r.category,r.entity_id,e.name entity_name,r.payload,r.source_url,r.captured_at
+                      FROM results r JOIN entities e ON e.id=r.entity_id
+                     WHERE r.run_id=$1 AND r.category=$2
+                     ORDER BY r.captured_at,r.id
+                    """,
+                    run_id, category,
+                )
             count_result = await self.pool.fetchval(
                 "SELECT count(*) FROM results WHERE run_id=$1 AND category=$2", run_id, category
             )
@@ -519,27 +664,54 @@ class Repository:
         return relationships, icp_results
 
     async def entity_names_for_run(self, run_id: UUID) -> list[str]:
-        rows = await self.pool.fetch(
+        names, _, _ = await self.entity_names_since(run_id, 0, 0)
+        return names
+
+    async def entity_names_since(
+        self, run_id: UUID, relationship_cursor: int = 0, result_cursor: int = 0
+    ) -> tuple[list[str], int, int]:
+        """Return newly persisted company names after the given stream cursors.
+
+        ICP discovery used to rescan every relationship/result on a 250ms poll.
+        Deep trees then paid a growing DISTINCT UNION on every tick. Incremental
+        stream_seq reads keep the same completeness while only touching new rows.
+        """
+        rel_cursor = max(0, int(relationship_cursor))
+        res_cursor = max(0, int(result_cursor))
+        row = await self.pool.fetchrow(
             """
-            SELECT DISTINCT name FROM (
-                SELECT p.name FROM relationships rel
-                  JOIN entities p ON p.id = rel.parent_entity_id
-                 WHERE rel.run_id = $1
-                UNION
-                SELECT c.name FROM relationships rel
-                  JOIN entities c ON c.id = rel.child_entity_id
-                 WHERE rel.run_id = $1
-                UNION
-                SELECT e.name FROM results r
-                  JOIN entities e ON e.id = r.entity_id
-                 WHERE r.run_id = $1
-                   AND r.category IN ('company_selection', 'invest', 'partner')
-            ) names
-            ORDER BY name
+            WITH rels AS (
+                SELECT stream_seq, parent_entity_id, child_entity_id
+                  FROM relationships
+                 WHERE run_id=$1 AND stream_seq > $2
+            ),
+            res AS (
+                SELECT stream_seq, entity_id
+                  FROM results
+                 WHERE run_id=$1
+                   AND category IN ('company_selection', 'invest', 'partner')
+                   AND stream_seq > $3
+            )
+            SELECT
+              COALESCE((SELECT max(stream_seq) FROM rels), $2) AS rel_cursor,
+              COALESCE((SELECT max(stream_seq) FROM res), $3) AS res_cursor,
+              COALESCE((
+                SELECT array_agg(DISTINCT name)
+                  FROM (
+                    SELECT p.name FROM rels JOIN entities p ON p.id = rels.parent_entity_id
+                    UNION
+                    SELECT c.name FROM rels JOIN entities c ON c.id = rels.child_entity_id
+                    UNION
+                    SELECT e.name FROM res JOIN entities e ON e.id = res.entity_id
+                  ) names
+              ), '{}'::text[]) AS names
             """,
             run_id,
+            rel_cursor,
+            res_cursor,
         )
-        return [row["name"] for row in rows]
+        names = [str(name) for name in (row["names"] or []) if str(name).strip()]
+        return names, int(row["rel_cursor"] or rel_cursor), int(row["res_cursor"] or res_cursor)
 
     async def delete_runs(self, run_ids: list[UUID]) -> int:
         if not run_ids:

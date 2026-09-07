@@ -546,8 +546,9 @@ export function SubdomainPage({
                 columns={columns}
                 dataSource={paged.data}
                 loading={loading}
-                scroll={{ x: 1380 }}
+                scroll={{ x: 1380, y: 'calc(100vh - 420px)' }}
                 pagination={false}
+                virtual
                 locale={{
                   emptyText: (
                     <Empty

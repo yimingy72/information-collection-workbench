@@ -262,16 +262,63 @@ class AnonymousTianyancha:
     ) -> list[Any]:
         rows: list[Any] = []
         total = 0
-        for page in range(1, max_pages + 1):
+        page_size = max(1, int(page_size))
+        max_pages = max(1, int(max_pages))
+        first, reported_total = await fetch(1)
+        rows.extend(first)
+        total = max(total, int(reported_total or 0))
+        if total and len(rows) >= total:
+            return rows[:total]
+        if not first:
+            return rows
+        if len(first) < page_size and not total:
+            return rows
+        if total:
+            # Upstream may cap pageSize below the requested value. Use the
+            # first page's actual width so remaining pages are not dropped.
+            effective_size = max(1, len(first) or page_size)
+            page_count = min(max_pages, (total + effective_size - 1) // effective_size)
+            remaining = list(range(2, page_count + 1))
+            if remaining:
+                limit = asyncio.Semaphore(min(4, len(remaining)))
+
+                async def load(page: int) -> tuple[int, list[Any], int]:
+                    async with limit:
+                        chunk, reported = await fetch(page)
+                        return page, chunk, reported
+
+                async def load_pages(pages: list[int], *, retry: bool = True) -> None:
+                    nonlocal total
+                    missing: list[int] = []
+                    chunks = await asyncio.gather(
+                        *(load(page) for page in pages),
+                        return_exceptions=True,
+                    )
+                    last_error: BaseException | None = None
+                    for page, item in zip(pages, chunks, strict=True):
+                        if isinstance(item, BaseException):
+                            missing.append(page)
+                            last_error = item
+                            continue
+                        _page, chunk, reported = item
+                        rows.extend(chunk)
+                        total = max(total, int(reported or 0))
+                    if missing and last_error is not None and not (total and len(rows) >= total):
+                        if retry:
+                            return await load_pages(missing, retry=False)
+                        raise last_error
+
+                await load_pages(remaining)
+            if total and len(rows) >= total:
+                return rows[:total]
+            return rows[:total] if total else rows
+        for page in range(2, max_pages + 1):
             # _request retries this exact query/page and rebuilds the proxy
             # tunnel on a login-wall response. Successfully completed earlier
             # pages remain in ``rows`` and are not requested again.
             chunk, reported_total = await fetch(page)
             rows.extend(chunk)
             total = max(total, int(reported_total or 0))
-            # Prefer the provider's total. Some endpoints cap pageSize below
-            # the requested value, so a short page does not necessarily mean
-            # the last page.
             if total and len(rows) >= total:
                 return rows[:total]
             if not chunk:

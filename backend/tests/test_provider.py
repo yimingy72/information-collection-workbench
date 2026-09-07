@@ -580,7 +580,8 @@ async def test_icp_direct_multi_page_saves_each_page_without_proxy_lookup(monkey
     assert fetch_calls[1][2] <= page_timeout
     assert fetch_calls[0][3]
     assert fetch_calls[0][3] == fetch_calls[1][3]
-    assert len(saved_pages) == 2
+    assert len(saved_pages) == 1
+    assert [row["domain"] for row in saved_pages[0]] == ["1.example", "2.example"]
 
 
 @pytest.mark.asyncio
@@ -939,7 +940,7 @@ async def test_icp_single_manual_proxy_uses_fresh_session_per_page(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_icp_single_manual_proxy_runs_one_company_at_a_time(monkeypatch):
+async def test_icp_single_manual_proxy_runs_companies_in_parallel(monkeypatch):
     import app.miit as miit
 
     active = 0
@@ -977,7 +978,7 @@ async def test_icp_single_manual_proxy_runs_one_company_at_a_time(monkeypatch):
     assert await miit.collect_icp(
         Repo(), uuid4(), [f"企业{i}" for i in range(4)]
     ) == []
-    assert maximum == 1
+    assert maximum == 4
     assert routes == ["http://user:pass@manual.example:8080"] * 4
 
 
@@ -1023,7 +1024,7 @@ async def test_icp_manual_proxy_pool_parallelism_matches_ready_nodes(monkeypatch
     assert await miit.collect_icp(
         Repo(), uuid4(), [f"企业{i}" for i in range(4)]
     ) == []
-    assert maximum == 2
+    assert maximum == 4
     assert set(routes) == {
         "http://manual0.example:8080",
         "http://manual1.example:8080",
@@ -1085,7 +1086,7 @@ async def test_icp_cloud_scheduler_does_not_apply_direct_ip_cooldown(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_icp_cloud_queries_are_processed_one_company_per_node(monkeypatch):
+async def test_icp_cloud_queries_use_five_slots_per_node(monkeypatch):
     import app.miit as miit
 
     active = 0
@@ -1113,7 +1114,7 @@ async def test_icp_cloud_queries_are_processed_one_company_per_node(monkeypatch)
     errors = await miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(12)])
 
     assert errors == []
-    assert maximum == 1
+    assert maximum == 5
     assert len(calls) == 12
     assert all(call[2] == miit.settings.serverless_proxy_miit_url for call in calls)
 
@@ -1297,7 +1298,7 @@ async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
         return {"rows": [], "pages": 1}
 
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
-
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
     monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
     errors = await asyncio.wait_for(
         miit.collect_icp(Repo(), uuid4(), [f"企业{i}" for i in range(5)]),
