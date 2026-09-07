@@ -45,6 +45,8 @@ from app.models import (
     ServerlessProxyRequest,
     ServerlessProxyTestResponse,
     SettingsResponse,
+    SubdomainApiSettingsRequest,
+    SubdomainApiSettingsView,
     SubdomainResultItem,
     SubdomainResultsResponse,
     SubdomainRunListResponse,
@@ -161,11 +163,18 @@ def settings_view(config: dict) -> SettingsResponse:
     pool = str(config.get("proxy_pool") or "cloud").strip().lower()
     if pool not in {"cloud", "manual", "direct"}:
         pool = "cloud"
+    api = config.get("subdomain_api") or {}
     return SettingsResponse(
         sessions=sessions,
         serverless_proxy=serverless_proxy_view(config),
         manual_proxies=[_manual_proxy_view(row) for row in config.get("manual_proxies") or []],
         proxy_pool=pool,  # type: ignore[arg-type]
+        subdomain_api=SubdomainApiSettingsView(
+            fofa_email=str(api.get("fofa_email") or ""),
+            has_fofa_key=bool(str(api.get("fofa_key") or "").strip()),
+            has_hunter_key=bool(str(api.get("hunter_key") or "").strip()),
+            updated_at=api.get("updated_at"),
+        ),
     )
 
 
@@ -1156,6 +1165,26 @@ async def delete_serverless_proxy_deployment() -> SettingsResponse:
     if target is None:
         raise HTTPException(400, "当前配置不是由平台部署的云函数")
     return await _delete_serverless_node(store, str(target["id"]))
+
+
+@app.put("/api/v1/settings/subdomain-api", response_model=SettingsResponse)
+async def save_subdomain_api(request: SubdomainApiSettingsRequest) -> SettingsResponse:
+    store = current_repo()
+    current = (await store.get_runtime_config()).get("subdomain_api") or {}
+    fofa_key = request.fofa_key
+    hunter_key = request.hunter_key
+    if request.fofa_key == "":
+        fofa_key = ""
+    if request.hunter_key == "":
+        hunter_key = ""
+    if request.fofa_email and not (fofa_key or str(current.get("fofa_key") or "").strip()):
+        raise HTTPException(400, "配置 FOFA 时需要填写 API Key")
+    await store.update_subdomain_api_settings(
+        fofa_email=request.fofa_email,
+        fofa_key=fofa_key,
+        hunter_key=hunter_key,
+    )
+    return settings_view(await store.get_runtime_config())
 
 
 @app.put("/api/v1/settings/sessions/{provider}", response_model=SettingsResponse)

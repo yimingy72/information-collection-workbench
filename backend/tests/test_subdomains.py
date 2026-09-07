@@ -54,6 +54,79 @@ async def test_passive_sources_parse_only_children_of_root():
 
 
 @pytest.mark.asyncio
+async def test_fofa_and_hunter_parse_hosts_from_api_payloads():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "fofa.info":
+            return httpx.Response(200, json={
+                "error": False,
+                "size": 1,
+                "results": [["portal.example.com", "80", "https://portal.example.com"]],
+            })
+        return httpx.Response(200, json={
+            "code": 200,
+            "data": {
+                "total": 1,
+                "arr": [{"domain": "api.example.com", "url": "https://vpn.example.com"}],
+            },
+        })
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await subdomains.collect_fofa(
+            client, "example.com", email="user@example.com", key="fofa-key"
+        ) == {"portal.example.com"}
+        assert await subdomains.collect_hunter(client, "example.com", key="hunter-key") == {
+            "api.example.com", "vpn.example.com"
+        }
+
+
+@pytest.mark.asyncio
+async def test_collection_uses_configured_fofa_and_hunter(monkeypatch):
+    async def empty(_client, _domain, **_kwargs):
+        return set()
+
+    captured = []
+
+    async def fake_call(repo, name, function, client, domain, fallback_client=None):
+        captured.append(name)
+        if name == "FOFA":
+            return name, {"portal.example.com"}, ""
+        if name == "Hunter":
+            return name, {"api.example.com"}, ""
+        return name, set(), ""
+
+    async def resolve(hostname):
+        return subdomains.ResolvedHost(hostname, ["93.184.216.34"])
+
+    monkeypatch.setattr(subdomains, "PASSIVE_SOURCES", (("crt.sh", "collect_crtsh"),))
+    monkeypatch.setattr(subdomains, "collect_crtsh", empty)
+    monkeypatch.setattr(subdomains, "_call_source", fake_call)
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", lambda _root: __import__("asyncio").sleep(0, result=set()))
+    monkeypatch.setattr(subdomains, "generate_altdns_candidates", lambda *_args: set())
+
+    class Repo(FakeRepo):
+        async def get_runtime_config(self):
+            return {
+                "subdomain_api": {
+                    "fofa_email": "user@example.com",
+                    "fofa_key": "fofa-key",
+                    "hunter_key": "hunter-key",
+                }
+            }
+
+    repo = Repo()
+    await subdomains.collect_subdomains(
+        repo,
+        uuid4(),
+        ["example.com"],
+        {"passive": True, "brute_force": False, "http_probe": False},
+        lease_id=uuid4(),
+    )
+    assert "FOFA" in captured and "Hunter" in captured
+    assert {item[1]["hostname"] for item in repo.results} >= {"portal.example.com", "api.example.com"}
+
+
+@pytest.mark.asyncio
 async def test_additional_passive_sources_parse_and_filter_results():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "urlscan.io":
@@ -100,6 +173,13 @@ class FakeRepo:
         self.results.append((run_id, values))
         self.result_event.set()
         return True
+
+    async def add_subdomain_results(self, run_id, rows):
+        inserted = 0
+        for item in rows:
+            if await self.add_subdomain_result(run_id, **item):
+                inserted += 1
+        return inserted
 
 
 @pytest.mark.asyncio

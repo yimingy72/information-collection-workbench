@@ -226,11 +226,25 @@ export type ManualProxyTest = {
   target: string
 }
 
+export type SubdomainApiSettings = {
+  fofa_email: string
+  has_fofa_key: boolean
+  has_hunter_key: boolean
+  updated_at?: string | null
+}
+
+export type SubdomainApiValues = {
+  fofa_email: string
+  fofa_key?: string
+  hunter_key?: string
+}
+
 export type SettingsView = {
   sessions: ProviderSession[]
   serverless_proxy: ServerlessProxySettings
   manual_proxies: ManualProxy[]
   proxy_pool: ProxyPool
+  subdomain_api: SubdomainApiSettings
 }
 
 export type LoginValues = {

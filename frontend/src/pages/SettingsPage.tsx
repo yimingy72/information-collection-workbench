@@ -34,11 +34,12 @@ import {
   getSettings,
   pollQrLogin,
   saveServerlessProxy,
+  saveSubdomainApi,
   testServerlessProxy,
   startQrLogin,
 } from '../api'
 import { formatDate } from '../formatters'
-import type { CloudProvider, ServerlessProxyValues, SessionProviderId, SettingsView } from '../types'
+import type { CloudProvider, ServerlessProxyValues, SessionProviderId, SettingsView, SubdomainApiValues } from '../types'
 import { ProxySettingsPage } from './ProxySettingsPage'
 
 type SettingsSection = 'sources' | 'proxy'
@@ -216,12 +217,14 @@ const proxyFormValues = (settings: SettingsView): ServerlessProxyValues => {
 export function SettingsPage() {
   const { message } = App.useApp()
   const [proxyForm] = Form.useForm<ServerlessProxyValues>()
+  const [subdomainApiForm] = Form.useForm<SubdomainApiValues>()
   const provider = Form.useWatch('provider', proxyForm) ?? 'aliyun'
   const [settings, setSettings] = useState<SettingsView | null>(null)
   const [settingsSection, setSettingsSection] = useState<SettingsSection>('sources')
   const [loading, setLoading] = useState(true)
   const [loggingOut, setLoggingOut] = useState<SessionProviderId | null>(null)
   const [savingProxy, setSavingProxy] = useState(false)
+  const [savingSubdomainApi, setSavingSubdomainApi] = useState(false)
   const [deployingProxy, setDeployingProxy] = useState(false)
   const [testingProxy, setTestingProxy] = useState(false)
   const [deletingProxy, setDeletingProxy] = useState(false)
@@ -229,6 +232,11 @@ export function SettingsPage() {
   const applySettings = (next: SettingsView) => {
     setSettings(next)
     proxyForm.setFieldsValue(proxyFormValues(next))
+    subdomainApiForm.setFieldsValue({
+      fofa_email: next.subdomain_api?.fofa_email || '',
+      fofa_key: undefined,
+      hunter_key: undefined,
+    })
   }
 
   const refresh = async () => {
@@ -314,6 +322,31 @@ export function SettingsPage() {
     }
   }
 
+  const saveSubdomainApiSettings = async () => {
+    setSavingSubdomainApi(true)
+    try {
+      const values = await subdomainApiForm.validateFields()
+      const payload: SubdomainApiValues = {
+        fofa_email: (values.fofa_email || '').trim(),
+      }
+      const fofaKey = (values.fofa_key || '').trim()
+      const hunterKey = (values.hunter_key || '').trim()
+      if (fofaKey) payload.fofa_key = fofaKey
+      if (hunterKey) payload.hunter_key = hunterKey
+      if (payload.fofa_email && !payload.fofa_key && !settings?.subdomain_api.has_fofa_key) {
+        message.error('配置 FOFA 时需要填写 API Key')
+        return
+      }
+      applySettings(await saveSubdomainApi(payload))
+      subdomainApiForm.setFieldsValue({ fofa_key: undefined, hunter_key: undefined })
+      message.success('子域名数据源已保存')
+    } catch (error) {
+      if (error instanceof Error) message.error(error.message)
+    } finally {
+      setSavingSubdomainApi(false)
+    }
+  }
+
   const onLogout = async (sessionProvider: SessionProviderId) => {
     setLoggingOut(sessionProvider)
     try {
@@ -368,16 +401,41 @@ export function SettingsPage() {
   const proxy = settings?.serverless_proxy
 
   const dataSourceTab = (
-    <Card title="数据源登录" size="small" loading={loading}>
-      <Table
-        className="settings-source-table"
-        rowKey="provider"
+    <div className="settings-source-page">
+      <Card title="数据源登录" size="small" loading={loading}>
+        <Table
+          className="settings-source-table"
+          rowKey="provider"
+          size="small"
+          pagination={false}
+          dataSource={settings?.sessions ?? []}
+          columns={sessionColumns}
+        />
+      </Card>
+      <Card
+        title="子域名情报源"
         size="small"
-        pagination={false}
-        dataSource={settings?.sessions ?? []}
-        columns={sessionColumns}
-      />
-    </Card>
+        extra={(
+          <Button size="small" icon={<SaveOutlined />} loading={savingSubdomainApi} onClick={() => void saveSubdomainApiSettings()}>
+            保存
+          </Button>
+        )}
+      >
+        <Form form={subdomainApiForm} size="small" layout="vertical" className="subdomain-api-form">
+          <div className="serverless-proxy-grid">
+            <Form.Item name="fofa_email" label="FOFA 邮箱">
+              <Input autoComplete="off" placeholder="fofa.info 账号邮箱" />
+            </Form.Item>
+            <Form.Item name="fofa_key" label="FOFA API Key">
+              <Input.Password autoComplete="new-password" placeholder={settings?.subdomain_api.has_fofa_key ? '已保存，留空不修改' : 'fofa.info API Key'} />
+            </Form.Item>
+            <Form.Item name="hunter_key" label="Hunter API Key">
+              <Input.Password autoComplete="new-password" placeholder={settings?.subdomain_api.has_hunter_key ? '已保存，留空不修改' : 'hunter.qianxin.com API Key'} />
+            </Form.Item>
+          </div>
+        </Form>
+      </Card>
+    </div>
   )
 
   const cloudActions = (

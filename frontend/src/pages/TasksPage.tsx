@@ -6,6 +6,7 @@ import {
   deleteHistory,
   getAllSubdomainResults,
   getQuery,
+  getSubdomainResults,
   getSubdomainRun,
   listHistory,
 } from '../api'
@@ -15,7 +16,7 @@ import { QueryResultsPanel } from '../components/QueryResultsPanel'
 import { TableFrame } from '../components/TableFrame'
 import { exportQuery, exportSubdomains } from '../export'
 import { formatDate, formatDuration, providerLabel } from '../formatters'
-import { TABLE_PAGE_SIZE, usePagedData } from '../pagination'
+import { TABLE_PAGE_SIZE } from '../pagination'
 import type { HistoryItem, HistoryKind, QueryView, SubdomainResult, SubdomainRun } from '../types'
 
 const STATUS_OPTIONS = [
@@ -44,14 +45,20 @@ function historyTitle(item: HistoryItem) {
 function SubdomainHistoryResults({
   run,
   results,
+  total,
   loading,
+  page,
+  pageSize,
+  onPageChange,
 }: {
   run: SubdomainRun
   results: SubdomainResult[]
+  total: number
   loading: boolean
+  page: number
+  pageSize: number
+  onPageChange: (page: number, pageSize: number) => void
 }) {
-  const paged = usePagedData(results, run.id)
-
   const columns: TableProps<SubdomainResult>['columns'] = [
     { title: '主域名', dataIndex: 'root_domain', width: 160, ellipsis: true },
     {
@@ -87,15 +94,23 @@ function SubdomainHistoryResults({
   ]
 
   return (
-    <TableFrame pagination={paged.pagination}>
+    <TableFrame
+      pagination={{
+        current: page,
+        pageSize,
+        total,
+        onChange: onPageChange,
+      }}
+    >
       <Table
         rowKey="id"
         className="table-fill"
         columns={columns}
-        dataSource={paged.data}
+        dataSource={results}
         loading={loading}
-        scroll={{ x: 1100 }}
+        scroll={{ x: 1100, y: 'calc(100vh - 360px)' }}
         pagination={false}
+        virtual
         locale={{
           emptyText: (
             <Empty
@@ -128,7 +143,11 @@ export function TasksPage() {
   const [openQuery, setOpenQuery] = useState<QueryView | null>(null)
   const [openSubdomain, setOpenSubdomain] = useState<SubdomainRun | null>(null)
   const [openSubdomainResults, setOpenSubdomainResults] = useState<SubdomainResult[]>([])
+  const [openSubdomainTotal, setOpenSubdomainTotal] = useState(0)
+  const [openSubdomainPage, setOpenSubdomainPage] = useState(1)
+  const [openSubdomainPageSize, setOpenSubdomainPageSize] = useState(TABLE_PAGE_SIZE)
   const [openLoading, setOpenLoading] = useState(false)
+  const [openSubdomainPageLoading, setOpenSubdomainPageLoading] = useState(false)
   const [openError, setOpenError] = useState<string | null>(null)
   const detailRequest = useRef(0)
 
@@ -168,6 +187,8 @@ export function TasksPage() {
       setOpenQuery(null)
       setOpenSubdomain(null)
       setOpenSubdomainResults([])
+      setOpenSubdomainTotal(0)
+      setOpenSubdomainPage(1)
       setOpenError(null)
     }
   }, [items, openItem])
@@ -178,6 +199,8 @@ export function TasksPage() {
     setOpenQuery(null)
     setOpenSubdomain(null)
     setOpenSubdomainResults([])
+    setOpenSubdomainTotal(0)
+    setOpenSubdomainPage(1)
     setOpenError(null)
     setOpenLoading(false)
   }
@@ -192,6 +215,8 @@ export function TasksPage() {
     setOpenQuery(null)
     setOpenSubdomain(null)
     setOpenSubdomainResults([])
+    setOpenSubdomainTotal(0)
+    setOpenSubdomainPage(1)
     setOpenError(null)
     setOpenLoading(true)
     try {
@@ -202,17 +227,43 @@ export function TasksPage() {
       } else {
         const [run, results] = await Promise.all([
           getSubdomainRun(item.id),
-          getAllSubdomainResults(item.id),
+          getSubdomainResults(item.id, TABLE_PAGE_SIZE, undefined, 0),
         ])
         if (detailRequest.current !== requestId) return
         setOpenSubdomain(run)
         setOpenSubdomainResults(results.items)
+        setOpenSubdomainTotal(results.total)
+        setOpenSubdomainPage(1)
       }
     } catch (error) {
       if (detailRequest.current !== requestId) return
       setOpenError(error instanceof Error ? error.message : '无法读取查询结果')
     } finally {
       if (detailRequest.current === requestId) setOpenLoading(false)
+    }
+  }
+
+  const loadSubdomainPage = async (page: number, pageSize: number) => {
+    if (!openItem || openItem.kind !== 'subdomain') return
+    const requestId = ++detailRequest.current
+    setOpenSubdomainPageLoading(true)
+    try {
+      const results = await getSubdomainResults(
+        openItem.id,
+        pageSize,
+        undefined,
+        (page - 1) * pageSize,
+      )
+      if (detailRequest.current !== requestId) return
+      setOpenSubdomainResults(results.items)
+      setOpenSubdomainTotal(results.total)
+      setOpenSubdomainPage(page)
+      setOpenSubdomainPageSize(pageSize)
+    } catch (error) {
+      if (detailRequest.current !== requestId) return
+      setOpenError(error instanceof Error ? error.message : '无法读取查询结果')
+    } finally {
+      if (detailRequest.current === requestId) setOpenSubdomainPageLoading(false)
     }
   }
 
@@ -384,10 +435,17 @@ export function TasksPage() {
                     icon={<DownloadOutlined />}
                     disabled={openQuery
                       ? !openQuery.investments.length && !openQuery.icp_records.length
-                      : !openSubdomainResults.length}
+                      : openSubdomainTotal <= 0}
                     onClick={() => {
                       if (openQuery) exportQuery(openQuery)
-                      else if (openSubdomain) exportSubdomains(openSubdomain, openSubdomainResults)
+                      else if (openSubdomain) {
+                        void getAllSubdomainResults(openSubdomain.id)
+                          .then((response) => {
+                            if (!response.items.length) throw new Error('这条记录没有可导出的查询数据')
+                            exportSubdomains(openSubdomain, response.items)
+                          })
+                          .catch((error) => message.error(error instanceof Error ? error.message : '导出失败'))
+                      }
                     }}
                   >
                     导出 Excel
@@ -411,7 +469,21 @@ export function TasksPage() {
               </>
             ) : openSubdomain ? (
               <>
-                <SubdomainHistoryResults run={openSubdomain} results={openSubdomainResults} loading={false} />
+                <SubdomainHistoryResults
+                  run={openSubdomain}
+                  results={openSubdomainResults}
+                  total={openSubdomainTotal}
+                  loading={openSubdomainPageLoading}
+                  page={openSubdomainPage}
+                  pageSize={openSubdomainPageSize}
+                  onPageChange={(nextPage, nextSize) => {
+                    if (nextSize !== openSubdomainPageSize) {
+                      void loadSubdomainPage(1, nextSize)
+                      return
+                    }
+                    void loadSubdomainPage(nextPage, nextSize)
+                  }}
+                />
               </>
             ) : null}
           </Card>

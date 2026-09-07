@@ -840,6 +840,60 @@ class Repository:
             root_domain, source, json.dumps(hosts), ttl_hours,
         )
 
+    async def add_subdomain_results(
+        self,
+        run_id: UUID,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Upsert many subdomain rows and return how many were newly inserted."""
+        if not rows:
+            return 0
+        if len(rows) == 1:
+            item = rows[0]
+            inserted = await self.add_subdomain_result(run_id, **item)
+            return 1 if inserted else 0
+        records = await self.pool.fetch(
+            """
+            INSERT INTO subdomain_results
+              (run_id, root_domain, hostname, ips, canonical_name, wildcard,
+               http_url, http_status, title, sources)
+            SELECT run_id, root_domain, hostname, ips::jsonb, canonical_name, wildcard,
+                   http_url, http_status, title, sources::jsonb
+              FROM UNNEST(
+                    $1::uuid[], $2::text[], $3::text[], $4::text[], $5::text[],
+                    $6::bool[], $7::text[], $8::int[], $9::text[], $10::text[]
+              ) AS t(run_id, root_domain, hostname, ips, canonical_name, wildcard,
+                     http_url, http_status, title, sources)
+            ON CONFLICT(run_id, root_domain, hostname) DO UPDATE
+               SET stream_seq=nextval('subdomain_results_stream_seq_seq'),
+                   ips=EXCLUDED.ips,
+                   canonical_name=CASE WHEN EXCLUDED.canonical_name <> ''
+                                       THEN EXCLUDED.canonical_name ELSE subdomain_results.canonical_name END,
+                   wildcard=EXCLUDED.wildcard,
+                   http_url=CASE WHEN EXCLUDED.http_url <> ''
+                                 THEN EXCLUDED.http_url ELSE subdomain_results.http_url END,
+                   http_status=COALESCE(EXCLUDED.http_status, subdomain_results.http_status),
+                   title=CASE WHEN EXCLUDED.title <> ''
+                              THEN EXCLUDED.title ELSE subdomain_results.title END,
+                   sources=(SELECT jsonb_agg(DISTINCT source ORDER BY source)
+                              FROM jsonb_array_elements_text(
+                                subdomain_results.sources || EXCLUDED.sources
+                              ) AS source)
+            RETURNING (xmax = 0) AS inserted
+            """,
+            [run_id for _ in rows],
+            [item["root_domain"] for item in rows],
+            [item["hostname"] for item in rows],
+            [json.dumps(item["ips"]) for item in rows],
+            [item["canonical_name"] for item in rows],
+            [bool(item["wildcard"]) for item in rows],
+            [item["http_url"] for item in rows],
+            [item["http_status"] for item in rows],
+            [item["title"] for item in rows],
+            [json.dumps(item["sources"]) for item in rows],
+        )
+        return sum(1 for row in records if row.get("inserted"))
+
     async def add_subdomain_result(
         self, run_id: UUID, *, root_domain: str, hostname: str, ips: list[str],
         canonical_name: str, wildcard: bool, http_url: str, http_status: int | None,
@@ -962,12 +1016,16 @@ class Repository:
             "SELECT * FROM serverless_proxy_settings WHERE id=1"
         )
         manual_proxies = await self.pool.fetch("SELECT * FROM manual_proxy_nodes ORDER BY created_at, id")
+        subdomain_api = await self.pool.fetchrow(
+            "SELECT * FROM subdomain_api_settings WHERE id=1"
+        )
         serverless = dict(serverless_proxy) if serverless_proxy else {}
         return {
             "sessions": {row["provider"]: dict(row) for row in sessions},
             "serverless_proxy": serverless,
             "manual_proxies": [dict(row) for row in manual_proxies],
             "proxy_pool": str(serverless.get("proxy_pool") or "cloud"),
+            "subdomain_api": dict(subdomain_api) if subdomain_api else {},
         }
 
     async def update_serverless_proxy(self, config: dict[str, Any]) -> asyncpg.Record:
@@ -1144,6 +1202,26 @@ class Repository:
             RETURNING *
             """,
             proxy_id, status, latency_ms, error, enabled,
+        )
+
+    async def update_subdomain_api_settings(
+        self,
+        *,
+        fofa_email: str,
+        fofa_key: str | None,
+        hunter_key: str | None,
+    ) -> asyncpg.Record:
+        return await self.pool.fetchrow(
+            """
+            UPDATE subdomain_api_settings
+               SET fofa_email=$1,
+                   fofa_key=COALESCE($2, fofa_key),
+                   hunter_key=COALESCE($3, hunter_key),
+                   updated_at=now()
+             WHERE id=1
+            RETURNING *
+            """,
+            fofa_email, fofa_key, hunter_key,
         )
 
     async def list_provider_sessions(self) -> list[asyncpg.Record]:

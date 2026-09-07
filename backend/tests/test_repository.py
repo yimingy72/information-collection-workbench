@@ -174,6 +174,67 @@ async def test_subdomain_source_cache_uses_unexpired_rows():
 
 
 @pytest.mark.asyncio
+async def test_runtime_config_loads_subdomain_api_settings():
+    class ConfigPool(FakePool):
+        async def fetch(self, query, *args):
+            self.queries.append((query, args))
+            if "FROM provider_sessions" in query:
+                return []
+            if "FROM manual_proxy_nodes" in query:
+                return []
+            return []
+
+        async def fetchrow(self, query, *args):
+            self.queries.append((query, args))
+            if "FROM serverless_proxy_settings" in query:
+                return {"proxy_pool": "cloud"}
+            if "FROM subdomain_api_settings" in query:
+                return {"fofa_email": "user@example.com", "fofa_key": "k", "hunter_key": "h"}
+            return {"id": uuid4()}
+
+    repo = Repository(ConfigPool(), None)
+    config = await repo.get_runtime_config()
+    assert config["subdomain_api"]["fofa_email"] == "user@example.com"
+    assert config["subdomain_api"]["hunter_key"] == "h"
+
+
+@pytest.mark.asyncio
+async def test_subdomain_result_upsert_merges_sources():
+    pool = FakePool()
+    repo = Repository(pool, None)
+    run_id = uuid4()
+    await repo.add_subdomain_results(run_id, [
+        {
+            "root_domain": "example.com",
+            "hostname": "www.example.com",
+            "ips": ["93.184.216.34"],
+            "canonical_name": "",
+            "wildcard": False,
+            "http_url": "",
+            "http_status": None,
+            "title": "",
+            "sources": ["crt.sh"],
+        },
+        {
+            "root_domain": "example.com",
+            "hostname": "api.example.com",
+            "ips": ["93.184.216.34"],
+            "canonical_name": "",
+            "wildcard": False,
+            "http_url": "https://api.example.com/",
+            "http_status": 200,
+            "title": "API",
+            "sources": ["DNS字典"],
+        },
+    ])
+    query, args = pool.queries[0]
+    assert "INSERT INTO subdomain_results" in query
+    assert "UNNEST" in query
+    assert "ON CONFLICT(run_id, root_domain, hostname) DO UPDATE" in query
+    assert args[2] == ["www.example.com", "api.example.com"]
+
+
+@pytest.mark.asyncio
 async def test_subdomain_result_upsert_merges_sources():
     pool = FakePool()
     repo = Repository(pool, None)

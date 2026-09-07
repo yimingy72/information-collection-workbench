@@ -439,6 +439,16 @@ body,
   margin-top: 0;
 }
 
+.settings-source-page {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.subdomain-api-form {
+  margin-top: 4px;
+}
+
 .serverless-proxy-form {
   margin-top: 4px;
 }

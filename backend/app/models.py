@@ -334,11 +334,39 @@ class ManualProxyView(BaseModel):
     updated_at: datetime
 
 
+class SubdomainApiSettingsView(BaseModel):
+    fofa_email: str = ""
+    has_fofa_key: bool = False
+    has_hunter_key: bool = False
+    updated_at: datetime | None = None
+
+
+class SubdomainApiSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    fofa_email: str = Field(default="", max_length=320)
+    fofa_key: str | None = Field(default=None, max_length=2000)
+    hunter_key: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("fofa_email")
+    @classmethod
+    def strip_email(cls, value: str) -> str:
+        return str(value or "").strip()
+
+    @field_validator("fofa_key", "hunter_key")
+    @classmethod
+    def strip_secret(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return str(value).strip() or None
+
+
 class SettingsResponse(BaseModel):
     sessions: list[ProviderSessionView]
     serverless_proxy: ServerlessProxyView
     manual_proxies: list[ManualProxyView] = Field(default_factory=list)
     proxy_pool: Literal["cloud", "manual", "direct"] = "cloud"
+    subdomain_api: SubdomainApiSettingsView = Field(default_factory=SubdomainApiSettingsView)
 
 
 class ProxyPoolRequest(BaseModel):

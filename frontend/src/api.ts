@@ -15,6 +15,7 @@ import type {
   ServerlessProxyValues,
   SessionProviderId,
   SettingsView,
+  SubdomainApiValues,
   IcpDomainRun,
   SubdomainOptions,
   SubdomainResult,
@@ -141,6 +142,12 @@ export const deleteRuns = (ids: string[]) =>
 
 export const getSettings = () => api<SettingsView>('/api/v1/settings')
 
+export const saveSubdomainApi = (values: SubdomainApiValues) =>
+  api<SettingsView>('/api/v1/settings/subdomain-api', {
+    method: 'PUT',
+    body: JSON.stringify(values),
+  })
+
 export const saveProxyPool = (proxyPool: 'cloud' | 'manual' | 'direct') =>
   api<SettingsView>('/api/v1/settings/proxy-pool', {
     method: 'PUT',
@@ -229,8 +236,13 @@ export const listSubdomainRuns = (page = 1, pageSize = 20) => {
 export const getSubdomainRun = (runId: string) =>
   api<SubdomainRun>(`/api/v1/subdomain-runs/${runId}`)
 
-export const getSubdomainResults = (runId: string, limit = 2000, afterId?: number) => {
-  const query = new URLSearchParams({ limit: String(limit), offset: '0' })
+export const getSubdomainResults = (
+  runId: string,
+  limit = 200,
+  afterId?: number,
+  offset = 0,
+) => {
+  const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
   if (afterId !== undefined) query.set('after_id', String(afterId))
   return api<SubdomainResults>(`/api/v1/subdomain-runs/${runId}/results?${query.toString()}`)
 }

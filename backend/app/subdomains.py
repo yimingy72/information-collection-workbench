@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import ipaddress
@@ -11,6 +12,7 @@ import ssl
 import string
 import time
 from dataclasses import dataclass
+from functools import partial
 from html.parser import HTMLParser
 from typing import Any, Awaitable, Callable
 from urllib.parse import urljoin, urlsplit
@@ -28,6 +30,7 @@ SOURCE_COOLDOWN_WAIT_SECONDS = 8.0
 PROGRESS_INTERVAL_SECONDS = 0.4
 PROGRESS_BATCH_SIZE = 25
 INSPECTION_BATCH_SIZE = 500
+PERSIST_BATCH_SIZE = 80
 DNS_CONCURRENCY = 64
 HTTP_CONCURRENCY = 20
 # Run a few root domains concurrently. DNS/HTTP semaphores below still cap
@@ -40,6 +43,10 @@ MAX_CANDIDATES_PER_DOMAIN = 10_000
 ALTDNS_CANDIDATE_LIMIT = 400
 COMMON_CRAWL_RESULT_LIMIT = 1_000
 WAYBACK_RESULT_LIMIT = 2_000
+FOFA_MAX_PAGES = 3
+FOFA_PAGE_SIZE = 1000
+HUNTER_MAX_PAGES = 5
+HUNTER_PAGE_SIZE = 100
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
 HOST_REFERENCE_RE = re.compile(
     r"(?<![a-z0-9-])(?:https?://|//)?((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})(?![a-z0-9-])",
@@ -148,6 +155,10 @@ def _candidate(value: str, root: str) -> str | None:
         return None
     if "://" in raw:
         raw = urlsplit(raw).hostname or ""
+    elif raw.count(":") == 1:
+        host, port = raw.rsplit(":", 1)
+        if port.isdigit():
+            raw = host
     raw = raw.strip(".*.")
     try:
         host = raw.encode("idna").decode("ascii")
@@ -535,6 +546,103 @@ async def collect_threatminer(client: httpx.AsyncClient, domain: str) -> set[str
     return found
 
 
+async def collect_fofa(
+    client: httpx.AsyncClient,
+    domain: str,
+    *,
+    email: str,
+    key: str,
+) -> set[str]:
+    email = email.strip()
+    key = key.strip()
+    if not email or not key:
+        raise SubdomainError("未配置 FOFA API")
+    query = base64.b64encode(f'domain="{domain}"'.encode("utf-8")).decode("ascii")
+    found: set[str] = set()
+    for page in range(1, FOFA_MAX_PAGES + 1):
+        response = await client.get(
+            "https://fofa.info/api/v1/search/all",
+            params={
+                "email": email,
+                "key": key,
+                "qbase64": query,
+                "page": str(page),
+                "full": "true",
+                "size": str(FOFA_PAGE_SIZE),
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise SubdomainError("FOFA 返回格式异常")
+        if data.get("error"):
+            raise SubdomainError(str(data.get("errmsg") or "FOFA 查询失败")[:300])
+        results = data.get("results")
+        page_hosts: set[str] = set()
+        for item in results if isinstance(results, list) else []:
+            page_hosts.update(_hosts_from_payload(item, domain))
+        found.update(page_hosts)
+        size = int(data.get("size") or 0)
+        if (
+            not results
+            or not page_hosts
+            or page * FOFA_PAGE_SIZE >= size
+            or (isinstance(results, list) and len(results) < FOFA_PAGE_SIZE)
+        ):
+            break
+        if page < FOFA_MAX_PAGES:
+            await asyncio.sleep(1.0)
+    return found
+
+
+async def collect_hunter(
+    client: httpx.AsyncClient,
+    domain: str,
+    *,
+    key: str,
+) -> set[str]:
+    key = key.strip()
+    if not key:
+        raise SubdomainError("未配置 Hunter API")
+    query = base64.b64encode(f'domain_suffix="{domain}"'.encode("utf-8")).decode("ascii")
+    found: set[str] = set()
+    for page in range(1, HUNTER_MAX_PAGES + 1):
+        response = await client.get(
+            "https://hunter.qianxin.com/openApi/search",
+            params={
+                "api-key": key,
+                "search": query,
+                "page": str(page),
+                "page_size": str(HUNTER_PAGE_SIZE),
+                "is_web": "1",
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            raise SubdomainError("Hunter 返回格式异常")
+        code = int(data.get("code") or 0)
+        if code != 200:
+            raise SubdomainError(str(data.get("message") or f"Hunter 查询失败（{code}）")[:300])
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        records = payload.get("arr") if isinstance(payload, dict) else None
+        page_hosts: set[str] = set()
+        for item in records if isinstance(records, list) else []:
+            page_hosts.update(_hosts_from_payload(item, domain))
+        found.update(page_hosts)
+        total = int((payload or {}).get("total") or 0)
+        if (
+            not records
+            or not page_hosts
+            or page * HUNTER_PAGE_SIZE >= total
+            or (isinstance(records, list) and len(records) < HUNTER_PAGE_SIZE)
+        ):
+            break
+        if page < HUNTER_MAX_PAGES:
+            await asyncio.sleep(1.0)
+    return found
+
+
 PASSIVE_SOURCES = (
     ("crt.sh", "collect_crtsh"),
     ("CertSpotter", "collect_certspotter"),
@@ -565,6 +673,8 @@ SOURCE_MIN_INTERVALS = {
     "SRV记录": 0.15,
     "站点元数据": 0.5,
     "Common Crawl": 1.2,
+    "FOFA": 1.0,
+    "Hunter": 1.0,
 }
 
 
@@ -927,10 +1037,12 @@ async def collect_subdomains(
         async with progress_lock:
             processed += 1
 
-    async def increment_discovered() -> None:
+    async def increment_discovered(count: int = 1) -> None:
         nonlocal discovered
+        if count <= 0:
+            return
         async with progress_lock:
-            discovered += 1
+            discovered += count
 
     passive_timeout = httpx.Timeout(
         PASSIVE_TIMEOUT, connect=8.0, read=PASSIVE_TIMEOUT, write=10.0, pool=5.0
@@ -970,6 +1082,10 @@ async def collect_subdomains(
         except Exception:  # noqa: BLE001 - proxy fallback is optional
             proxy_routes = []
         fallback_proxy = next((value for value in proxy_routes if value), "")
+        api_settings = runtime_config.get("subdomain_api") or {}
+        fofa_email = str(api_settings.get("fofa_email") or "").strip()
+        fofa_key = str(api_settings.get("fofa_key") or "").strip()
+        hunter_key = str(api_settings.get("hunter_key") or "").strip()
         passive_proxy_client = (
             httpx.AsyncClient(
                 proxy=fallback_proxy,
@@ -996,23 +1112,97 @@ async def collect_subdomains(
                             resolved_cache[hostname] = await resolve_hostname(hostname)
                     return resolved_cache[hostname]
 
-                passive_tasks = [
-                    asyncio.create_task(
-                        _call_source(
-                            repo,
-                            source_name,
-                            globals()[function_name],
-                            passive_client,
-                            root,
-                            fallback_client=passive_proxy_client,
+                passive_tasks = []
+                if passive_enabled:
+                    for source_name, function_name in PASSIVE_SOURCES:
+                        passive_tasks.append(
+                            asyncio.create_task(
+                                _call_source(
+                                    repo,
+                                    source_name,
+                                    globals()[function_name],
+                                    passive_client,
+                                    root,
+                                    fallback_client=passive_proxy_client,
+                                )
+                            )
                         )
-                    )
-                    for source_name, function_name in PASSIVE_SOURCES
-                ] if passive_enabled else []
+                    if fofa_email and fofa_key:
+                        passive_tasks.append(
+                            asyncio.create_task(
+                                _call_source(
+                                    repo,
+                                    "FOFA",
+                                    partial(collect_fofa, email=fofa_email, key=fofa_key),
+                                    passive_client,
+                                    root,
+                                    fallback_client=passive_proxy_client,
+                                )
+                            )
+                        )
+                    if hunter_key:
+                        passive_tasks.append(
+                            asyncio.create_task(
+                                _call_source(
+                                    repo,
+                                    "Hunter",
+                                    partial(collect_hunter, key=hunter_key),
+                                    passive_client,
+                                    root,
+                                    fallback_client=passive_proxy_client,
+                                )
+                            )
+                        )
                 wildcard_task = (
                     asyncio.create_task(_wildcard_ips(root))
                     if passive_enabled or brute_enabled else None
                 )
+
+                pending_rows: list[dict[str, Any]] = []
+                persist_lock = asyncio.Lock()
+
+                def _merge_pending_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                    merged: dict[str, dict[str, Any]] = {}
+                    for item in rows:
+                        current = merged.get(item["hostname"])
+                        if current is None:
+                            merged[item["hostname"]] = dict(item)
+                            continue
+                        if item["ips"]:
+                            current["ips"] = item["ips"]
+                        if item["canonical_name"]:
+                            current["canonical_name"] = item["canonical_name"]
+                        current["wildcard"] = item["wildcard"]
+                        if item["http_url"]:
+                            current["http_url"] = item["http_url"]
+                        if item["http_status"] is not None:
+                            current["http_status"] = item["http_status"]
+                        if item["title"]:
+                            current["title"] = item["title"]
+                        current["sources"] = sorted(
+                            set(current["sources"]) | set(item["sources"])
+                        )
+                    return list(merged.values())
+
+                async def _flush_rows(rows: list[dict[str, Any]]) -> None:
+                    rows = _merge_pending_rows(rows)
+                    if not rows:
+                        return
+                    batch_fn = getattr(repo, "add_subdomain_results", None)
+                    if batch_fn is not None:
+                        inserted = await batch_fn(run_id, rows)
+                    else:
+                        inserted = 0
+                        for item in rows:
+                            if await repo.add_subdomain_result(run_id, **item):
+                                inserted += 1
+                    await increment_discovered(inserted)
+
+                async def flush_persist() -> None:
+                    async with persist_lock:
+                        rows = pending_rows[:]
+                        pending_rows.clear()
+                    await _flush_rows(rows)
 
                 async def persist(
                     resolved: ResolvedHost, probe: HttpProbe, wildcard_ips: set[str]
@@ -1024,20 +1214,24 @@ async def collect_subdomains(
                     passive_sources = sources[host] - {"DNS字典", "AltDNS"}
                     if is_wildcard and not passive_sources:
                         return
-                    inserted = await repo.add_subdomain_result(
-                        run_id,
-                        root_domain=root,
-                        hostname=host,
-                        ips=resolved.ips,
-                        canonical_name=resolved.canonical_name,
-                        wildcard=is_wildcard,
-                        http_url=probe.url,
-                        http_status=probe.status,
-                        title=probe.title,
-                        sources=sorted(sources[host]),
-                    )
-                    if inserted:
-                        await increment_discovered()
+                    row = {
+                        "root_domain": root,
+                        "hostname": host,
+                        "ips": resolved.ips,
+                        "canonical_name": resolved.canonical_name,
+                        "wildcard": is_wildcard,
+                        "http_url": probe.url,
+                        "http_status": probe.status,
+                        "title": probe.title,
+                        "sources": sorted(sources[host]),
+                    }
+                    async with persist_lock:
+                        pending_rows.append(row)
+                        if len(pending_rows) < PERSIST_BATCH_SIZE:
+                            return
+                        rows = pending_rows[:]
+                        pending_rows.clear()
+                    await _flush_rows(rows)
 
                 async def merge_inspected(
                     candidates: set[str], wildcard_ips: set[str]
@@ -1046,6 +1240,7 @@ async def collect_subdomains(
                         resolved, probe = inspected[host]
                         if resolved:
                             await persist(resolved, probe, wildcard_ips)
+                    await flush_persist()
 
                 async def inspect_many(
                     candidates: list[str], wildcard_ips: set[str]
@@ -1070,47 +1265,73 @@ async def collect_subdomains(
                         pending = pending[INSPECTION_BATCH_SIZE:]
                         await report_progress("resolving", force=True)
 
-                        async def inspect(
+                        async def resolve_one(
                             hostname: str,
-                        ) -> tuple[str, ResolvedHost | None, HttpProbe]:
-                            resolved = await resolve_cached(hostname)
-                            if not resolved:
-                                return hostname, None, HttpProbe()
-                            # Persist DNS before HTTP enrichment. A slow or
-                            # blocked web server must not hide a valid DNS hit.
-                            await persist(resolved, HttpProbe(), wildcard_ips)
-                            if not http_enabled:
-                                return hostname, resolved, HttpProbe()
-                            is_wildcard = bool(
-                                wildcard_ips and set(resolved.ips).issubset(wildcard_ips)
-                            )
-                            # Dictionary-only wildcard hits are not persisted.
-                            # Skip HTTP too: probing thousands of identical
-                            # wildcard answers dominates large ICP batches.
-                            if is_wildcard and not (sources.get(hostname, set()) - {"DNS字典", "AltDNS"}):
-                                return hostname, resolved, HttpProbe()
-                            async with http_semaphore:
-                                probe = await probe_http(probe_client, resolved, root)
-                            return hostname, resolved, probe
+                        ) -> tuple[str, ResolvedHost | None]:
+                            return hostname, await resolve_cached(hostname)
 
-                        tasks = [asyncio.create_task(inspect(host)) for host in batch]
-                        newly_discovered: set[str] = set()
+                        resolve_tasks = [
+                            asyncio.create_task(resolve_one(host)) for host in batch
+                        ]
+                        resolved_hits: list[tuple[str, ResolvedHost]] = []
                         try:
-                            for task in asyncio.as_completed(tasks):
-                                host, resolved, probe = await task
-                                inspected[host] = (resolved, probe)
+                            for task in asyncio.as_completed(resolve_tasks):
+                                host, resolved = await task
+                                inspected[host] = (resolved, HttpProbe())
                                 if resolved:
+                                    resolved_hits.append((host, resolved))
+                                    await persist(resolved, HttpProbe(), wildcard_ips)
+                                await report_progress("resolving")
+                        finally:
+                            for task in resolve_tasks:
+                                if not task.done():
+                                    task.cancel()
+                            await asyncio.gather(*resolve_tasks, return_exceptions=True)
+                        # Write DNS hits before HTTP so a slow site cannot hide
+                        # already-resolved hostnames from the live result stream.
+                        await flush_persist()
+
+                        newly_discovered: set[str] = set()
+                        if http_enabled:
+                            http_targets: list[tuple[str, ResolvedHost]] = []
+                            for host, resolved in resolved_hits:
+                                is_wildcard = bool(
+                                    wildcard_ips and set(resolved.ips).issubset(wildcard_ips)
+                                )
+                                if is_wildcard and not (
+                                    sources.get(host, set()) - {"DNS字典", "AltDNS"}
+                                ):
+                                    continue
+                                http_targets.append((host, resolved))
+
+                            async def probe_one(
+                                hostname: str, resolved: ResolvedHost
+                            ) -> tuple[str, ResolvedHost, HttpProbe]:
+                                async with http_semaphore:
+                                    probe = await probe_http(probe_client, resolved, root)
+                                return hostname, resolved, probe
+
+                            probe_tasks = [
+                                asyncio.create_task(probe_one(host, resolved))
+                                for host, resolved in http_targets
+                            ]
+                            try:
+                                for task in asyncio.as_completed(probe_tasks):
+                                    host, resolved, probe = await task
+                                    inspected[host] = (resolved, probe)
                                     if probe.url or probe.status is not None or probe.title:
                                         await persist(resolved, probe, wildcard_ips)
                                     for found_host in probe.discovered:
                                         sources.setdefault(found_host, set()).add("页面内容")
                                         newly_discovered.add(found_host)
-                                await report_progress(phase)
-                        finally:
-                            for task in tasks:
-                                if not task.done():
-                                    task.cancel()
-                            await asyncio.gather(*tasks, return_exceptions=True)
+                                    await report_progress(phase)
+                            finally:
+                                for task in probe_tasks:
+                                    if not task.done():
+                                        task.cancel()
+                                await asyncio.gather(*probe_tasks, return_exceptions=True)
+                            await flush_persist()
+
                         pending.extend(
                             sorted(host for host in newly_discovered if host not in inspected)
                         )
@@ -1144,6 +1365,7 @@ async def collect_subdomains(
                                 sources.setdefault(host, set()).add("AltDNS")
                             await inspect_many(sorted(altdns_hosts), wildcard_ips)
                 finally:
+                    await flush_persist()
                     for task in passive_tasks:
                         if not task.done():
                             task.cancel()

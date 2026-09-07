@@ -42,6 +42,7 @@
 
 - 多个主域名以最多 `ROOT_CONCURRENCY=5` 个根任务并发处理；总 DNS 并发和 HTTP 并发仍分别受 `DNS_CONCURRENCY`、`HTTP_CONCURRENCY` 限制，避免把单域名优化成全局洪峰。纯字典命中的泛解析结果会跳过 HTTP 探测。
 - `subdomain_source_cache` 缓存被动来源；数据库结果使用 `(run_id, root_domain, hostname)` 去重。
+- `subdomain_api_settings` 保存可选的 FOFA / Hunter 密钥；采集时仅在密钥存在时调用对应接口。
 - 被动来源先走容器直连；遇到连接/超时、403、429 或 5xx 时，若已配置并验证手动代理或 SeaMoon 路由，则立即通过代理重试，不等待下一轮。DNS 解析和发现主机的 HTTP 探测不自动改走该兜底代理。
 - CertSpotter 的分页 `Link` 既支持绝对地址也支持相对地址，会先解析为完整 URL，避免第二页出现 `unknown url type`。
 - `027_subdomain_result_stream.sql` 为结果增加单调递增变更游标，避免“先展示 DNS、后补充 HTTP”时前端长期看不到更新。
