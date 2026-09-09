@@ -1,0 +1,25 @@
+# YMICP (ICP_Query) with workbench patches applied at build time.
+# Upstream: third_party/ICP_Query (HG-ha/ICP_Query, Python image layout).
+FROM python:3.12-slim
+
+WORKDIR /icp_Api
+
+COPY third_party/ICP_Query/src/python/ /icp_Api/
+COPY third_party/ICP_Query/config.yml /icp_Api/config.yml
+COPY third_party/ICP_Query/templates/ /icp_Api/templates/
+COPY third_party/ICP_Query/static/ /icp_Api/static/
+COPY scripts/ymicp_jsl.py /icp_Api/ymicp_jsl.py
+COPY scripts/ymicp_patched.py /icp_Api/ymicp.py
+COPY scripts/query_routes_patched.py /icp_Api/routes/query_routes.py
+COPY scripts/batch_routes_patched.py /icp_Api/routes/batch_routes.py
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc python3-dev \
+    && pip install --no-cache-dir -r requirements.txt quickjs \
+    && apt-get purge -y gcc python3-dev \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && sed -i 's/retry_times: 10/retry_times: 3/' /icp_Api/config.yml
+
+EXPOSE 16181
+CMD ["python3", "icpApi.py"]

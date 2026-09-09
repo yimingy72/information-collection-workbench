@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { App as AntdApp, ConfigProvider, Form } from 'antd'
+import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { App as AntdApp, ConfigProvider, Form, Spin } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import {
   cancelCollectionRun,
@@ -7,15 +7,13 @@ import {
   createCollectionRun,
   deleteRuns,
   getQuery,
+  getRun,
   getSettings,
   saveProxyPool,
   listRuns,
 } from './api'
 import { AppShell } from './components/AppShell'
 import { CollectionPage } from './pages/CollectionPage'
-import { SettingsPage } from './pages/SettingsPage'
-import { SubdomainPage } from './pages/SubdomainPage'
-import { TasksPage } from './pages/TasksPage'
 import { sourceTags } from './formatters'
 import { workbenchTheme } from './theme'
 import type {
@@ -30,6 +28,16 @@ import type {
 } from './types'
 import { PROVIDER_OPTIONS, SESSION_PROVIDERS } from './types'
 import './styles.css'
+
+const SettingsPage = lazy(() => import('./pages/SettingsPage').then((module) => ({
+  default: module.SettingsPage,
+})))
+const SubdomainPage = lazy(() => import('./pages/SubdomainPage').then((module) => ({
+  default: module.SubdomainPage,
+})))
+const TasksPage = lazy(() => import('./pages/TasksPage').then((module) => ({
+  default: module.TasksPage,
+})))
 
 const terminalStatuses = new Set(['succeeded', 'partial', 'failed', 'cancelled'])
 
@@ -71,9 +79,40 @@ const icpKey = (row: IcpRow) =>
 const mergeIcpRecords = (current: IcpRow[], incoming: IcpRow[]) => {
   if (!incoming.length) return current
   const rows = new Map(current.map((item) => [icpKey(item), item]))
-  const before = rows.size
-  incoming.forEach((item) => rows.set(icpKey(item), item))
-  return rows.size === before ? current : [...rows.values()]
+  let changed = false
+  incoming.forEach((item) => {
+    const key = icpKey(item)
+    const existing = rows.get(key)
+    if (!existing) {
+      rows.set(key, item)
+      changed = true
+      return
+    }
+    const merged: IcpRow = {
+      ...existing,
+      ...item,
+      unit_name: item.unit_name || existing.unit_name,
+      main_licence: item.main_licence || existing.main_licence,
+      service_licence: item.service_licence || existing.service_licence,
+      domain: item.domain || existing.domain,
+      nature_name: item.nature_name || existing.nature_name,
+      update_time: item.update_time || existing.update_time,
+      source: sourceTags(`${existing.source}、${item.source}`).join('、'),
+    }
+    if (
+      merged.unit_name !== existing.unit_name
+      || merged.main_licence !== existing.main_licence
+      || merged.service_licence !== existing.service_licence
+      || merged.domain !== existing.domain
+      || merged.nature_name !== existing.nature_name
+      || merged.update_time !== existing.update_time
+      || merged.source !== existing.source
+    ) {
+      rows.set(key, merged)
+      changed = true
+    }
+  })
+  return changed ? [...rows.values()] : current
 }
 
 function Workbench({
@@ -223,12 +262,8 @@ function Workbench({
               if (!current || current.run.id !== id) return finalView
               return {
                 ...finalView,
-                investments: current.investments.length >= finalView.investments.length
-                  ? current.investments
-                  : finalView.investments,
-                icp_records: current.icp_records.length >= finalView.icp_records.length
-                  ? current.icp_records
-                  : finalView.icp_records,
+                investments: mergeInvestments(current.investments, finalView.investments),
+                icp_records: mergeIcpRecords(current.icp_records, finalView.icp_records),
               }
             })
             if (finalView.source_errors.length && finalView.run.status !== 'cancelled') {
@@ -239,11 +274,13 @@ function Workbench({
         void refreshRecents()
       })
       source.onerror = () => {
-        // EventSource reconnects automatically. Refresh only the lightweight
-        // run/snapshot on transport recovery rather than polling all rows.
-        void getQuery(id)
-          .then((next) => {
-            if (!cancelled) setQuery(next)
+        // EventSource reconnects automatically. Refresh only the run summary;
+        // the full snapshot is intentionally reserved for the final event.
+        void getRun(id)
+          .then((run) => {
+            if (cancelled) return
+            setQuery((current) => current?.run.id === id ? { ...current, run } : current)
+            setQuerying(!terminalStatuses.has(run.status))
           })
           .catch(() => undefined)
       }
@@ -375,7 +412,15 @@ function Workbench({
       onNavigate={go}
       onDarkChange={onDarkChange}
     >
-      {content}
+      <Suspense
+        fallback={(
+          <div style={{ minHeight: 240, display: 'grid', placeItems: 'center' }}>
+            <Spin />
+          </div>
+        )}
+      >
+        {content}
+      </Suspense>
     </AppShell>
   )
 }

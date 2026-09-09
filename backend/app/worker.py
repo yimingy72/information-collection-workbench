@@ -129,7 +129,8 @@ async def subdomain_worker_loop(repo: Repository) -> None:
             # Optional public sources failing (429/timeout/network) is expected.
             # Keep those notes on the run, but only mark partial when nothing
             # resolvable was found after every discovery method finished.
-            status = "succeeded" if discovered or not warnings else "partial"
+            incomplete = any("[结果不完整]" in warning for warning in warnings)
+            status = "succeeded" if not incomplete and (discovered or not warnings) else "partial"
             await repo.finish_subdomain_run(
                 run_id, status, warnings, None,
                 lease_id=lease_id,
@@ -141,8 +142,9 @@ async def subdomain_worker_loop(repo: Repository) -> None:
         except Exception as exc:  # noqa: BLE001 - persist failure for UI/history
             log.exception("subdomain run %s failed", run_id)
             try:
+                discovered = await repo.subdomain_result_count(run_id)
                 await repo.finish_subdomain_run(
-                    run_id, "failed", [], str(exc), lease_id=lease_id
+                    run_id, "partial" if discovered else "failed", [], str(exc), lease_id=lease_id
                 )
             except LeaseLost:
                 log.warning("lost lease while finishing subdomain run %s", run_id)

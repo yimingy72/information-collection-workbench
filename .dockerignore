@@ -10,3 +10,6 @@ frontend/dist
 .impeccable
 .DS_Store
 backend/.ruff_cache
+third_party/ICP_Query/.git
+third_party/ICP_Query/src/rust
+third_party/ICP_Query/model_data

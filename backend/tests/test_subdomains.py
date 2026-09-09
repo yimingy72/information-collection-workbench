@@ -182,6 +182,248 @@ class FakeRepo:
         return inserted
 
 
+class FastRepo(FakeRepo):
+    def __init__(self):
+        super().__init__()
+        self.by_host = {}
+
+    async def add_subdomain_results(self, run_id, rows):
+        before = len(self.by_host)
+        for row in rows:
+            prior = self.by_host.setdefault(row["hostname"], {})
+            prior.update({key: value for key, value in row.items() if value not in ("", None, [])})
+        return len(self.by_host) - before
+
+
+@pytest.mark.asyncio
+async def test_every_observed_candidate_above_ten_thousand_is_verified(monkeypatch):
+    hosts = {f"p{i:05d}.example.com" for i in range(10_021)}
+    seen = []
+
+    async def source(*args, **kwargs):
+        return "fixture", hosts, ""
+
+    async def wildcard(*args):
+        return set()
+
+    async def resolve(host):
+        seen.append(host)
+        return ResolvedHost(host, ["93.184.216.34"])
+
+    monkeypatch.setattr(subdomains, "PASSIVE_SOURCES", (("fixture", "collect_crtsh"),))
+    monkeypatch.setattr(subdomains, "_call_source", source)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", wildcard)
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    repo = FastRepo()
+    warnings = await subdomains.collect_subdomains(
+        repo, uuid4(), ["example.com"], {"passive": True, "brute_force": False, "http_probe": False}, lease_id=uuid4()
+    )
+    assert warnings == []
+    assert len(seen) == len(hosts)
+    assert set(repo.by_host) == hosts
+
+
+@pytest.mark.asyncio
+async def test_slow_http_does_not_block_dns_after_the_old_batch_boundary(monkeypatch):
+    import asyncio
+    reached_tail = asyncio.Event()
+    release_http = asyncio.Event()
+    hosts = {f"p{i:04d}.example.com" for i in range(601)}
+
+    async def source(*args, **kwargs):
+        return "fixture", hosts, ""
+
+    async def wildcard(*args):
+        return set()
+
+    async def resolve(host):
+        if host == "p0600.example.com":
+            reached_tail.set()
+        return ResolvedHost(host, ["93.184.216.34"])
+
+    async def probe(client, resolved, root):
+        if resolved.hostname == "p0000.example.com":
+            await release_http.wait()
+        return HttpProbe(f"https://{resolved.hostname}/", 200)
+
+    monkeypatch.setattr(subdomains, "PASSIVE_SOURCES", (("fixture", "collect_crtsh"),))
+    monkeypatch.setattr(subdomains, "_call_source", source)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", wildcard)
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    monkeypatch.setattr(subdomains, "probe_http", probe)
+    repo = FastRepo()
+    task = asyncio.create_task(subdomains.collect_subdomains(
+        repo, uuid4(), ["example.com"], {"passive": True, "brute_force": False}, lease_id=uuid4()
+    ))
+    try:
+        await asyncio.wait_for(reached_tail.wait(), 2)
+        assert not task.done()
+    finally:
+        release_http.set()
+        await task
+    assert set(repo.by_host) == hosts
+    assert all(row["http_status"] == 200 for row in repo.by_host.values())
+
+
+@pytest.mark.asyncio
+async def test_source_limit_preserves_hosts_without_creating_complete_cache():
+    repo = FakeRepo()
+
+    async def source(*args):
+        raise subdomains.IncompleteSource({"api.example.com"}, "more pages remain")
+
+    async with httpx.AsyncClient() as client:
+        name, hosts, error = await subdomains._call_source(repo, "limited", source, client, "example.com")
+    assert hosts == {"api.example.com"}
+    assert "[结果不完整]" in error
+    assert repo.cache == {}
+
+
+@pytest.mark.asyncio
+async def test_legacy_source_cache_is_not_treated_as_complete():
+    repo = FakeRepo()
+    repo.cache[("example.com", "legacy")] = ["old.example.com"]
+
+    async def source(*args):
+        return {"fresh.example.com"}
+
+    async with httpx.AsyncClient() as client:
+        _, hosts, _ = await subdomains._call_source(repo, "legacy", source, client, "example.com")
+    assert hosts == {"fresh.example.com"}
+
+
+@pytest.mark.asyncio
+async def test_429_never_uses_proxy_fallback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(subdomains, "SOURCE_THROTTLE", subdomains._SourceThrottle())
+
+    async def source(client, domain):
+        calls.append(client)
+        response = httpx.Response(429, request=httpx.Request("GET", "https://example.test"))
+        response.raise_for_status()
+
+    async with httpx.AsyncClient() as direct, httpx.AsyncClient() as proxy:
+        _, _, error = await subdomains._call_source(FakeRepo(), "fixture", source, direct, "example.com", fallback_client=proxy)
+        assert calls == [direct]
+        assert "429" in error
+
+
+@pytest.mark.asyncio
+async def test_srv_targets_are_filtered_against_root_domain():
+    def handler(request):
+        return httpx.Response(200, json={"Answer": [{"data": "0 5 5060 sip.example.com."}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await subdomains.collect_srv_records(client, "example.com") == {"sip.example.com"}
+
+
+@pytest.mark.asyncio
+async def test_temporary_dns_failure_is_retried_and_not_negative_cached(monkeypatch):
+    import socket
+    calls = 0
+
+    def lookup(*args):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise socket.gaierror(socket.EAI_AGAIN, "temporary")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+
+    monkeypatch.setattr(subdomains.socket, "getaddrinfo", lookup)
+    assert (await subdomains.resolve_hostname("api.example.com")).ips == ["93.184.216.34"]
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_persistent_dns_failure_is_distinct_from_nxdomain(monkeypatch):
+    import socket
+
+    def failed(*args):
+        raise socket.gaierror(socket.EAI_AGAIN, "temporary")
+
+    monkeypatch.setattr(subdomains.socket, "getaddrinfo", failed)
+    with pytest.raises(subdomains.DNSLookupError):
+        await subdomains.resolve_hostname("api.example.com")
+
+    def missing(*args):
+        raise socket.gaierror(socket.EAI_NONAME, "not found")
+
+    monkeypatch.setattr(subdomains.socket, "getaddrinfo", missing)
+    assert await subdomains.resolve_hostname("missing.example.com") is None
+
+
+@pytest.mark.asyncio
+async def test_dns_executor_queue_time_does_not_consume_response_timeout(monkeypatch):
+    import asyncio
+    import socket
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    release = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    executor.submit(release.wait)
+    monkeypatch.setattr(subdomains, "_DNS_EXECUTOR", executor)
+    monkeypatch.setattr(subdomains, "DNS_TIMEOUT", 0.01)
+    monkeypatch.setattr(subdomains.socket, "getaddrinfo", lambda *args: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))
+    ])
+    task = asyncio.create_task(subdomains.resolve_hostname("queued.example.com"))
+    try:
+        await asyncio.sleep(0.03)
+        assert not task.done()
+        release.set()
+        assert (await asyncio.wait_for(task, 1)).hostname == "queued.example.com"
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        executor.shutdown(wait=True)
+
+
+@pytest.mark.asyncio
+async def test_completion_waits_for_periodic_flush_already_in_flight(monkeypatch):
+    import asyncio
+    write_started = asyncio.Event()
+    probe_finished = asyncio.Event()
+    release_write = asyncio.Event()
+
+    class SlowRepo(FastRepo):
+        async def add_subdomain_results(self, run_id, rows):
+            write_started.set()
+            await release_write.wait()
+            return await super().add_subdomain_results(run_id, rows)
+
+    async def wildcard(root):
+        return set()
+
+    async def resolve(host):
+        return ResolvedHost(host, ["93.184.216.34"])
+
+    async def probe(*args):
+        await write_started.wait()
+        probe_finished.set()
+        return HttpProbe()
+
+    monkeypatch.setattr(subdomains, "COMMON_PREFIXES", ("api",))
+    monkeypatch.setattr(subdomains, "PROGRESS_INTERVAL_SECONDS", 0.005)
+    monkeypatch.setattr(subdomains, "_wildcard_ips", wildcard)
+    monkeypatch.setattr(subdomains, "resolve_hostname", resolve)
+    monkeypatch.setattr(subdomains, "probe_http", probe)
+    repo = SlowRepo()
+    task = asyncio.create_task(subdomains.collect_subdomains(
+        repo, uuid4(), ["example.com"], {"passive": False, "brute_force": True}, lease_id=uuid4()
+    ))
+    try:
+        await asyncio.wait_for(probe_finished.wait(), 1)
+        await asyncio.sleep(0.01)
+        assert not task.done()
+        release_write.set()
+        assert await asyncio.wait_for(task, 1) == []
+        assert set(repo.by_host) == {"api.example.com"}
+    finally:
+        release_write.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.mark.asyncio
 async def test_collection_streams_resolved_results_and_filters_dictionary_wildcard(monkeypatch):
     async def crt(_client, _domain):
@@ -276,7 +518,7 @@ async def test_passive_source_failure_is_warning_not_fatal(monkeypatch):
 @pytest.mark.asyncio
 async def test_passive_source_cache_avoids_duplicate_external_request():
     repo = FakeRepo()
-    repo.cache[("example.com", "cached")] = ["api.example.com"]
+    repo.cache[("example.com", f"{subdomains.SOURCE_CACHE_VERSION}:cached")] = ["api.example.com"]
     called = False
 
     async def source(_client, _domain):
@@ -375,7 +617,7 @@ async def test_passive_source_retries_once_before_warning(monkeypatch):
 
     assert (name, hosts, error) == ("flaky", {"api.example.com"}, "")
     assert attempts == 2
-    assert repo.cache[("example.com", "flaky")] == ["api.example.com"]
+    assert repo.cache[("example.com", f"{subdomains.SOURCE_CACHE_VERSION}:flaky")] == ["api.example.com"]
 
 
 @pytest.mark.asyncio

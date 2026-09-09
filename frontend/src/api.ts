@@ -19,6 +19,8 @@ import type {
   IcpDomainRun,
   SubdomainOptions,
   SubdomainResult,
+  SubdomainResultCounts,
+  SubdomainResultView,
   SubdomainResults,
   SubdomainRun,
   SubdomainRunList,
@@ -241,9 +243,13 @@ export const getSubdomainResults = (
   limit = 200,
   afterId?: number,
   offset = 0,
+  keyword = '',
+  view: SubdomainResultView = 'all',
 ) => {
   const query = new URLSearchParams({ limit: String(limit), offset: String(offset) })
   if (afterId !== undefined) query.set('after_id', String(afterId))
+  if (keyword.trim()) query.set('keyword', keyword.trim())
+  if (view !== 'all') query.set('view', view)
   return api<SubdomainResults>(`/api/v1/subdomain-runs/${runId}/results?${query.toString()}`)
 }
 
@@ -251,15 +257,17 @@ export const getAllSubdomainResults = async (runId: string) => {
   const items: SubdomainResult[] = []
   let cursor = 0
   let total = 0
+  let counts: SubdomainResultCounts = { all: 0, web: 0, wildcard: 0 }
   while (true) {
     const response = await getSubdomainResults(runId, 2000, cursor)
     total = response.total
+    counts = response.counts
     if (!response.items.length) break
     items.push(...response.items)
     cursor = response.items.reduce((value, item) => Math.max(value, item.id), cursor)
     if (response.items.length < 2000 && items.length >= total) break
   }
-  return { run_id: runId, items, total } satisfies SubdomainResults
+  return { run_id: runId, items, total, counts } satisfies SubdomainResults
 }
 
 export const deleteSubdomainRun = (runId: string) =>

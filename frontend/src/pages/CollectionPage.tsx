@@ -16,10 +16,12 @@ import {
   Typography,
 } from 'antd'
 import type { FormInstance } from 'antd'
-import { exportQuery } from '../export'
 import { StatusTag } from '../components/StatusTag'
 import { formatDuration } from '../formatters'
-import { QueryResultsPanel } from '../components/QueryResultsPanel'
+import {
+  DeferredQueryResultsPanel,
+  preloadQueryResultsPanel,
+} from '../components/DeferredQueryResultsPanel'
 import type { CollectionValues, ProviderId, QueryView, Run, SettingsView } from '../types'
 import { PROVIDER_OPTIONS } from '../types'
 
@@ -156,6 +158,11 @@ export function CollectionPage({
   savingProxyPool?: boolean
 }) {
   const { message } = App.useApp()
+
+  useEffect(() => {
+    if (loading || query) void preloadQueryResultsPanel()
+  }, [loading, query?.run.id])
+
   const cloudReady = Boolean(
     settings?.serverless_proxy.status === 'ready'
     || settings?.serverless_proxy.nodes.some((item) => item.status === 'ready' && item.endpoint),
@@ -294,7 +301,11 @@ export function CollectionPage({
               <Button
                 icon={<DownloadOutlined />}
                 disabled={!query.investments.length && !query.icp_records.length}
-                onClick={() => exportQuery(query)}
+                onClick={() => {
+                  void import('../export')
+                    .then(({ exportQuery }) => exportQuery(query))
+                    .catch(() => message.error('导出组件加载失败'))
+                }}
               >
                 导出 Excel
               </Button>
@@ -307,7 +318,7 @@ export function CollectionPage({
           <Alert type="warning" showIcon title={query.source_errors.join('；')} style={{ marginBottom: 16 }} />
         ) : null}
         {query ? (
-          <QueryResultsPanel query={query} loading={loading && !query} />
+          <DeferredQueryResultsPanel query={query} loading={loading && !query} />
         ) : (
           <Empty
             image={Empty.PRESENTED_IMAGE_SIMPLE}

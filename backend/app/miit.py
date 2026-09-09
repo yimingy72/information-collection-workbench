@@ -9,11 +9,11 @@ from uuid import UUID, uuid4
 
 import httpx
 
+from app.concurrency import supervise
 from app.repository import Repository
 from app.serverless_proxy import manual_proxy_urls, miit_proxy_urls, pool_nodes, selected_proxy_pool
 from app.settings import settings
 
-MAX_PAGES = 50
 # YMICP's own implementation documents 26 as the maximum reliable page size.
 # Larger values are silently normalized upstream and can destabilize pagination.
 PAGE_SIZE = 26
@@ -89,6 +89,15 @@ def _collection_lock() -> asyncio.Lock:
 
 class IcpPageError(RuntimeError):
     """An ICP page request failed."""
+
+
+class IcpRateLimited(IcpPageError):
+    def __init__(self, delay: float = 60.0) -> None:
+        super().__init__("HTTP 429：ICP 请求频率受限，本轮暂停实时请求")
+        self.delay = min(900.0, max(1.0, delay))
+
+
+_icp_cooldowns: WeakKeyDictionary = WeakKeyDictionary()
 
 
 class _IcpCloudRotationScheduler:
@@ -304,6 +313,7 @@ class CompanyFailure:
     error: str
     elapsed_seconds: float
     company_attempts: int = 1
+    retryable: bool = True
 
 
 def _clean(value: Any) -> str:
@@ -318,6 +328,12 @@ def _icp_reason(data: Any, fallback: str = "ICP 接口异常") -> str:
 
 def _http_error(response: httpx.Response) -> IcpPageError:
     status = response.status_code
+    if status == 429:
+        try:
+            delay = float(response.headers.get("retry-after", "60"))
+        except ValueError:
+            delay = 60.0
+        return IcpRateLimited(delay)
     if status == 521:
         return IcpPageError("HTTP 521：上游 Web 服务不可用")
     return IcpPageError(f"HTTP {status}")
@@ -381,7 +397,9 @@ async def _fetch_page(
                 raise IcpPageError("ICP JSON 分页字段无效") from exc
             total_value = payload.get("total")
             try:
-                total = max(0, int(total_value)) if total_value is not None else None
+                total = int(total_value) if total_value is not None else None
+                if total is not None and total < 0:
+                    raise ValueError("negative total")
             except (TypeError, ValueError) as exc:
                 raise IcpPageError("ICP JSON 总数字段无效") from exc
             return {"rows": rows, "pages": pages, "total": total}
@@ -663,9 +681,10 @@ def _failure(
     started: float,
     attempted_pages: int,
     error: str,
+    *, retryable: bool = True,
 ) -> CompanyFailure:
     elapsed = max(0.0, asyncio.get_running_loop().time() - started)
-    return CompanyFailure(name, attempted_pages, error, elapsed)
+    return CompanyFailure(name, attempted_pages, error, elapsed, retryable=retryable)
 
 
 async def _run_company_round(
@@ -772,20 +791,25 @@ async def _collect_icp_from_queue(
 
     async def collect_company_once(name: str, client: httpx.AsyncClient) -> CompanyFailure | None:
         started = asyncio.get_running_loop().time()
+        if _icp_cooldowns.get(asyncio.get_running_loop(), 0.0) > started:
+            return _failure(name, started, 0, str(IcpRateLimited()), retryable=False)
         budget_started: float | None = None
         attempted_pages = 0
         expected_total: int | None = None
         aggregate_rows: dict[tuple[str, ...], dict[str, Any]] = {}
         last_incomplete_reason = ""
+        saved_complete = False
 
         def remaining_budget() -> float:
             origin = budget_started if budget_started is not None else asyncio.get_running_loop().time()
             return ICP_COMPANY_TIMEOUT_SECONDS - (asyncio.get_running_loop().time() - origin)
 
         async def save_complete_result() -> None:
+            nonlocal saved_complete
             complete_rows = list(aggregate_rows.values())
             await _save_icp_page(repo, run_id, name, complete_rows, set())
             await _store_icp_cache(repo, name, complete_rows, expected_total)
+            saved_complete = True
 
         try:
             async with asyncio.timeout(ICP_COMPANY_TIMEOUT_SECONDS):
@@ -806,7 +830,7 @@ async def _collect_icp_from_queue(
                     held_route_proxy = route_proxy
                     held_route_index: int | None = None
                     held_generation: int | None = None
-                    while page <= min(total_pages, MAX_PAGES):
+                    while page <= total_pages:
                         fetch_options: dict[str, Any] = {
                             "timeout_seconds": ICP_PAGE_TIMEOUT_SECONDS,
                             "session_key": session_key,
@@ -868,10 +892,21 @@ async def _collect_icp_from_queue(
                                     )
                                     fetch_options["session_key"] = f"lane_{suffix}"
                             attempted_pages += 1
+                            loop = asyncio.get_running_loop()
+                            remaining_cooldown = _icp_cooldowns.get(loop, 0.0) - loop.time()
+                            if remaining_cooldown > 0:
+                                attempted_pages -= 1
+                                raise IcpRateLimited(remaining_cooldown)
                             chunk = await _fetch_page(client, name, page, **fetch_options)
                             if budget_started is None:
                                 budget_started = asyncio.get_running_loop().time()
                         except IcpPageError as exc:
+                            if isinstance(exc, IcpRateLimited):
+                                loop = asyncio.get_running_loop()
+                                _icp_cooldowns[loop] = max(
+                                    _icp_cooldowns.get(loop, 0.0), loop.time() + exc.delay
+                                )
+                                return _failure(name, started, attempted_pages, str(exc), retryable=False)
                             detail = str(exc)
                             waf_hit = "创宇盾" in detail
                             timeout_hit = "超时" in detail
@@ -948,13 +983,6 @@ async def _collect_icp_from_queue(
                         if pass_pages is None:
                             pass_pages = reported_pages
                             total_pages = reported_pages
-                            if total_pages > MAX_PAGES:
-                                return _failure(
-                                    name,
-                                    started,
-                                    attempted_pages,
-                                    f"上游报告 {total_pages} 页，超过安全上限 {MAX_PAGES} 页",
-                                )
                         elif reported_pages != pass_pages:
                             inconsistent = True
                             last_incomplete_reason = (
@@ -989,8 +1017,7 @@ async def _collect_icp_from_queue(
                         page += 1
 
                     if not inconsistent and expected_total is None:
-                        await save_complete_result()
-                        return None
+                        return _failure(name, started, attempted_pages, "上游未返回 total，无法确认结果完整")
 
                     if not last_incomplete_reason:
                         last_incomplete_reason = (
@@ -1023,6 +1050,11 @@ async def _collect_icp_from_queue(
             )
         except Exception as exc:  # noqa: BLE001 - isolate one enterprise
             return _failure(name, started, attempted_pages, str(exc) or "ICP 查询失败")
+        finally:
+            if aggregate_rows and not saved_complete:
+                # Partial rows remain visible, but never enter the complete
+                # company cache. Database uniqueness makes retries idempotent.
+                await _save_icp_page(repo, run_id, name, list(aggregate_rows.values()), set())
 
     try:
         async with httpx.AsyncClient(
@@ -1059,7 +1091,7 @@ async def _collect_icp_from_queue(
                         attempted_pages[name] = attempted_pages.get(name, 0) + outcome.attempted_pages
                         elapsed_seconds[name] = elapsed_seconds.get(name, 0.0) + outcome.elapsed_seconds
                         last_failures[name] = outcome
-                        if attempt_counts[name] < ICP_COMPANY_MAX_ATTEMPTS:
+                        if outcome.retryable and attempt_counts[name] < ICP_COMPANY_MAX_ATTEMPTS:
                             delay = ICP_COMPANY_RETRY_BACKOFF_SECONDS * attempt_counts[name]
                             if delay:
                                 await asyncio.sleep(delay)
@@ -1095,15 +1127,8 @@ async def _collect_icp_from_queue(
                         elapsed_seconds.setdefault(name, 0.0)
                         await queue.put(name)
                 await queue.join()
-                for _ in workers:
-                    await queue.put(None)
 
-            workers = [
-                asyncio.create_task(worker())
-                for _ in range(max(1, batch_size))
-            ]
-            await ingest()
-            await asyncio.gather(*workers)
+            await supervise(ingest(), [worker() for _ in range(max(1, batch_size))])
 
             failed: list[CompanyFailure] = []
             for name in live_names:

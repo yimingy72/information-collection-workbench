@@ -35,9 +35,17 @@ import { TableFrame } from '../components/TableFrame'
 import { exportSubdomains } from '../export'
 import { formatDate, formatDuration } from '../formatters'
 import { TABLE_PAGE_SIZE, usePagedData } from '../pagination'
-import type { IcpDomainRun, SubdomainOptions, SubdomainResult, SubdomainRun } from '../types'
+import type {
+  IcpDomainRun,
+  SubdomainOptions,
+  SubdomainResult,
+  SubdomainResultCounts,
+  SubdomainResultView,
+  SubdomainRun,
+} from '../types'
 
 const terminalStatuses = new Set(['succeeded', 'partial', 'failed', 'cancelled'])
+const emptyResultCounts = (): SubdomainResultCounts => ({ all: 0, web: 0, wildcard: 0 })
 const phaseLabels: Record<string, string> = {
   queued: '等待执行',
   collecting: '被动数据源收集',
@@ -119,17 +127,22 @@ export function SubdomainPage({
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [resultTotal, setResultTotal] = useState(0)
+  const [serverResultCounts, setServerResultCounts] = useState<SubdomainResultCounts>(emptyResultCounts)
   const [submitting, setSubmitting] = useState(false)
   const [resultKeyword, setResultKeyword] = useState('')
   const deferredResultKeyword = useDeferredValue(resultKeyword)
-  const [resultView, setResultView] = useState<'all' | 'web' | 'wildcard'>('all')
+  const [resultView, setResultView] = useState<SubdomainResultView>('all')
   const [resultPage, setResultPage] = useState(1)
   const [resultPageSize, setResultPageSize] = useState(TABLE_PAGE_SIZE)
   const [pageLoading, setPageLoading] = useState(false)
   const eventSourceRef = useRef<EventSource | null>(null)
 
   const results = useMemo(() => [...resultsByIdRef.current.values()], [resultsVersion])
-  const replaceResults = (items: SubdomainResult[], total?: number) => {
+  const replaceResults = (
+    items: SubdomainResult[],
+    total?: number,
+    counts?: SubdomainResultCounts,
+  ) => {
     resultsByIdRef.current = new Map(items.map((item) => [item.id, item]))
     pendingResultsRef.current = []
     if (resultFlushRef.current !== null) {
@@ -137,6 +150,7 @@ export function SubdomainPage({
       resultFlushRef.current = null
     }
     if (total !== undefined) setResultTotal(total)
+    if (counts) setServerResultCounts(counts)
     setResultsVersion((value) => value + 1)
   }
   const queueResult = (item: SubdomainResult) => {
@@ -158,11 +172,13 @@ export function SubdomainPage({
   }, [icpRuns, selectedIcpRunIds])
 
   const sortedResults = useMemo(() => [...results].sort((a, b) => b.id - a.id), [results])
-  const resultCounts = useMemo(() => ({
+  const localResultCounts = useMemo(() => ({
     all: Math.max(resultTotal, results.length, run?.discovered ?? 0),
     web: results.filter((row) => Boolean(row.http_status)).length,
     wildcard: results.filter((row) => row.wildcard).length,
   }), [resultTotal, results, run?.discovered])
+  const serverPaged = Boolean(run && terminalStatuses.has(run.status))
+  const resultCounts = serverPaged ? serverResultCounts : localResultCounts
   const filteredResults = useMemo(() => {
     const keyword = deferredResultKeyword.trim().toLowerCase()
     return sortedResults.filter((row) => {
@@ -173,13 +189,6 @@ export function SubdomainPage({
         .some((value) => String(value || '').toLowerCase().includes(keyword))
     })
   }, [deferredResultKeyword, resultView, sortedResults])
-  const serverPaged = Boolean(
-    run
-    && terminalStatuses.has(run.status)
-    && resultTotal > results.length
-    && !deferredResultKeyword.trim()
-    && resultView === 'all',
-  )
   const clientPaged = usePagedData(filteredResults, `${run?.id ?? ''}:${deferredResultKeyword}:${resultView}`)
   const paged = serverPaged
     ? {
@@ -189,18 +198,8 @@ export function SubdomainPage({
           pageSize: resultPageSize,
           total: resultTotal,
           onChange: (nextPage: number, nextSize: number) => {
-            if (!runId) return
-            const page = nextSize !== resultPageSize ? 1 : nextPage
-            const size = nextSize
-            setResultPage(page)
-            setResultPageSize(size)
-            setPageLoading(true)
-            void getSubdomainResults(runId, size, undefined, (page - 1) * size)
-              .then((response) => {
-                replaceResults(response.items, response.total)
-              })
-              .catch((error) => message.error(error instanceof Error ? error.message : '无法加载子域名结果'))
-              .finally(() => setPageLoading(false))
+            setResultPage(nextSize !== resultPageSize ? 1 : nextPage)
+            setResultPageSize(nextSize)
           },
         },
       }
@@ -270,7 +269,7 @@ export function SubdomainPage({
     setResultPage(1)
     if (!runId) {
       setRun(null)
-      replaceResults([], 0)
+      replaceResults([], 0, emptyResultCounts())
       return
     }
 
@@ -280,7 +279,7 @@ export function SubdomainPage({
       .then(([nextRun, response]) => {
         if (cancelled) return
         setRun(nextRun)
-        replaceResults(response.items, response.total)
+        replaceResults(response.items, response.total, response.counts)
         setRecentRuns((current) => [
           nextRun,
           ...current.filter((item) => item.id !== nextRun.id),
@@ -326,6 +325,34 @@ export function SubdomainPage({
     }
   }, [runId])
 
+  useEffect(() => {
+    if (!runId || !run || !terminalStatuses.has(run.status)) return
+    let cancelled = false
+    setPageLoading(true)
+    void getSubdomainResults(
+      runId,
+      resultPageSize,
+      undefined,
+      (resultPage - 1) * resultPageSize,
+      deferredResultKeyword,
+      resultView,
+    )
+      .then((response) => {
+        if (!cancelled) replaceResults(response.items, response.total, response.counts)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          message.error(error instanceof Error ? error.message : '无法加载子域名结果')
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPageLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [runId, run?.status, resultPage, resultPageSize, deferredResultKeyword, resultView])
+
   useEffect(() => () => {
     if (resultFlushRef.current !== null) window.clearTimeout(resultFlushRef.current)
   }, [])
@@ -348,7 +375,7 @@ export function SubdomainPage({
         options,
       })
       setRun(created)
-      replaceResults([], 0)
+      replaceResults([], 0, emptyResultCounts())
       onOpenRun(created.id)
       await refreshRecent()
     } catch (error) {
@@ -580,20 +607,28 @@ export function SubdomainPage({
                 allowClear
                 value={resultKeyword}
                 placeholder="筛选子域名、IP、CNAME 或标题"
-                onChange={(event) => setResultKeyword(event.target.value)}
+                onChange={(event) => {
+                  setResultKeyword(event.target.value)
+                  setResultPage(1)
+                }}
               />
               <Space className="subdomain-result-filter-group" size={10}>
                 <Segmented
                   size="small"
                   value={resultView}
-                  onChange={(value) => setResultView(value as 'all' | 'web' | 'wildcard')}
+                  onChange={(value) => {
+                    setResultView(value as SubdomainResultView)
+                    setResultPage(1)
+                  }}
                   options={[
                     { label: `全部 ${resultCounts.all}`, value: 'all' },
                     { label: `网站可访问 ${resultCounts.web}`, value: 'web' },
                     { label: `泛解析 ${resultCounts.wildcard}`, value: 'wildcard' },
                   ]}
                 />
-                <Typography.Text type="secondary">已加载 {results.length} / {resultCounts.all} 条</Typography.Text>
+                <Typography.Text type="secondary">
+                  已加载 {results.length} / {serverPaged ? resultTotal : resultCounts.all} 条
+                </Typography.Text>
               </Space>
             </Flex>
             <TableFrame pagination={paged.pagination}>

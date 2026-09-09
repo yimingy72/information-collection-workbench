@@ -1,10 +1,86 @@
 from __future__ import annotations
 
 from uuid import uuid4
+import asyncio
 
 import pytest
 
 from app import miit
+
+
+@pytest.mark.asyncio
+async def test_missing_total_keeps_rows_but_never_succeeds_or_caches(monkeypatch):
+    async def fetch(*args, **kwargs):
+        return {"rows": [icp_row()], "pages": 1, "total": None}
+
+    monkeypatch.setattr(miit, "_fetch_page", fetch)
+    monkeypatch.setattr(miit, "ICP_COMPANY_MAX_ATTEMPTS", 1)
+    repo = CacheRepo()
+    errors = await miit._collect_icp(repo, uuid4(), ["示例公司"])
+    assert "未返回 total" in errors[0]
+    assert len(repo.results) == 1
+    assert not repo.cache_writes
+
+
+@pytest.mark.asyncio
+async def test_icp_reads_beyond_fifty_pages_within_existing_budget(monkeypatch):
+    async def fetch(client, name, page, **kwargs):
+        return {"rows": [icp_row(f"p{page}.example.com", str(page))], "pages": 51, "total": 51}
+
+    monkeypatch.setattr(miit, "_fetch_page", fetch)
+    monkeypatch.setattr(miit, "ICP_DIRECT_REQUEST_GAP_SECONDS", 0)
+    monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
+    repo = CacheRepo()
+    assert await miit._collect_icp(repo, uuid4(), ["示例公司"]) == []
+    assert len(repo.results) == 51
+    assert repo.cache_writes[0][2] == 51
+
+
+@pytest.mark.asyncio
+async def test_icp_cancellation_stops_all_page_workers(monkeypatch):
+    started = asyncio.Event()
+    active = 0
+
+    async def fetch(*args, **kwargs):
+        nonlocal active
+        active += 1
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(miit, "_fetch_page", fetch)
+    task = asyncio.create_task(miit._collect_icp(CacheRepo(), uuid4(), ["示例公司"]))
+    await asyncio.wait_for(started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_icp_429_does_not_rotate_or_retry_and_pauses_other_companies(monkeypatch):
+    calls = []
+
+    class Repo(CacheRepo):
+        async def get_runtime_config(self):
+            return {"serverless_proxy": {"enabled": True, "endpoint": "https://example.test"}}
+
+    async def fetch(client, keyword, page, **kwargs):
+        calls.append(keyword)
+        raise miit.IcpRateLimited()
+
+    async def rotate(*args, **kwargs):
+        raise AssertionError("ICP 429 must not rotate sessions")
+
+    monkeypatch.setattr(miit, "_fetch_page", fetch)
+    monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
+    monkeypatch.setattr(miit._IcpProxyPoolScheduler, "rotate", rotate)
+    errors = await asyncio.wait_for(miit._collect_icp(Repo(), uuid4(), ["A", "B"]), 1)
+    assert calls == ["A"]
+    assert "HTTP 429" in errors[0]
+    assert "企业尝试 1 次" in errors[0]
 
 
 def icp_row(domain: str = "example.com", licence: str = "京ICP备1号") -> dict:

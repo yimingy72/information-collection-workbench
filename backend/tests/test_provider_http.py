@@ -1,10 +1,42 @@
 import json
+import asyncio
 
 import httpx
 import pytest
 
 import app.providers.tianyancha as tianyancha
 from app.providers.tianyancha import AnonymousTianyancha
+
+
+@pytest.mark.asyncio
+async def test_tianyancha_retired_client_closes_when_last_request_finishes(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request):
+        started.set()
+        await release.wait()
+        return httpx.Response(200, json={"state": "ok"})
+
+    provider = AnonymousTianyancha("https://example.test", proxy="http://proxy.test:8080")
+    await provider.client.aclose()
+    old = httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(handler))
+    provider.client = old
+    new = httpx.AsyncClient(base_url="https://example.test", transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(provider, "_make_client", lambda: new)
+    task = asyncio.create_task(provider._request("GET", "/page"))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await provider._rotate_proxy()
+        assert not old.is_closed
+        release.set()
+        assert await task == {"state": "ok"}
+        assert old.is_closed
+        assert provider._retired_clients == []
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await provider.close()
 
 
 @pytest.mark.asyncio

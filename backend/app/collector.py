@@ -4,6 +4,8 @@ import asyncio
 from dataclasses import dataclass, field
 from uuid import UUID
 
+from app.concurrency import drain_queue, gather_cancel_on_error
+from app.providers.pagination import IncompletePagination
 from app.miit import collect_icp, collect_icp_from_queue
 from app.settings import settings
 from app.providers.names import provider_label
@@ -163,7 +165,15 @@ async def _collect_icp_as_entities_are_discovered(
 
     try:
         while True:
+            done_before_read = producers_done.is_set()
+            entity_changed.clear()
             since = getattr(repo, "entity_names_since", None)
+            # Sequence IDs are assigned before commit. A slow transaction can
+            # commit below a cursor already observed from a faster writer.
+            # Reconcile once against the authoritative set after all writers
+            # finish; running discovery still uses cheap incremental reads.
+            if done_before_read and getattr(repo, "entity_names_for_run", None) is not None:
+                since = None
             if since is not None:
                 new_names, name_rel_cursor, name_res_cursor = await since(
                     spec.id, name_rel_cursor, name_res_cursor
@@ -186,6 +196,10 @@ async def _collect_icp_as_entities_are_discovered(
                 await start_collector(discovered_count)
                 await feed(pending)
             if producers_done.is_set():
+                if not done_before_read:
+                    # The last producer may have committed while the snapshot
+                    # was being read. Drain once after all producers finish.
+                    continue
                 remaining = [name for name in pending if name not in seen]
                 if collector_task is None and remaining:
                     await start_collector(discovered_count)
@@ -216,7 +230,6 @@ async def _collect_icp_as_entities_are_discovered(
                                 errors.append(detail)
                 return errors
 
-            entity_changed.clear()
             change_task = asyncio.create_task(entity_changed.wait())
             done_task = asyncio.create_task(producers_done.wait())
             try:
@@ -254,6 +267,8 @@ async def collect_run(
         label = _provider_label(provider)
         try:
             return await _collect_one(repo, provider, spec, entity_changed)
+        except LeaseLost:
+            raise
         except Exception as exc:  # noqa: BLE001 - surface per-source failure
             return [f"{label}：{exc}"]
 
@@ -275,7 +290,7 @@ async def collect_run(
                 repo, spec, producers_done, entity_changed
             )
         )
-        return await asyncio.gather(
+        return await gather_cancel_on_error(
             *(run_provider(provider) for provider in providers)
         )
 
@@ -329,65 +344,47 @@ async def _collect_one(
     if entity_changed is not None:
         entity_changed.set()
 
-    queue: asyncio.Queue[tuple[Company, UUID, int] | None] = asyncio.Queue()
-    await queue.put((selected, root_id, 0))
-    queued: set[str] = {f"{provider_id}:{selected.external_id}"}
-    completed: set[str] = set()
-    counted: set[str] = set()
-    retry_counts: dict[str, int] = {}
-    failed_company_retries = max(0, int(getattr(provider, "failed_company_retries", 0)))
+    # A level barrier preserves shortest-path depth. Letting fast branches
+    # run ahead could mark a company visited at the depth limit before its
+    # shorter path arrived, permanently dropping that company's descendants.
+    frontier: list[tuple[Company, UUID]] = [(selected, root_id)]
+    scheduled = {selected.external_id}
     processed = 0
     errors: list[str] = []
-    state_lock = asyncio.Lock()
     workers = max(1, min(INVEST_CONCURRENCY, 24))
+    failed_company_retries = max(0, int(getattr(provider, "failed_company_retries", 0)))
+    next_frontier: list[tuple[Company, UUID]] = []
 
-    async def visit(company: Company, entity_id: UUID, level: int) -> None:
+    async def visit(item: tuple[Company, UUID]) -> None:
         nonlocal processed
-        visit_key = f"{provider_id}:{company.external_id}"
-        should_beat = False
-        async with state_lock:
-            queued.discard(visit_key)
-            if visit_key in completed:
-                return
-            if visit_key not in counted:
-                counted.add(visit_key)
-                processed += 1
-            current_processed = processed
-            should_beat = current_processed == 1 or current_processed % INVEST_HEARTBEAT_EVERY == 0
-        if should_beat:
+        company, entity_id = item
+        processed += 1
+        current_processed = processed
+        if current_processed == 1 or current_processed % INVEST_HEARTBEAT_EVERY == 0:
             await repo.heartbeat(spec.id, current_processed, lease_id=spec.lease_id)
-
         if "invest" not in spec.fields or level >= spec.depth:
-            async with state_lock:
-                completed.add(visit_key)
             return
-        try:
-            investments = await provider.all_pages(
-                lambda page, current=company: provider.investments(current.external_id, page)
-            )
-        except ProviderError as extra:
-            retry = False
-            retries = 0
-            async with state_lock:
-                retries = retry_counts.get(visit_key, 0)
-                if retries < failed_company_retries:
-                    retry_counts[visit_key] = retries + 1
-                    if visit_key not in queued:
-                        queued.add(visit_key)
-                        retry = True
-                else:
-                    completed.add(visit_key)
-                    retry_note = f"（失败企业已定向重试 {retries} 次）" if retries else ""
+        investments = []
+        for attempt in range(failed_company_retries + 1):
+            try:
+                investments = await provider.all_pages(
+                    lambda page: provider.investments(company.external_id, page)
+                )
+                break
+            except IncompletePagination as extra:
+                # The paginator already retried failed pages. Keep verified
+                # records and traverse their children while exposing the gap.
+                investments = extra.rows
+                errors.append(f"{source}：{company.name} {extra}")
+                break
+            except ProviderError as extra:
+                if attempt >= failed_company_retries or not extra.retryable:
+                    retry_note = f"（失败企业已定向重试 {attempt} 次）" if attempt else ""
                     errors.append(f"{source}：{company.name} {extra}{retry_note}")
-            if retry:
+                    return
                 reset = getattr(provider, "reset_after_failure", None)
                 if reset is not None:
                     await reset()
-                await queue.put((company, entity_id, level))
-            return
-
-        async with state_lock:
-            completed.add(visit_key)
 
         kept = [
             investment for investment in investments
@@ -437,30 +434,20 @@ async def _collect_one(
                 await repo.add_relationship(*row)
         if entity_changed is not None and queued_children:
             entity_changed.set()
-        async with state_lock:
-            for child, child_id in queued_children:
-                child_key = f"{provider_id}:{child.external_id}"
-                if child_key not in completed and child_key not in queued:
-                    queued.add(child_key)
-                    await queue.put((child, child_id, level + 1))
+        for child, child_id in queued_children:
+            if child.external_id not in scheduled:
+                scheduled.add(child.external_id)
+                next_frontier.append((child, child_id))
 
-    async def worker() -> None:
-        while True:
-            item = await queue.get()
-            try:
-                if item is None:
-                    return
-                await visit(*item)
-            finally:
-                queue.task_done()
-
-    tasks = [asyncio.create_task(worker()) for _ in range(workers)]
-    try:
-        await queue.join()
-    finally:
-        for _ in tasks:
-            await queue.put(None)
-        await asyncio.gather(*tasks, return_exceptions=True)
+    for level in range(spec.depth + 1):
+        if not frontier:
+            break
+        next_frontier = []
+        queue: asyncio.Queue[tuple[Company, UUID]] = asyncio.Queue()
+        for item in frontier:
+            queue.put_nowait(item)
+        await drain_queue(queue, visit, min(workers, len(frontier)))
+        frontier = next_frontier
 
     await repo.heartbeat(spec.id, processed, processed, lease_id=spec.lease_id)
     return errors

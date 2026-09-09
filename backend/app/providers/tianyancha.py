@@ -4,11 +4,13 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 from urllib.parse import quote
 
 import httpx
 
+
+from app.providers.pagination import ProviderError, ProviderRateLimited, all_pages, bounded_request, reported_total
 
 SEARCH_URL = "/cloud-tempest/web/searchCompanyV4"
 INVEST_URL = "/cloud-company-background/company/investListV2"
@@ -43,10 +45,6 @@ class Shareholder:
     name: str
     holding_percent: float | None
     payload: dict[str, Any]
-
-
-class ProviderError(RuntimeError):
-    pass
 
 
 def _provider_message(data: dict[str, Any] | None, fallback: str = "provider error") -> str:
@@ -94,6 +92,7 @@ class AnonymousTianyancha:
         self.client = self._make_client()
         self._client_lock = asyncio.Lock()
         self._retired_clients: list[httpx.AsyncClient] = []
+        self._client_users: dict[httpx.AsyncClient, int] = {}
         self.retries = max(0, retries)
         # After one query has exhausted its immediate attempts, the collector
         # retries only that failed company once at the end of the queue.
@@ -125,7 +124,11 @@ class AnonymousTianyancha:
             if len(self._proxy_routes) > 1:
                 self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
             self.client = self._make_client()
-            self._retired_clients.append(previous)
+            in_use = self._client_users.get(previous, 0) > 0
+            if in_use:
+                self._retired_clients.append(previous)
+        if not in_use:
+            await previous.aclose()
 
     async def close(self) -> None:
         async with self._client_lock:
@@ -138,13 +141,25 @@ class AnonymousTianyancha:
         """Open a fresh proxy tunnel before retrying only the failed company."""
         await self._rotate_proxy()
 
+    @bounded_request
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         attempts = max(1, self.retries + 1)
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
                 client = self.client
-                response = await client.request(method, path, **kwargs)
+                self._client_users[client] = self._client_users.get(client, 0) + 1
+                try:
+                    response = await client.request(method, path, **kwargs)
+                finally:
+                    self._client_users[client] -= 1
+                    if not self._client_users[client]:
+                        del self._client_users[client]
+                        if client in self._retired_clients:
+                            self._retired_clients.remove(client)
+                            await client.aclose()
+                if response.status_code == 429:
+                    raise ProviderRateLimited("天眼查请求频率受限 (HTTP 429)", response.headers.get("retry-after", "60"))
                 if response.status_code in {403, 429, 433, 500, 501, 502, 503, 504, 521}:
                     raise ProviderError(f"Tianyancha request rejected (HTTP {response.status_code})")
                 response.raise_for_status()
@@ -158,6 +173,8 @@ class AnonymousTianyancha:
                     raise ProviderError(_provider_message(data))
                 return data
             except (httpx.HTTPError, ValueError, ProviderError) as exc:
+                if isinstance(exc, ProviderRateLimited):
+                    raise
                 last_error = exc if isinstance(exc, ProviderError) else ProviderError(str(exc))
                 if attempt >= attempts - 1:
                     break
@@ -201,7 +218,7 @@ class AnonymousTianyancha:
         selected = next((item for item in candidates if normalize_name(item.name) == normalized), candidates[0])
         return selected, candidates
 
-    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int]:
+    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int | None]:
         data = await self._request(
             "POST",
             INVEST_URL,
@@ -228,7 +245,7 @@ class AnonymousTianyancha:
                 values.append(Investment(name, child_id, _number(row.get("percent")), row))
         return values, total
 
-    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int]:
+    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int | None]:
         data = await self._request(
             "POST",
             PARTNER_URL,
@@ -254,92 +271,13 @@ class AnonymousTianyancha:
                 values.append(Shareholder(name, _number(row.get("finalBenefitShares") or row.get("percent")), row))
         return values, total
 
-    async def all_pages(
-        self,
-        fetch: Callable[[int], Awaitable[tuple[list[Any], int]]],
-        page_size: int = 100,
-        max_pages: int = 50,
-    ) -> list[Any]:
-        rows: list[Any] = []
-        total = 0
-        page_size = max(1, int(page_size))
-        max_pages = max(1, int(max_pages))
-        first, reported_total = await fetch(1)
-        rows.extend(first)
-        total = max(total, int(reported_total or 0))
-        if total and len(rows) >= total:
-            return rows[:total]
-        if not first:
-            return rows
-        if len(first) < page_size and not total:
-            return rows
-        if total:
-            # Upstream may cap pageSize below the requested value. Use the
-            # first page's actual width so remaining pages are not dropped.
-            effective_size = max(1, len(first) or page_size)
-            page_count = min(max_pages, (total + effective_size - 1) // effective_size)
-            remaining = list(range(2, page_count + 1))
-            if remaining:
-                limit = asyncio.Semaphore(min(4, len(remaining)))
-
-                async def load(page: int) -> tuple[int, list[Any], int]:
-                    async with limit:
-                        chunk, reported = await fetch(page)
-                        return page, chunk, reported
-
-                async def load_pages(pages: list[int], *, retry: bool = True) -> None:
-                    nonlocal total
-                    missing: list[int] = []
-                    chunks = await asyncio.gather(
-                        *(load(page) for page in pages),
-                        return_exceptions=True,
-                    )
-                    last_error: BaseException | None = None
-                    for page, item in zip(pages, chunks, strict=True):
-                        if isinstance(item, BaseException):
-                            missing.append(page)
-                            last_error = item
-                            continue
-                        _page, chunk, reported = item
-                        rows.extend(chunk)
-                        total = max(total, int(reported or 0))
-                    if missing and last_error is not None and not (total and len(rows) >= total):
-                        if retry:
-                            return await load_pages(missing, retry=False)
-                        raise last_error
-
-                await load_pages(remaining)
-            if total and len(rows) >= total:
-                return rows[:total]
-            return rows[:total] if total else rows
-        for page in range(2, max_pages + 1):
-            # _request retries this exact query/page and rebuilds the proxy
-            # tunnel on a login-wall response. Successfully completed earlier
-            # pages remain in ``rows`` and are not requested again.
-            chunk, reported_total = await fetch(page)
-            rows.extend(chunk)
-            total = max(total, int(reported_total or 0))
-            if total and len(rows) >= total:
-                return rows[:total]
-            if not chunk:
-                return rows
-            if len(chunk) < page_size and not total:
-                return rows
-        raise ProviderError(f"Tianyancha pagination exceeded {max_pages} pages")
+    async def all_pages(self, fetch, page_size: int = 100, max_pages: int | None = None):
+        return await all_pages(fetch, label=self.label, page_size=page_size, max_pages=max_pages)
 
 
 
-def _first_int(value: Any, *keys: str) -> int:
-    if not isinstance(value, dict):
-        return len(value) if isinstance(value, list) else 0
-    for key in keys:
-        try:
-            number = int(value.get(key) or 0)
-        except (TypeError, ValueError):
-            continue
-        if number:
-            return number
-    return 0
+def _first_int(value: Any, *keys: str) -> int | None:
+    return reported_total(value, *keys) if isinstance(value, dict) else None
 
 
 def _number(value: Any) -> float | None:

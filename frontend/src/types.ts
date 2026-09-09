@@ -312,10 +312,15 @@ export type SubdomainResult = {
   discovered_at: string
 }
 
+export type SubdomainResultView = 'all' | 'web' | 'wildcard'
+
+export type SubdomainResultCounts = Record<SubdomainResultView, number>
+
 export type SubdomainResults = {
   run_id: string
   items: SubdomainResult[]
   total: number
+  counts: SubdomainResultCounts
 }
 
 export type IcpDomainRun = {

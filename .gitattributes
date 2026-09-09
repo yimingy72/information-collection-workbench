@@ -1,0 +1,2 @@
+# Preserve upstream source bytes and keep vendored files out of language statistics.
+third_party/ICP_Query/** linguist-vendored=true -whitespace

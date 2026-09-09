@@ -560,6 +560,7 @@ async def test_icp_direct_multi_page_saves_each_page_without_proxy_lookup(monkey
         return {
             "rows": [{"domain": f"{page}.example", "serviceLicence": str(page)}],
             "pages": 2,
+            "total": 2,
         }
 
     async def fake_save(_repo, _run_id, _name, page_rows, _seen):
@@ -745,7 +746,7 @@ async def test_icp_retries_an_incomplete_pagination_with_a_new_affinity_session(
 
 
 @pytest.mark.asyncio
-async def test_icp_incomplete_pagination_is_reported_and_not_saved(monkeypatch):
+async def test_icp_incomplete_pagination_is_reported_and_partial_rows_are_saved(monkeypatch):
     import app.miit as miit
 
     calls = []
@@ -782,7 +783,7 @@ async def test_icp_incomplete_pagination_is_reported_and_not_saved(monkeypatch):
     assert "仅获取 1 条" in errors[0]
     assert "结果不完整" in errors[0]
     assert len({key for key, _page in calls}) == 2
-    assert saved == []
+    assert saved[0][0][3] == [{"domain": "same.example", "serviceLicence": "A"}]
 
 
 @pytest.mark.asyncio
@@ -868,7 +869,7 @@ async def test_icp_serverless_proxy_is_forwarded_to_local_icp_service(monkeypatc
         _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
     ):
         calls.append((page, timeout_seconds, route_proxy, session_key))
-        return {"rows": [], "pages": 1}
+        return {"rows": [], "pages": 1, "total": 0}
 
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
     monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
@@ -928,8 +929,9 @@ async def test_icp_single_manual_proxy_uses_fresh_session_per_page(monkeypatch):
         _client, _keyword, page, timeout_seconds=10, route_proxy="", session_key=""
     ):
         calls.append((page, timeout_seconds, route_proxy, session_key))
-        return {"rows": [], "pages": 2}
+        return {"rows": [{"domain": f"{page}.example", "serviceLicence": str(page)}], "pages": 2, "total": 2}
 
+    monkeypatch.setattr(miit, "_save_icp_page", _no_icp)
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
 
     assert await miit.collect_icp(Repo(), uuid4(), ["测试企业"]) == []
@@ -1106,7 +1108,7 @@ async def test_icp_cloud_queries_use_five_slots_per_node(monkeypatch):
         calls.append((keyword, page, route_proxy))
         await asyncio.sleep(0.01)
         active -= 1
-        return {"rows": [], "pages": 1}
+        return {"rows": [], "pages": 1, "total": 0}
 
     monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
@@ -1133,7 +1135,7 @@ async def test_icp_direct_queries_keep_five_request_burst_and_gap(monkeypatch):
         _client, keyword, page, timeout_seconds=10, session_key=""
     ):
         started.append(keyword)
-        return {"rows": [], "pages": 1}
+        return {"rows": [], "pages": 1, "total": 0}
 
     monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
     monkeypatch.setattr(miit, "ICP_DIRECT_REQUEST_GAP_SECONDS", 0)
@@ -1205,7 +1207,7 @@ async def test_icp_cloud_reuses_session_key_after_five_actual_requests(monkeypat
         _client, keyword, page, timeout_seconds=10, route_proxy="", session_key=""
     ):
         calls.append((keyword, page, route_proxy, session_key))
-        return {"rows": [], "pages": 1}
+        return {"rows": [], "pages": 1, "total": 0}
 
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
     monkeypatch.setattr(miit, "ICP_BATCH_PAUSE_SECONDS", 0)
@@ -1232,7 +1234,7 @@ async def test_icp_cloud_waf_retries_current_page_after_rotating_session(monkeyp
         calls.append((page, route_proxy, session_key))
         if len(calls) == 1:
             raise miit.IcpPageError("当前访问已被创宇盾拦截")
-        return {"rows": [], "pages": 1}
+        return {"rows": [], "pages": 1, "total": 0}
 
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
@@ -1295,7 +1297,7 @@ async def test_icp_cloud_concurrent_waf_failover_does_not_deadlock(monkeypatch):
         calls.append((keyword, session_key))
         if session_key.endswith("_0"):
             raise miit.IcpPageError("当前访问已被创宇盾拦截")
-        return {"rows": [], "pages": 1}
+        return {"rows": [], "pages": 1, "total": 0}
 
     monkeypatch.setattr(miit, "_fetch_page", fake_fetch)
     monkeypatch.setattr(miit, "ICP_CONCURRENCY", 1)

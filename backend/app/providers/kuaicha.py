@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from app.providers.pagination import ProviderRateLimited, all_pages, bounded_request, reported_total
 from app.providers.tianyancha import (
     Company,
     Investment,
@@ -45,6 +46,7 @@ class AnonymousKuaicha:
     async def close(self) -> None:
         await self.client.aclose()
 
+    @bounded_request
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(2):
@@ -60,10 +62,7 @@ class AnonymousKuaicha:
             if response.status_code in {401, 403}:
                 raise ProviderError(f"快查拒绝访问 (HTTP {response.status_code})")
             if response.status_code == 429:
-                last_error = ProviderError("请求过于频繁，请稍候重试")
-                if attempt == 0:
-                    await asyncio.sleep(0.15)
-                continue
+                raise ProviderRateLimited("请求过于频繁，请稍候重试", response.headers.get("retry-after", "60"))
             try:
                 response.raise_for_status()
                 data = response.json()
@@ -105,7 +104,7 @@ class AnonymousKuaicha:
         selected = next((item for item in candidates if normalize_name(item.name) == normalize_name(keyword)), candidates[0])
         return selected, candidates
 
-    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int]:
+    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int | None]:
         data = await self._request(
             "GET",
             "/open/app/v1/pc_enterprise/invest_abroad/list",
@@ -121,9 +120,9 @@ class AnonymousKuaicha:
             child_id = str(row.get("frgn_invest_corp_id") or row.get("org_id") or "")
             if name and child_id:
                 values.append(Investment(name, child_id, _number(row.get("invest_ratio")), row))
-        return values, int(payload.get("total") or len(values))
+        return values, reported_total(payload, "total")
 
-    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int]:
+    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int | None]:
         data = await self._request(
             "GET",
             "/open/app/v1/pc_enterprise/shareholder/latest_announcement",
@@ -138,13 +137,7 @@ class AnonymousKuaicha:
             name = clean_text(str(row.get("shareholder_name") or row.get("name") or ""))
             if name:
                 values.append(Shareholder(name, _number(row.get("shareholding_ratio")), row))
-        return values, int(payload.get("total") or len(values))
+        return values, reported_total(payload, "total")
 
-    async def all_pages(self, fetch, page_size: int = 10, max_pages: int = 50):
-        rows: list = []
-        for page in range(1, max_pages + 1):
-            chunk, _ = await fetch(page)
-            rows.extend(chunk)
-            if len(chunk) < page_size:
-                return rows
-        raise ProviderError(f"快查分页超过 {max_pages} 页")
+    async def all_pages(self, fetch, page_size: int = 10, max_pages: int | None = None):
+        return await all_pages(fetch, label=self.label, page_size=page_size, max_pages=max_pages)

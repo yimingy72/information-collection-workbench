@@ -8,6 +8,37 @@ from app.providers.riskbird import AnonymousRiskbird
 from app.providers.tianyancha import ProviderError
 
 
+@pytest.mark.asyncio
+async def test_aiqicha_proxy_rotation_keeps_inflight_requests_alive(monkeypatch):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request):
+        started.set()
+        await release.wait()
+        return httpx.Response(200, json={"status": 0, "data": {}})
+
+    provider = AnonymousAiqicha(proxy="http://proxy.test:8080")
+    await provider.client.aclose()
+    old = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider.client = old
+    new = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(provider, "_make_client", lambda: new)
+    task = asyncio.create_task(provider._get("https://example.test/page"))
+    try:
+        await asyncio.wait_for(started.wait(), 1)
+        await provider._rotate_proxy_client()
+        assert not old.is_closed
+        release.set()
+        assert await task == {"status": 0, "data": {}}
+        assert old.is_closed
+        assert not new.is_closed
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await provider.close()
+
+
 def _no_auth(headers) -> None:
     lowered = {key.lower() for key in headers}
     assert "cookie" not in lowered

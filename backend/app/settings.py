@@ -1,3 +1,4 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -27,6 +28,8 @@ class Settings(BaseSettings):
     worker_poll_seconds: float = 1.0
     worker_lease_seconds: int = 120
     worker_concurrency: int = 2
+    provider_request_concurrency: int = Field(default=20, ge=1, le=64)
+    provider_page_concurrency: int = Field(default=4, ge=1, le=8)
     subdomain_worker_concurrency: int = 2
     database_pool_min_size: int = 2
     database_pool_max_size: int = 20

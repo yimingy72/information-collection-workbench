@@ -255,6 +255,7 @@ class SubdomainResultsResponse(BaseModel):
     run_id: UUID
     items: list[SubdomainResultItem]
     total: int
+    counts: dict[Literal["all", "web", "wildcard"], int] = Field(default_factory=dict)
 
 
 class IcpDomainRun(BaseModel):

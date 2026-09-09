@@ -206,6 +206,14 @@ body,
   place-items: center;
 }
 
+.query-results-loading {
+  flex: 1 1 0%;
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  color: var(--ant-color-text-secondary, #4b6663);
+}
+
 .task-toolbar,
 .fill-body > .ant-segmented,
 .fill-card > .ant-card-body > .ant-alert {

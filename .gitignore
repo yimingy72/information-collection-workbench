@@ -32,3 +32,6 @@ __pycache__/
 
 # Local frontend build used by Dockerfile.local
 .frontend-dist-local/
+
+# Nested clone metadata from HG-ha/ICP_Query
+third_party/ICP_Query/.git/

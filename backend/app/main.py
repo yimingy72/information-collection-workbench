@@ -5,20 +5,26 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, AsyncIterator
 from uuid import UUID
 from urllib.parse import unquote, urlsplit
 
 import httpx
 
 import asyncpg
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.collector import RunSpec, collect_run
+from app.event_hub import (
+    COLLECTION_EVENTS_CHANNEL,
+    SUBDOMAIN_EVENTS_CHANNEL,
+    EventSubscription,
+    PostgresEventHub,
+)
 from app.models import (
     CollectionRequest,
     IcpDomainRun,
@@ -78,6 +84,32 @@ from app.settings import settings
 from app.subdomains import normalize_domains, registrable_domain
 
 logger = logging.getLogger(__name__)
+
+
+def _collection_resume_cursors(
+    last_event_id: str | None,
+    relationship_cursor: int,
+    result_cursor: int,
+) -> tuple[int, int]:
+    if not last_event_id:
+        return relationship_cursor, result_cursor
+    try:
+        relationship, result = last_event_id.split(":", 1)
+        return (
+            max(relationship_cursor, int(relationship), 0),
+            max(result_cursor, int(result), 0),
+        )
+    except (TypeError, ValueError):
+        return relationship_cursor, result_cursor
+
+
+def _resume_cursor(last_event_id: str | None, cursor: int) -> int:
+    if not last_event_id:
+        return cursor
+    try:
+        return max(cursor, int(last_event_id), 0)
+    except (TypeError, ValueError):
+        return cursor
 
 
 class DeleteRunsRequest(BaseModel):
@@ -178,8 +210,31 @@ def settings_view(config: dict) -> SettingsResponse:
     )
 
 
+SSE_NOTIFICATION_TIMEOUT_SECONDS = 15.0
+SSE_POLL_FALLBACK_SECONDS = 0.75
+
 pool: asyncpg.Pool | None = None
 repo: Repository | None = None
+event_hub: PostgresEventHub | None = None
+
+
+@asynccontextmanager
+async def _subscribe_run_events(
+    channel: str, run_id: UUID
+) -> AsyncIterator[EventSubscription | None]:
+    hub = event_hub
+    if hub is None:
+        yield None
+        return
+    async with hub.subscribe(channel, run_id) as subscription:
+        yield subscription
+
+
+async def _wait_for_run_event(subscription: EventSubscription | None) -> None:
+    if subscription is None:
+        await asyncio.sleep(SSE_POLL_FALLBACK_SECONDS)
+        return
+    await subscription.wait(SSE_NOTIFICATION_TIMEOUT_SECONDS)
 
 
 def current_repo() -> Repository:
@@ -312,10 +367,20 @@ def frontend_dir() -> Path:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global pool, repo
-    pool = await create_pool(settings.database_url, min_size=settings.database_pool_min_size, max_size=settings.database_pool_max_size)
+    global pool, repo, event_hub
+    pool = await create_pool(
+        settings.database_url,
+        min_size=settings.database_pool_min_size,
+        max_size=settings.database_pool_max_size,
+    )
     repo = Repository(pool, Path(__file__).parent.parent / "migrations")
     await repo.migrate()
+    event_hub = PostgresEventHub(pool)
+    try:
+        await event_hub.start()
+    except Exception:  # noqa: BLE001 - SSE retains a polling fallback
+        logger.exception("PostgreSQL 事件监听启动失败，SSE 将回退为短轮询")
+        event_hub = None
     try:
         await configure_gateway_for_active_route(await repo.get_runtime_config())
     except ServerlessProxyError:
@@ -326,6 +391,10 @@ async def lifespan(_: FastAPI):
     finally:
         refresh_task.cancel()
         await asyncio.gather(refresh_task, return_exceptions=True)
+        hub = event_hub
+        event_hub = None
+        if hub is not None:
+            await hub.close()
         await pool.close()
         pool = None
         repo = None
@@ -585,72 +654,81 @@ async def stream_collection_results(
     run_id: UUID,
     relationship_cursor: int = Query(0, ge=0),
     result_cursor: int = Query(0, ge=0),
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
     store = current_repo()
     if await store.get_run(run_id) is None:
         raise HTTPException(404, "run not found")
+    resume_relationship_cursor, resume_result_cursor = _collection_resume_cursors(
+        last_event_id, relationship_cursor, result_cursor
+    )
 
     async def events():
-        rel_cursor = relationship_cursor
-        icp_cursor = result_cursor
+        rel_cursor = resume_relationship_cursor
+        icp_cursor = resume_result_cursor
         last_progress = ""
-        while True:
-            relationships, icp_results = await store.collection_events_after(
-                run_id, rel_cursor, icp_cursor, 1000
-            )
-            investments: list[dict[str, Any]] = []
-            icp_records: list[dict[str, Any]] = []
-            for item in relationships:
-                rel_cursor = max(rel_cursor, int(item["stream_seq"] or 0))
-                investments.append(
-                    InvestmentRow(
-                        parent_name=item["parent_name"],
-                        child_name=item["child_name"],
-                        holding_percent=item["holding_percent"],
-                        depth=item["depth"],
-                        source=_source_from(item["raw_payload"]),
-                    ).model_dump(mode="json")
+        # Subscribe before the first event query. A commit racing with that read
+        # either lands in the cursor query or leaves a queued wake-up signal.
+        async with _subscribe_run_events(
+            COLLECTION_EVENTS_CHANNEL, run_id
+        ) as subscription:
+            while True:
+                relationships, icp_results = await store.collection_events_after(
+                    run_id, rel_cursor, icp_cursor, 1000
                 )
-            for item in icp_results:
-                icp_cursor = max(icp_cursor, int(item["stream_seq"] or 0))
-                payload = item["payload"] or {}
-                icp_records.append(
-                    IcpRow(
-                        unit_name=payload.get("unit_name") or item["entity_name"],
-                        main_licence=payload.get("main_licence") or "",
-                        service_licence=payload.get("service_licence") or "",
-                        domain=payload.get("domain") or "",
-                        nature_name=payload.get("nature_name") or "",
-                        update_time=payload.get("update_time") or "",
-                        source=payload.get("source") or "ICP备案",
-                    ).model_dump(mode="json")
-                )
-            if investments or icp_records:
-                payload = json.dumps(
-                    {
-                        "relationship_cursor": rel_cursor,
-                        "result_cursor": icp_cursor,
-                        "investments": investments,
-                        "icp_records": icp_records,
-                    },
-                    ensure_ascii=False,
-                )
-                yield f"event: delta\ndata: {payload}\n\n"
+                investments: list[dict[str, Any]] = []
+                icp_records: list[dict[str, Any]] = []
+                for item in relationships:
+                    rel_cursor = max(rel_cursor, int(item["stream_seq"] or 0))
+                    investments.append(
+                        InvestmentRow(
+                            parent_name=item["parent_name"],
+                            child_name=item["child_name"],
+                            holding_percent=item["holding_percent"],
+                            depth=item["depth"],
+                            source=_source_from(item["raw_payload"]),
+                        ).model_dump(mode="json")
+                    )
+                for item in icp_results:
+                    icp_cursor = max(icp_cursor, int(item["stream_seq"] or 0))
+                    payload = item["payload"] or {}
+                    icp_records.append(
+                        IcpRow(
+                            unit_name=payload.get("unit_name") or item["entity_name"],
+                            main_licence=payload.get("main_licence") or "",
+                            service_licence=payload.get("service_licence") or "",
+                            domain=payload.get("domain") or "",
+                            nature_name=payload.get("nature_name") or "",
+                            update_time=payload.get("update_time") or "",
+                            source=payload.get("source") or "ICP备案",
+                        ).model_dump(mode="json")
+                    )
+                if investments or icp_records:
+                    payload = json.dumps(
+                        {
+                            "relationship_cursor": rel_cursor,
+                            "result_cursor": icp_cursor,
+                            "investments": investments,
+                            "icp_records": icp_records,
+                        },
+                        ensure_ascii=False,
+                    )
+                    yield f"id: {rel_cursor}:{icp_cursor}\nevent: delta\ndata: {payload}\n\n"
 
-            run = await store.get_run(run_id)
-            if run is None:
-                yield 'event: error\ndata: {"detail":"记录已删除"}\n\n'
-                return
-            summary = run_summary(run)
-            progress = summary.model_dump_json()
-            if progress != last_progress:
-                yield f"event: progress\ndata: {progress}\n\n"
-                last_progress = progress
-            if summary.status in {"succeeded", "partial", "failed", "cancelled"}:
-                yield f"event: done\ndata: {progress}\n\n"
-                return
-            yield ": keepalive\n\n"
-            await asyncio.sleep(0.75)
+                run = await store.get_run(run_id)
+                if run is None:
+                    yield 'event: error\ndata: {"detail":"记录已删除"}\n\n'
+                    return
+                summary = run_summary(run)
+                progress = summary.model_dump_json()
+                if progress != last_progress:
+                    yield f"id: {rel_cursor}:{icp_cursor}\nevent: progress\ndata: {progress}\n\n"
+                    last_progress = progress
+                if summary.status in {"succeeded", "partial", "failed", "cancelled"}:
+                    yield f"id: {rel_cursor}:{icp_cursor}\nevent: done\ndata: {progress}\n\n"
+                    return
+                yield ": keepalive\n\n"
+                await _wait_for_run_event(subscription)
 
     return StreamingResponse(
         events(),
@@ -742,49 +820,62 @@ async def get_subdomain_results(
     limit: int = Query(200, ge=1, le=2000),
     offset: int = Query(0, ge=0),
     after_id: int | None = Query(None, ge=0),
+    keyword: str = Query("", max_length=253),
+    view: str = Query("all", pattern="^(all|web|wildcard)$"),
 ) -> SubdomainResultsResponse:
     if await current_repo().get_subdomain_run(run_id) is None:
         raise HTTPException(404, "子域名查询记录不存在")
-    rows, total = await current_repo().subdomain_results(run_id, limit, offset, after_id)
+    rows, total, counts = await current_repo().subdomain_results(
+        run_id, limit, offset, after_id, keyword, view
+    )
     return SubdomainResultsResponse(
-        run_id=run_id, items=[subdomain_result_item(row) for row in rows], total=total
+        run_id=run_id,
+        items=[subdomain_result_item(row) for row in rows],
+        total=total,
+        counts=counts,
     )
 
 
 @app.get("/api/v1/subdomain-runs/{run_id}/events")
 async def stream_subdomain_results(
-    run_id: UUID, after_seq: int = Query(0, ge=0)
+    run_id: UUID,
+    after_seq: int = Query(0, ge=0),
+    last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
-    if await current_repo().get_subdomain_run(run_id) is None:
+    store = current_repo()
+    if await store.get_subdomain_run(run_id) is None:
         raise HTTPException(404, "子域名查询记录不存在")
+    resume_seq = _resume_cursor(last_event_id, after_seq)
 
     async def events():
         # stream_seq advances for both inserts and enrichment updates. Using the
         # row id here would miss the second write when HTTP probing fills in a
         # DNS-only result that was already sent to the browser.
-        cursor = after_seq
-        store = current_repo()
+        cursor = resume_seq
         last_progress = ""
-        while True:
-            rows = await store.subdomain_events_after(run_id, cursor, 500)
-            for row in rows:
-                item = subdomain_result_item(row)
-                cursor = max(cursor, item.stream_seq)
-                yield f"event: result\ndata: {item.model_dump_json()}\n\n"
-            run = await store.get_subdomain_run(run_id)
-            if run is None:
-                yield "event: error\ndata: {\"detail\":\"记录已删除\"}\n\n"
-                return
-            summary = subdomain_run_summary(run)
-            progress = summary.model_dump_json()
-            if progress != last_progress:
-                yield f"event: progress\ndata: {progress}\n\n"
-                last_progress = progress
-            if summary.status in {"succeeded", "partial", "failed", "cancelled"}:
-                yield f"event: done\ndata: {progress}\n\n"
-                return
-            yield ": keepalive\n\n"
-            await asyncio.sleep(0.75)
+        async with _subscribe_run_events(
+            SUBDOMAIN_EVENTS_CHANNEL, run_id
+        ) as subscription:
+            while True:
+                rows = await store.subdomain_events_after(run_id, cursor, 500)
+                for row in rows:
+                    item = subdomain_result_item(row)
+                    cursor = max(cursor, item.stream_seq)
+                    yield f"id: {cursor}\nevent: result\ndata: {item.model_dump_json()}\n\n"
+                run = await store.get_subdomain_run(run_id)
+                if run is None:
+                    yield "event: error\ndata: {\"detail\":\"记录已删除\"}\n\n"
+                    return
+                summary = subdomain_run_summary(run)
+                progress = summary.model_dump_json()
+                if progress != last_progress:
+                    yield f"id: {cursor}\nevent: progress\ndata: {progress}\n\n"
+                    last_progress = progress
+                if summary.status in {"succeeded", "partial", "failed", "cancelled"}:
+                    yield f"id: {cursor}\nevent: done\ndata: {progress}\n\n"
+                    return
+                yield ": keepalive\n\n"
+                await _wait_for_run_event(subscription)
 
     return StreamingResponse(
         events(),

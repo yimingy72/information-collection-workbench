@@ -9,6 +9,7 @@ dependencies = [
   "asyncpg==0.30.0",
   "httpx==0.28.1",
   "pydantic-settings==2.7.1",
+  "tldextract==5.3.1",
 ]
 
 [project.optional-dependencies]
@@ -24,9 +25,3 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
-
-docs = """
-Install: pip install -e '.[test]'
-Run API: uvicorn app.main:app --reload
-Run worker: python -m app.worker
-"""

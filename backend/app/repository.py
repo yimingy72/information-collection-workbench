@@ -8,6 +8,12 @@ from uuid import UUID
 import asyncpg
 
 
+# Serialize schema migrations across the API and worker processes. Both start
+# from the same image and may reach Repository.migrate() at the same time.
+# This stable, application-specific bigint stays held for the transaction.
+MIGRATION_LOCK_ID = 0x4153574F524B424E
+
+
 class LeaseLost(RuntimeError):
     pass
 
@@ -33,6 +39,9 @@ class Repository:
     async def migrate(self) -> None:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
+                await connection.execute(
+                    "SELECT pg_advisory_xact_lock($1)", MIGRATION_LOCK_ID
+                )
                 await connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -936,14 +945,28 @@ class Repository:
         )
 
     async def subdomain_results_after(
-        self, run_id: UUID, after_id: int, limit: int
+        self,
+        run_id: UUID,
+        after_id: int,
+        limit: int,
+        keyword: str = "",
+        view: str = "all",
     ) -> list[asyncpg.Record]:
         return await self.pool.fetch(
             """
             SELECT * FROM subdomain_results
-             WHERE run_id=$1 AND id>$2 ORDER BY id LIMIT $3
+             WHERE run_id=$1 AND id>$2
+               AND ($4 = '' OR root_domain ILIKE '%' || $4 || '%'
+                    OR hostname ILIKE '%' || $4 || '%'
+                    OR canonical_name ILIKE '%' || $4 || '%'
+                    OR title ILIKE '%' || $4 || '%'
+                    OR ips::text ILIKE '%' || $4 || '%')
+               AND ($5 = 'all'
+                    OR ($5 = 'web' AND http_status IS NOT NULL)
+                    OR ($5 = 'wildcard' AND wildcard))
+             ORDER BY id LIMIT $3
             """,
-            run_id, after_id, limit,
+            run_id, after_id, limit, keyword, view,
         )
 
     async def subdomain_events_after(
@@ -959,22 +982,66 @@ class Repository:
         )
 
     async def subdomain_results(
-        self, run_id: UUID, limit: int, offset: int = 0, after_id: int | None = None
-    ) -> tuple[list[asyncpg.Record], int]:
+        self,
+        run_id: UUID,
+        limit: int,
+        offset: int = 0,
+        after_id: int | None = None,
+        keyword: str = "",
+        view: str = "all",
+    ) -> tuple[list[asyncpg.Record], int, dict[str, int]]:
+        keyword = " ".join(str(keyword or "").split())
+        view = str(view or "all").strip().lower()
+        if view not in {"all", "web", "wildcard"}:
+            view = "all"
         if after_id is not None:
-            rows = await self.subdomain_results_after(run_id, after_id, limit)
+            rows = await self.subdomain_results_after(
+                run_id, after_id, limit, keyword, view
+            )
         else:
             rows = await self.pool.fetch(
                 """
                 SELECT * FROM subdomain_results
-                 WHERE run_id=$1 ORDER BY id DESC LIMIT $2 OFFSET $3
+                 WHERE run_id=$1
+                   AND ($4 = '' OR root_domain ILIKE '%' || $4 || '%'
+                        OR hostname ILIKE '%' || $4 || '%'
+                        OR canonical_name ILIKE '%' || $4 || '%'
+                        OR title ILIKE '%' || $4 || '%'
+                        OR ips::text ILIKE '%' || $4 || '%')
+                   AND ($5 = 'all'
+                        OR ($5 = 'web' AND http_status IS NOT NULL)
+                        OR ($5 = 'wildcard' AND wildcard))
+                 ORDER BY id DESC LIMIT $2 OFFSET $3
                 """,
-                run_id, limit, offset,
+                run_id, limit, offset, keyword, view,
             )
-        total = await self.pool.fetchval(
-            "SELECT count(*) FROM subdomain_results WHERE run_id=$1", run_id
+        count_row = await self.pool.fetchrow(
+            """
+            SELECT count(*) AS all_count,
+                   count(*) FILTER (WHERE http_status IS NOT NULL) AS web_count,
+                   count(*) FILTER (WHERE wildcard) AS wildcard_count,
+                   count(*) FILTER (
+                     WHERE ($2 = '' OR root_domain ILIKE '%' || $2 || '%'
+                            OR hostname ILIKE '%' || $2 || '%'
+                            OR canonical_name ILIKE '%' || $2 || '%'
+                            OR title ILIKE '%' || $2 || '%'
+                            OR ips::text ILIKE '%' || $2 || '%')
+                       AND ($3 = 'all'
+                            OR ($3 = 'web' AND http_status IS NOT NULL)
+                            OR ($3 = 'wildcard' AND wildcard))
+                   ) AS filtered_count
+              FROM subdomain_results
+             WHERE run_id=$1
+            """,
+            run_id, keyword, view,
         )
-        return rows, int(total or 0)
+        counts = {
+            "all": int(count_row["all_count"] or 0) if count_row else 0,
+            "web": int(count_row["web_count"] or 0) if count_row else 0,
+            "wildcard": int(count_row["wildcard_count"] or 0) if count_row else 0,
+        }
+        total = int(count_row["filtered_count"] or 0) if count_row else 0
+        return rows, total, counts
 
     async def delete_subdomain_run(self, run_id: UUID) -> int:
         result = await self.pool.execute("DELETE FROM subdomain_runs WHERE id=$1", run_id)

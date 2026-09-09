@@ -11,3 +11,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.local
+
+  ymicp:
+    build:
+      context: .
+      dockerfile: Dockerfile.ymicp

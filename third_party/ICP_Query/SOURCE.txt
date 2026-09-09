@@ -1,0 +1,17 @@
+Upstream: https://github.com/HG-ha/ICP_Query
+Commit: c68e427b34c6cdfa40de29b0ba1dcf973cd2e1ca
+Date: 2026-08-29T11:43:26+08:00
+Tag: v0.7.6
+Docker image: yiminger/ymicp
+
+Fetched for the Python Dockerfile:
+- Dockerfile
+- config.yml
+- src/python/
+- templates/
+- static/
+
+Not fetched:
+- src/rust/
+- model_data/*.onnx (~97MB; the upstream Dockerfile does not COPY these files)
+- .github/

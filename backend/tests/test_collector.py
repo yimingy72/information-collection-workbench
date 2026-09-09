@@ -1,8 +1,119 @@
 from uuid import uuid4
+import asyncio
+from collections import Counter
 
 import pytest
 
 from app import collector
+from app.providers.tianyancha import Company, Investment
+from app.providers.pagination import IncompletePagination
+
+
+class TraversalRepo:
+    def __init__(self):
+        self.entities = {}
+        self.relationships = []
+        self.results = []
+
+    async def upsert_entity(self, provider, external_id, *args):
+        return self.entities.setdefault(external_id, uuid4())
+
+    async def add_result(self, *args):
+        self.results.append(args)
+
+    async def add_relationship(self, *args):
+        self.relationships.append(args)
+
+    async def heartbeat(self, *args, **kwargs):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_shared_company_uses_shortest_path_and_is_fetched_once():
+    calls = Counter()
+
+    class Provider:
+        id = "test"
+        label = "test"
+
+        async def search(self, keyword):
+            root = Company("root", "root", {})
+            return root, [root]
+
+        async def all_pages(self, fetch):
+            return (await fetch(1))[0]
+
+        async def investments(self, company, page):
+            calls[company] += 1
+            if company == "slow":
+                await asyncio.sleep(0.02)
+            graph = {"root": ["fast", "slow"], "fast": ["middle"],
+                     "middle": ["shared"], "slow": ["shared"], "shared": ["leaf"]}
+            children = graph.get(company, [])
+            return [Investment(child, child, 100, {}) for child in children], len(children)
+
+    repo = TraversalRepo()
+    errors = await collector._collect_one(repo, Provider(), collector.RunSpec(uuid4(), "root", 3, 100, ["invest"]))
+    assert errors == []
+    assert "leaf" in repo.entities
+    assert calls["shared"] == 1
+    assert max(calls.values()) == 1
+    leaf_rows = [row for row in repo.relationships if row[2] == repo.entities["leaf"]]
+    assert leaf_rows[0][5] == 3
+
+
+@pytest.mark.asyncio
+async def test_partial_provider_pages_are_kept_and_their_children_are_traversed():
+    class Provider:
+        id = "test"
+        label = "test"
+
+        async def search(self, keyword):
+            root = Company("root", "root", {})
+            return root, [root]
+
+        async def all_pages(self, fetch):
+            return await fetch(1)
+
+        async def investments(self, company, page):
+            if company == "root":
+                raise IncompletePagination("missing page", [Investment("child", "child", 100, {})])
+            return [Investment("leaf", "leaf", 100, {})]
+
+    repo = TraversalRepo()
+    errors = await collector._collect_one(repo, Provider(), collector.RunSpec(uuid4(), "root", 2, 100, ["invest"]))
+    assert "missing page" in errors[0]
+    assert "leaf" in repo.entities
+
+
+@pytest.mark.asyncio
+async def test_icp_final_drain_rechecks_snapshot_after_last_producer_commit(monkeypatch):
+    done = asyncio.Event()
+    fed = []
+
+    class Repo:
+        calls = 0
+
+        async def entity_names_since(self, *args):
+            self.calls += 1
+            if self.calls == 1:
+                done.set()
+                return ["root"], 1, 1
+            return ["last-child"], 2, 2
+
+        async def touch_run(self, *args, **kwargs):
+            pass
+
+    async def collect(repo, run_id, queue):
+        while (name := await queue.get()) is not None:
+            fed.append(name)
+        return []
+
+    monkeypatch.setattr(collector, "collect_icp_from_queue", collect)
+    await collector._collect_icp_as_entities_are_discovered(
+        Repo(), collector.RunSpec(uuid4(), "root", 2, 100, ["invest"]), done, asyncio.Event()
+    )
+    assert fed == ["root", "last-child"]
 
 
 @pytest.mark.asyncio
@@ -123,7 +234,8 @@ async def test_icp_consumer_uses_incremental_name_cursor(monkeypatch):
             return ["子企业2"], 5, 2
 
         async def entity_names_for_run(self, _run_id):
-            raise AssertionError("incremental discovery should not rescan all names")
+            assert producers_done.is_set(), "running discovery must use incremental cursors"
+            return ["根企业", "子企业1", "子企业2"]
 
         async def touch_run(self, *_args, **_kwargs):
             return None
@@ -152,4 +264,5 @@ async def test_icp_consumer_uses_incremental_name_cursor(monkeypatch):
     assert errors == []
     assert "根企业" in fed
     assert "子企业1" in fed
+    assert "子企业2" in fed
     assert calls[0] == (0, 0)

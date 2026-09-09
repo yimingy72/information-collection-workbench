@@ -2,7 +2,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.repository import LeaseLost, Repository
+from app.repository import MIGRATION_LOCK_ID, LeaseLost, Repository
 
 
 class FakePool:
@@ -33,6 +33,52 @@ class FakePool:
     async def fetchval(self, query, *args):
         self.queries.append((query, args))
         return 0
+
+
+@pytest.mark.asyncio
+async def test_migrate_takes_advisory_lock_before_schema_changes(tmp_path):
+    migration = tmp_path / "001_test.sql"
+    migration.write_text("SELECT 1;")
+
+    class AsyncContext:
+        def __init__(self, value=None):
+            self.value = value
+
+        async def __aenter__(self):
+            return self.value
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class Connection:
+        def __init__(self):
+            self.queries = []
+
+        def transaction(self):
+            return AsyncContext()
+
+        async def execute(self, query, *args):
+            self.queries.append(("execute", query, args))
+            return "SELECT 1"
+
+        async def fetch(self, query, *args):
+            self.queries.append(("fetch", query, args))
+            return []
+
+    connection = Connection()
+
+    class MigrationPool:
+        def acquire(self):
+            return AsyncContext(connection)
+
+    await Repository(MigrationPool(), tmp_path).migrate()
+
+    assert connection.queries[0] == (
+        "execute",
+        "SELECT pg_advisory_xact_lock($1)",
+        (MIGRATION_LOCK_ID,),
+    )
+    assert any(query == "SELECT 1;" for _, query, _ in connection.queries)
 
 
 @pytest.mark.asyncio
@@ -262,8 +308,9 @@ async def test_subdomain_results_after_skips_count_query():
     await repo.subdomain_results_after(uuid4(), 12, 500)
     assert len(pool.queries) == 1
     query, args = pool.queries[0]
-    assert "id>$2 ORDER BY id LIMIT $3" in query
-    assert args[1:] == (12, 500)
+    assert "id>$2" in query
+    assert "ORDER BY id LIMIT $3" in query
+    assert args[1:] == (12, 500, "", "all")
 
 
 @pytest.mark.asyncio
@@ -369,6 +416,41 @@ async def test_subdomain_result_count_reads_persisted_rows():
     repo = Repository(pool, None)
     assert await repo.subdomain_result_count(uuid4()) == 8
     assert "count(*) FROM subdomain_results" in pool.queries[0][0]
+
+
+@pytest.mark.asyncio
+async def test_subdomain_results_filters_and_returns_matching_counts():
+    class ResultsPool(FakePool):
+        async def fetchrow(self, query, *args):
+            self.queries.append((query, args))
+            if "filtered_count" in query:
+                return {
+                    "all_count": 7,
+                    "web_count": 3,
+                    "wildcard_count": 2,
+                    "filtered_count": 2,
+                }
+            return {"id": uuid4()}
+
+    run_id = uuid4()
+    pool = ResultsPool()
+    repo = Repository(pool, None)
+
+    rows, total, counts = await repo.subdomain_results(
+        run_id, 20, 0, None, "api", "web"
+    )
+
+    assert rows == []
+    assert total == 2
+    assert counts == {"all": 7, "web": 3, "wildcard": 2}
+    rows_query, rows_args = pool.queries[0]
+    assert "hostname ILIKE" in rows_query
+    assert "http_status IS NOT NULL" in rows_query
+    assert rows_args == (run_id, 20, 0, "api", "web")
+    counts_query, counts_args = pool.queries[1]
+    assert "count(*) FILTER" in counts_query
+    assert "filtered_count" in counts_query
+    assert counts_args == (run_id, "api", "web")
 
 
 

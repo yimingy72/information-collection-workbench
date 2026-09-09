@@ -1,6 +1,6 @@
 # 运行与排障
 
-> 最后更新：2026-09-04
+> 最后更新：2026-09-09
 
 ## 常用命令
 
@@ -11,7 +11,12 @@ docker compose -p asset-workbench up -d --build
 # 查看状态
 docker compose -p asset-workbench ps
 
-# 重建 API 和 worker
+# 本地开发镜像（前端由宿主机 Vite 提供）
+docker build -f Dockerfile.local -t asset-workbench-api:latest .
+docker compose -p asset-workbench -f docker-compose.yml -f docker-compose.local.yml up -d --no-build --force-recreate api worker
+
+# 生产构建
+# 前端应生成 react-vendor、antd-runtime、Table 等独立块，且不再出现默认 500 kB 大块警告
 docker compose -p asset-workbench build api
 docker compose -p asset-workbench up -d --no-deps --force-recreate api worker
 
@@ -21,26 +26,28 @@ curl http://127.0.0.1:8000/api/health
 
 ## YMICP
 
+YMICP 已纳入 `docker compose -p asset-workbench up -d --build`。容器名仍为 `ymicp`，默认地址 `http://ymicp:16181`。
+
 ```bash
 # 查看状态
-docker ps --filter name=ymicp
+docker compose -p asset-workbench ps ymicp
 curl 'http://127.0.0.1:16181/query/web?search=测试企业&pageNum=1&pageSize=26'
 
-# 重新应用仓库补丁
-./scripts/apply_ymicp_patch.sh
+# 重建已打补丁的镜像
+docker compose -p asset-workbench up -d --build ymicp
 
-# 连接 Compose 网络（仅首次需要）
-docker network connect asset-workbench_default ymicp
+# 热更新运行中容器的补丁
+./scripts/apply_ymicp_patch.sh
 ```
 
-补丁脚本假定容器名为 `ymicp`，会复制：
+补丁在镜像构建时已经写入。热更新脚本会复制：
 
 - `scripts/ymicp_jsl.py`
 - `scripts/ymicp_patched.py`
 - `scripts/query_routes_patched.py`
 - `scripts/batch_routes_patched.py`
 
-随后安装 `quickjs`、把验证码重试次数调整为3并重启容器。
+随后安装 `quickjs`、把验证码重试次数调整为3并重启容器。不要再手工 `docker run yiminger/ymicp` 后 `docker network connect`。
 
 ## 日志
 
@@ -112,7 +119,7 @@ docker compose -p asset-workbench exec -T postgres \
 3. 是否出现验证码、非 JSON、HTTP 5xx、521 或创宇盾拦截。
 4. 云函数是否处于冷启动或触发器异常状态。
 5. 当前代码是否错误地对云函数应用了直连12秒冷却；现行版本不应这样做。
-6. 直连模式虽然保留单 IP 的 0.4 秒间隔和每 5 次 12 秒冷却，但独立企业会在节流器后并发 pipeline；云函数代理池是默认路由；只有在“代理池配置”中显式选择 HTTP 代理池后，才会改走手动代理。
+6. 查询页“代理”下拉框决定本轮路由。直连模式保留单 IP 的约 0.4 秒间隔和每 5 次 8 秒冷却；云函数和自定义代理不套用该窗口。没有就绪云函数节点或可用手动代理时，不会静默改走直连。
 
 单次80秒预算耗尽后，该企业会进入后续企业级重试轮次。默认总计尝试2次，轮次间等待0.5秒；只有全部尝试均失败时，任务才记录该企业失败并标记为部分成功。
 
@@ -155,13 +162,13 @@ LIMIT 20;
 
 ### ICP 云函数请求大量出现“创宇盾拦截”
 
-确认应用日志中的 YMICP 请求带有 `proxy=http://seamoon-gateway:19080`。当前 ICP 路由按节点复用热隧道：每通道连续 5 次查询后暂停 12 秒，不重建会话；创宇盾/传输失败才轮换 generation。SeaMoon 网关按 lane_{slot}_{generation} 的 slot 固定打到同一个云函数，避免不同通道哈希撞到同一出口 IP。需要注意，单个 FC 函数地址无法保证每次隧道获得不同公网 IP；若仍持续拦截，应降低并发/请求速率，或配置多个云函数出口、云 NAT/EIP。
+确认应用日志中的 YMICP 请求带有 `proxy=http://seamoon-gateway:19080`。当前 ICP 路由按节点复用热隧道：每通道连续 5 次查询后补足 8 秒窗口剩余等待，不重建会话；创宇盾/传输失败才轮换 generation。SeaMoon 网关按 lane_{slot}_{generation} 的 slot 固定打到同一个云函数，避免不同通道哈希撞到同一出口 IP。需要注意，单个 FC 函数地址无法保证每次隧道获得不同公网 IP；若仍持续拦截，应降低并发/请求速率，或配置多个云函数出口、云 NAT/EIP。
 
 若同时看到大量“天眼查：请登录以使用完整功能”，这是天眼查匿名接口权限限制，需要登录天眼查或改用已登录的数据源，代理轮换不能补全该阶段数据。
 
 ### 单个手动代理开启后 ICP 反而变慢
 
-检查 YMICP 日志是否同时出现大量页面超时。手动代理是固定出口，当前调度只允许每个已就绪节点同时处理1家企业；配置1个节点时串行执行，配置多个节点时按节点数并发，最多5家。YMICP 的独立分页会话不再共用全局验证码锁，避免一个验证码请求阻塞其他代理节点或 SeaMoon 隧道。
+检查 YMICP 日志是否同时出现大量页面超时。手动代理模式当前总并发为 `min(40, max(8, 可用入口数))`；这一策略适配每次请求更换出口的代理服务，普通固定出口不能据此假设有多个 IP。YMICP 的独立分页会话不再共用全局验证码锁，避免一个验证码请求阻塞其他代理节点或 SeaMoon 隧道。
 
 ### `FunctionAlreadyExists`
 
@@ -194,7 +201,7 @@ cd ../seamoon && go test ./...
 
 ### 被动来源结果未立即更新
 
-实时列表会优先显示 DNS 字典已经验证的结果。较慢的被动来源随后命中同一子域名时，数据库会合并来源标签；任务结束事件触发后，前端会重新加载完整结果并显示最终来源集合。
+实时列表会优先显示 DNS 字典已经验证的结果。较慢的被动来源随后命中同一子域名时，数据库会合并来源标签，SSE 按同一结果 `id` 更新来源。完成后前端按页加载，不再一次拉全量；导出 Excel 时才会分页拉完全部结果。
 
 检查缓存：
 
@@ -211,7 +218,20 @@ LIMIT 50;
 
 ### 如何提高结果覆盖率
 
-默认查询已经组合公开证书、DNS 数据集、SRV 记录、站点元数据、Common Crawl、DNS 字典、页面引用和有限名称变体。对于已获授权的目标，建议保持“被动数据源、DNS 字典和智能变体”开启；如果只需要快速初筛，可关闭智能变体和 HTTP 探测。FOFA 和 Hunter 需要在“基础配置 → 数据源配置”填写 API Key 后才会参与子域名收集；未填写时跳过这两个来源。平台不会默认开启 AXFR、接管或端口类检查。
+默认查询已经组合公开证书、DNS 数据集、SRV 记录、站点元数据、Common Crawl、DNS 字典、页面引用和有限名称变体。对于已获授权的目标，建议保持“被动数据源、DNS 字典和智能变体”开启；如果只需要快速初筛，可关闭智能变体和 HTTP 探测。FOFA 和 Hunter 需要在“基础配置 → 数据源配置 → 子域名情报源”填写 API Key 后才会参与子域名收集；未填写时跳过这两个来源。平台不会默认开启 AXFR、接管或端口类检查。
+
+检查密钥是否已保存：
+
+```sql
+SELECT fofa_email,
+       (fofa_key <> '') AS has_fofa_key,
+       (hunter_key <> '') AS has_hunter_key,
+       updated_at
+FROM subdomain_api_settings
+WHERE id = 1;
+```
+
+FOFA 请求 `https://fofa.info/api/v1/search/all`，查询 `domain="主域名"`；Hunter 请求 `https://hunter.qianxin.com/openApi/search`，查询 `domain_suffix="主域名"`。接口报额度/权限错误会写入该主域名警告，不影响其他来源。
 
 结果不完整时先检查任务警告和 `subdomain_source_cache`，再等待限流来源冷却后重新查询。不要用代理轮换连续冲击返回 429 的来源；这不能保证增加结果，反而可能扩大限流范围。
 
@@ -255,9 +275,10 @@ GET /api/v1/collection-runs/{run_id}/events
 该 SSE 会推送 `delta`、`progress` 和 `done`。如果页面一直显示加载但表格没有增量：
 
 1. 在浏览器网络面板确认事件请求保持连接且响应类型为 `text/event-stream`。
-2. 检查迁移 `026_collection_event_stream.sql` 是否应用。
-3. 检查 `relationships.stream_seq`、`results.stream_seq` 是否持续增长。
-4. SSE 临时中断会自动重连，完成事件后页面还会重新读取一次最终快照。
+2. 检查迁移 `026_collection_event_stream.sql` 和 `032_event_notifications.sql` 是否应用。
+3. 检查 `relationships.stream_seq`、`results.stream_seq` 是否持续增长，并确认 `relationships_event_notify`、`icp_results_event_notify`、`collection_runs_update_event_notify` 触发器存在。
+4. 检查 API 日志是否出现“PostgreSQL 事件监听启动失败”；监听不可用时会回退短轮询，监听已启动但通知偶发丢失时仍会每 15 秒保底校验。
+5. SSE 临时中断会携带 `Last-Event-ID` 从最后确认游标自动重连，完成事件后页面还会重新读取一次最终快照。
 
 页面“停止”按钮调用：
 
@@ -270,11 +291,11 @@ POST /api/v1/collection-runs/{run_id}/cancel
 
 ## 子域名实时结果与恢复
 
-- 页面首次进入任务时先读取全部已保存结果，再从 `stream_seq` 游标建立 SSE；刷新浏览器不会把历史结果清空，也不会丢失进行中的任务。
+- 页面首次进入任务时先读取一页已保存结果，再从 `stream_seq` 游标建立 SSE；刷新浏览器不会把历史结果清空，也不会丢失进行中的任务。`subdomain_results_event_notify`、`subdomain_results_update_event_notify` 和 `subdomain_runs_update_event_notify` 在事务提交后唤醒实时流。
 - DNS 结果和 HTTP 探测结果可能是同一主机的两次写入，前端按结果 `id` 合并，后一次会补全状态码、标题、访问地址和来源。
-- 任务列表默认展示最近 30 条记录，并每 3 秒刷新一次进行中的摘要；SSE 断线时浏览器自动重连，任务完成后重新读取最终快照。
+- 任务列表默认展示最近 30 条记录，并每 3 秒刷新一次进行中的摘要；SSE 断线时浏览器从最后确认的 `stream_seq` 自动重连。任务完成后，翻页、搜索及“网站可访问 / 泛解析”筛选都向服务端取当前页和分类总数。
 - 多主域名默认同时处理 5 个根域名；如需降低压力，调整 `backend/app/subdomains.py` 的 `ROOT_CONCURRENCY`，不要直接取消 DNS/HTTP 全局并发限制。
-- 被动数据源采用“直连优先、已验证代理立即兜底”：连接失败、超时、403、429、5xx 等情况会立即尝试当前可用的手动代理或 SeaMoon 路由；代理兜底成功不会把该来源标记为失败。
+- 被动数据源采用“直连优先、已验证代理立即兜底”：连接失败、超时、403、5xx 等情况会立即尝试当前可用的手动代理或 SeaMoon 路由；代理兜底成功不会把该来源标记为失败。
 - CertSpotter 返回的相对分页链接会自动拼接到 `api.certspotter.com`，因此不会因 `Link: </v1/issuances?...>` 导致分页失败。
 
 ## 云函数节点自动回收
@@ -283,3 +304,14 @@ POST /api/v1/collection-runs/{run_id}/cancel
 - 缩容只发生在本轮 ICP 企业全部消费完成之后，按最终企业数计算目标节点数。
 - 缩容失败只记录错误，不影响已完成结果；下次任务仍可再次修复/回收。
 - 自动缩容不会删除主节点、手动节点或没有 `auto_managed` 标记的历史节点。
+
+## 性能调优与完整性核对（2026-09-09）
+
+- 并发先看 [审计报告](PERFORMANCE_AUDIT.md)。`PROVIDER_REQUEST_CONCURRENCY=20` 是每个企业数据源、每个进程的请求总上限；`PROVIDER_PAGE_CONCURRENCY=4` 受这个上限约束。不要用增加 worker 副本绕过来源限流，多个进程不共享内存预算。
+- 子域名根域名 / DNS / HTTP 的进程共享预算为 5 / 64 / 20。HTTP 队列满时等待，不丢结果；专用 DNS 线程池不会把线程排队误判成域名不存在。暂时解析失败重试一次，仍失败会出现“结果不完整”。
+- ICP 返回 HTTP 429 时本进程暂停实时请求，不轮换会话或重试当前企业；等待冷却结束再重新查询，缓存命中仍可使用。
+- ICP 缺少 `total`、唯一数不相等或超过现有时间预算时，已获取行仍保留，缓存保持不完整结果不写入的规则。大企业不再按 50 页直接中止，但超时依然有效。
+- `subdomain_source_cache.source` 的新值形如 `v2:CertSpotter`。旧缓存保留到自然过期，不作为新算法的完整结果使用；首次升级后查询可能多一些实时来源请求。
+- 子域名出现 `[结果不完整]` 表示确认有分页或解析缺口，即使已有结果也显示部分成功；普通可选来源超时仍按原产品规则处理。来源请求额度未自动增加，FOFA / Hunter 未配置密钥仍跳过。
+- 任务取消与租约失效会收拢所有采集 worker；数据写入异常向上报告，避免队列一直等待或误标成功。子域名独立心跳每 5 秒执行一次。
+- 离线验收：`python3 -m pytest backend/tests -q`、`cd frontend && npx tsc --noEmit -p tsconfig.json`；调度对比：`python3 scripts/benchmark_query_pipeline.py --baseline 0b18e24 --repeats 3`。比较结果包含完整记录集合和请求次数校验，不以少发请求或少保存结果换取提速。

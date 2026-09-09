@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 
+from app.providers.pagination import ProviderRateLimited, all_pages, bounded_request, reported_total
 from app.providers.tianyancha import (
     Company,
     Investment,
@@ -48,6 +49,7 @@ class AnonymousRiskbird:
     async def close(self) -> None:
         await self.client.aclose()
 
+    @bounded_request
     async def _request(self, method: str, path: str, **kwargs: Any) -> dict[str, Any]:
         extra_headers = kwargs.pop("headers", None)
         last_error: Exception | None = None
@@ -63,6 +65,8 @@ class AnonymousRiskbird:
             self.client.cookies.clear()
             if response.status_code in {401, 403}:
                 raise ProviderError(f"风鸟拒绝访问 (HTTP {response.status_code})")
+            if response.status_code == 429:
+                raise ProviderRateLimited("风鸟请求频率受限 (HTTP 429)", response.headers.get("retry-after", "60"))
             if response.status_code in {429, 500, 502, 503, 504}:
                 last_error = ProviderError(f"风鸟服务暂时不可用 (HTTP {response.status_code})")
                 if attempt == 0:
@@ -151,7 +155,7 @@ class AnonymousRiskbird:
             },
         )
 
-    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int]:
+    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int | None]:
         data = await self._list(external_id, "companyInvest", page)
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         rows = payload.get("apiData") or []
@@ -163,9 +167,9 @@ class AnonymousRiskbird:
             child_id = str(row.get("entid") or row.get("orderNo") or row.get("entId") or "")
             if name and child_id:
                 values.append(Investment(name, child_id, _number(row.get("funderRatio") or row.get("fundedRatio")), row))
-        return values, int(payload.get("totalCount") or len(values))
+        return values, reported_total(payload, "totalCount")
 
-    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int]:
+    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int | None]:
         data = await self._list(external_id, "shareHolder", page)
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         rows = payload.get("apiData") or []
@@ -176,13 +180,7 @@ class AnonymousRiskbird:
             name = clean_text(str(row.get("shaName") or row.get("name") or ""))
             if name:
                 values.append(Shareholder(name, _number(row.get("fundedRatio")), row))
-        return values, int(payload.get("totalCount") or len(values))
+        return values, reported_total(payload, "totalCount")
 
-    async def all_pages(self, fetch, page_size: int = 100, max_pages: int = 50):
-        rows: list = []
-        for page in range(1, max_pages + 1):
-            chunk, _ = await fetch(page)
-            rows.extend(chunk)
-            if len(chunk) < page_size:
-                return rows
-        raise ProviderError(f"风鸟分页超过 {max_pages} 页")
+    async def all_pages(self, fetch, page_size: int = 100, max_pages: int | None = None):
+        return await all_pages(fetch, label=self.label, page_size=page_size, max_pages=max_pages)

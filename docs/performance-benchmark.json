@@ -1,0 +1,29 @@
+{
+  "baseline": "0b18e24",
+  "repeats": 3,
+  "network": "simulated only",
+  "cases": {
+    "investment_12_pages_20ms": {
+      "before_seconds": 0.2495,
+      "after_seconds": 0.0842,
+      "speedup": 2.96,
+      "records": 120,
+      "before_requests": 12,
+      "after_requests": 12
+    },
+    "subdomain_1000_hosts_two_slow_sites": {
+      "before_seconds": 0.3585,
+      "after_seconds": 0.2072,
+      "speedup": 1.73,
+      "records": 1000,
+      "before_requests": {
+        "dns": 1000,
+        "http": 1000
+      },
+      "after_requests": {
+        "dns": 1000,
+        "http": 1000
+      }
+    }
+  }
+}

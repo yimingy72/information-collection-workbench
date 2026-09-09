@@ -5,6 +5,7 @@ from typing import Any
 
 import httpx
 
+from app.providers.pagination import ProviderRateLimited, all_pages, bounded_request, reported_total
 from app.providers.tianyancha import (
     Company,
     Investment,
@@ -51,6 +52,9 @@ class AnonymousAiqicha:
         self._proxy_index = 0
         self._proxy_request_count = 0
         self.client = self._make_client()
+        self._client_lock = asyncio.Lock()
+        self._client_users: dict[httpx.AsyncClient, int] = {}
+        self._retired_clients: set[httpx.AsyncClient] = set()
 
     @property
     def _proxy(self) -> str:
@@ -75,16 +79,23 @@ class AnonymousAiqicha:
         )
 
     async def close(self) -> None:
-        await self.client.aclose()
+        for client in {self.client, *self._retired_clients}:
+            await client.aclose()
+        self._retired_clients.clear()
 
     async def _rotate_proxy_client(self) -> None:
         if not self._proxy_routes:
             return
-        previous = self.client
-        self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
-        self.client = self._make_client()
-        self._proxy_request_count = 0
-        await previous.aclose()
+        async with self._client_lock:
+            previous = self.client
+            self._proxy_index = (self._proxy_index + 1) % len(self._proxy_routes)
+            self.client = self._make_client()
+            self._proxy_request_count = 0
+            in_use = self._client_users.get(previous, 0) > 0
+            if in_use:
+                self._retired_clients.add(previous)
+        if not in_use:
+            await previous.aclose()
 
     async def _proxy_get(
         self,
@@ -93,11 +104,29 @@ class AnonymousAiqicha:
     ) -> httpx.Response:
         if self._proxy and self._proxy_request_count >= AIQICHA_PROXY_REQUEST_LIMIT:
             await self._rotate_proxy_client()
-        if self._proxy:
-            self._proxy_request_count += 1
-        return await self.client.get(url, params=params)
+        async with self._client_lock:
+            if self._proxy:
+                self._proxy_request_count += 1
+            client = self.client
+            self._client_users[client] = self._client_users.get(client, 0) + 1
+        try:
+            response = await client.get(url, params=params)
+            client.cookies.clear()
+            return response
+        finally:
+            async with self._client_lock:
+                self._client_users[client] -= 1
+                retire = not self._client_users[client] and client in self._retired_clients
+                if not self._client_users[client]:
+                    del self._client_users[client]
+                if retire:
+                    self._retired_clients.remove(client)
+            if retire:
+                await client.aclose()
 
     def _raise_for_challenge(self, response) -> None:
+        if response.status_code == 429:
+            raise ProviderRateLimited("爱企查请求频率受限 (HTTP 429)", response.headers.get("retry-after", "60"))
         location = response.headers.get("location", "")
         text_head = response.text[:200]
         if (
@@ -114,6 +143,7 @@ class AnonymousAiqicha:
                 self._proxy_request_count = AIQICHA_PROXY_REQUEST_LIMIT
             raise ProviderError(f"爱企查拒绝访问 (HTTP {response.status_code})")
 
+    @bounded_request
     async def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(2):
@@ -170,15 +200,15 @@ class AnonymousAiqicha:
         selected = next((item for item in candidates if normalize_name(item.name) == normalize_name(keyword)), candidates[0])
         return selected, candidates
 
-    def _parse_investments(self, data: dict[str, Any]) -> tuple[list[Investment], int]:
+    def _parse_investments(self, data: dict[str, Any]) -> tuple[list[Investment], int | None]:
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         record = payload.get("investRecordData")
         if isinstance(record, dict):
             rows = record.get("list") or []
-            total = int(record.get("total") or 0)
+            total = reported_total(record, "total")
         else:
             rows = payload.get("list") or []
-            total = int(payload.get("total") or 0)
+            total = reported_total(payload, "total")
         values = []
         for row in rows if isinstance(rows, list) else []:
             if not isinstance(row, dict):
@@ -187,9 +217,9 @@ class AnonymousAiqicha:
             child_id = str(row.get("pid") or row.get("yid") or row.get("entid") or "")
             if name and child_id:
                 values.append(Investment(name, child_id, _number(row.get("regRate") or row.get("proportion")), row))
-        return values, total or len(values)
+        return values, total
 
-    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int]:
+    async def investments(self, external_id: str, page: int = 1) -> tuple[list[Investment], int | None]:
         params = {"pid": external_id, "p": str(page), "size": str(self.page_size)}
         try:
             data = await self._get("https://aiqicha.baidu.com/relations/stockchartAjax", params=params)
@@ -200,7 +230,7 @@ class AnonymousAiqicha:
             data = await self._get("https://aiqicha.baidu.com/relations/relationalMapAjax", params={"pid": external_id})
             return self._parse_investments(data)
 
-    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int]:
+    async def shareholders(self, external_id: str, page: int = 1) -> tuple[list[Shareholder], int | None]:
         data = await self._get(
             "https://aiqicha.baidu.com/detail/sharesAjax",
             params={"pid": external_id, "p": str(page), "size": str(self.page_size)},
@@ -214,13 +244,7 @@ class AnonymousAiqicha:
             name = clean_text(str(row.get("name") or row.get("entName") or ""))
             if name:
                 values.append(Shareholder(name, _number(row.get("subRate")), row))
-        return values, int(payload.get("total") or len(values))
+        return values, reported_total(payload, "total")
 
-    async def all_pages(self, fetch, page_size: int = 10, max_pages: int = 50):
-        rows: list = []
-        for page in range(1, max_pages + 1):
-            chunk, total = await fetch(page)
-            rows.extend(chunk)
-            if not chunk or len(chunk) < page_size or (total and len(rows) >= total):
-                return rows
-        raise ProviderError(f"爱企查分页超过 {max_pages} 页")
+    async def all_pages(self, fetch, page_size: int = 10, max_pages: int | None = None):
+        return await all_pages(fetch, label=self.label, page_size=page_size, max_pages=max_pages)

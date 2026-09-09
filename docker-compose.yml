@@ -1,3 +1,5 @@
+name: asset-workbench
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -14,6 +16,21 @@ services:
       timeout: 5s
       retries: 20
 
+  ymicp:
+    image: asset-workbench-ymicp:latest
+    container_name: ymicp
+    build:
+      context: .
+      dockerfile: Dockerfile.ymicp
+    ports:
+      - "127.0.0.1:16181:16181"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:16181/')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
   api:
     image: asset-workbench-api:latest
     build: .
@@ -21,8 +38,10 @@ services:
       DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
       DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-2}
       DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-20}
+      PROVIDER_REQUEST_CONCURRENCY: ${PROVIDER_REQUEST_CONCURRENCY:-20}
+      PROVIDER_PAGE_CONCURRENCY: ${PROVIDER_PAGE_CONCURRENCY:-4}
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
-      MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
+      MIIT_API_URL: ${MIIT_API_URL:-http://ymicp:16181}
       ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
       ICP_COMPANY_MAX_ATTEMPTS: ${ICP_COMPANY_MAX_ATTEMPTS:-2}
       ICP_COMPANY_RETRY_BACKOFF_SECONDS: ${ICP_COMPANY_RETRY_BACKOFF_SECONDS:-0.5}
@@ -44,6 +63,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      ymicp:
+        condition: service_healthy
       seamoon-gateway:
         condition: service_healthy
     healthcheck:
@@ -59,8 +80,10 @@ services:
       DATABASE_URL: postgresql://workbench:workbench@postgres:5432/workbench
       DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-2}
       DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-20}
+      PROVIDER_REQUEST_CONCURRENCY: ${PROVIDER_REQUEST_CONCURRENCY:-20}
+      PROVIDER_PAGE_CONCURRENCY: ${PROVIDER_PAGE_CONCURRENCY:-4}
       TIANYANCHA_BASE_URL: ${TIANYANCHA_BASE_URL:-https://capi.tianyancha.com}
-      MIIT_API_URL: ${MIIT_API_URL:-http://172.17.0.1:16181}
+      MIIT_API_URL: ${MIIT_API_URL:-http://ymicp:16181}
       ICP_PROXY_CONTROL_TOKEN: ${ICP_PROXY_CONTROL_TOKEN:-asset-workbench-local}
       ICP_COMPANY_MAX_ATTEMPTS: ${ICP_COMPANY_MAX_ATTEMPTS:-2}
       ICP_COMPANY_RETRY_BACKOFF_SECONDS: ${ICP_COMPANY_RETRY_BACKOFF_SECONDS:-0.5}
@@ -83,6 +106,8 @@ services:
     restart: unless-stopped
     depends_on:
       postgres:
+        condition: service_healthy
+      ymicp:
         condition: service_healthy
       seamoon-gateway:
         condition: service_healthy
